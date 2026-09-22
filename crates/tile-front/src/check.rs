@@ -706,6 +706,7 @@ impl Checker<'_> {
                 Some(reg(t.dtype, &t.shape))
             }
             Op::Dequant(q, s, m, group) | Op::Dequant4(q, s, m, group, _) => {
+                let pairs = matches!(op, Op::Dequant4(.., crate::ir::Nibbles::Pairs));
                 let mut ops = vec![*q, *s];
                 ops.extend(*m);
                 let tys = self.args(&ops)?;
@@ -737,7 +738,11 @@ impl Checker<'_> {
                         return None;
                     }
                 }
-                let cols = tq.shape.get(1).copied().unwrap_or(0);
+                // Output columns: two per byte when both nibbles are taken.
+                let cols = tq
+                    .shape
+                    .get(1)
+                    .map_or(0, |c| if pairs { 2 * c } else { *c });
                 let ok = tq.shape.len() == 2
                     && *group > 0
                     && cols % group == 0
@@ -753,6 +758,40 @@ impl Checker<'_> {
                     return None;
                 }
                 Some(reg(DType::F32, &[tq.shape[0], cols]))
+            }
+            Op::Dequant6(lo, hi, s, group) => {
+                let tys = self.args(&[*lo, *hi, *s])?;
+                let tl = self.tile(tys[0].clone(), "dequant6 low plane")?;
+                let th = self.tile(tys[1].clone(), "dequant6 high plane")?;
+                let ts = self.tile(tys[2].clone(), "dequant6 scales")?;
+                if tl.dtype != DType::I8 || th.dtype != DType::I8 {
+                    self.err(Kind::Type, "dequant6 bit planes must be I8".into());
+                    return None;
+                }
+                if !self.numeric(&ts, "dequant6 scales") {
+                    return None;
+                }
+                let (r, c) = (
+                    tl.shape.first().copied().unwrap_or(0),
+                    2 * tl.shape.get(1).copied().unwrap_or(0),
+                );
+                let ok = tl.shape.len() == 2
+                    && *group > 0
+                    && c.is_multiple_of(4)
+                    && c.is_multiple_of(*group)
+                    && th.shape == [r, c / 4]
+                    && ts.shape == [r, c / group];
+                if !ok {
+                    self.err(
+                        Kind::Shape,
+                        format!(
+                            "dequant6 of planes {:?} and {:?} with scales {:?} in groups of {group}",
+                            tl.shape, th.shape, ts.shape
+                        ),
+                    );
+                    return None;
+                }
+                Some(reg(DType::F32, &[r, c]))
             }
             Op::RowReduce(_, a) => {
                 let ty = self.args(&[*a])?.remove(0);

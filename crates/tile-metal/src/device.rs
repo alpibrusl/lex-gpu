@@ -233,6 +233,38 @@ impl Gpu {
         best
     }
 
+    /// Run one dispatch and return how long the GPU spent on it, in seconds,
+    /// from the command buffer's own timestamps — without the CPU's submit
+    /// and wait, which dominate wall time for small kernels.
+    pub fn run_gpu_timed(&self, pipeline: &Pipeline, buffers: &[&Buffer]) -> f64 {
+        autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            let l = pipeline.plan.launch;
+            enc.set_compute_pipeline_state(&pipeline.pso);
+            for (i, &b) in buffers.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new(
+                    l.threadgroups[0] as u64,
+                    l.threadgroups[1] as u64,
+                    l.threadgroups[2] as u64,
+                ),
+                MTLSize::new(
+                    l.threads_per_threadgroup[0] as u64,
+                    l.threads_per_threadgroup[1] as u64,
+                    l.threads_per_threadgroup[2] as u64,
+                ),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let (start, end) = gpu_times(cb);
+            end - start
+        })
+    }
+
     /// Run a sequence of dispatches in one command buffer and wait once.
     ///
     /// The compute encoder is serial (Metal's default): each dispatch
@@ -240,7 +272,14 @@ impl Gpu {
     /// has the same semantics as calling [`Gpu::run`] for each in turn,
     /// without a CPU round trip between them.
     pub fn run_all(&self, steps: &[(&Pipeline, &[&Buffer])]) {
+        self.run_all_timed(steps);
+    }
+
+    /// [`Gpu::run_all`], returning (CPU seconds spent encoding, GPU seconds
+    /// executing).
+    pub fn run_all_timed(&self, steps: &[(&Pipeline, &[&Buffer])]) -> (f64, f64) {
         autoreleasepool(|| {
+            let t0 = Instant::now();
             let cb = self.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             for (pipeline, buffers) in steps {
@@ -263,9 +302,12 @@ impl Gpu {
                 );
             }
             enc.end_encoding();
+            let encode = t0.elapsed().as_secs_f64();
             cb.commit();
             cb.wait_until_completed();
-        });
+            let (start, end) = gpu_times(cb);
+            (encode, end - start)
+        })
     }
 
     fn dispatch(&self, pipeline: &Pipeline, buffers: &[&Buffer], iters: usize) {
@@ -301,4 +343,11 @@ impl Gpu {
             cb.wait_until_completed();
         });
     }
+}
+
+/// A completed command buffer's GPU start and end times, in seconds.
+/// metal-rs does not wrap these properties.
+fn gpu_times(cb: &metal::CommandBufferRef) -> (f64, f64) {
+    use metal::objc::{msg_send, sel, sel_impl};
+    unsafe { (msg_send![cb, GPUStartTime], msg_send![cb, GPUEndTime]) }
 }

@@ -36,7 +36,10 @@ fn main() -> Result<(), String> {
 
     for (pass, sync) in [
         ("one command buffer per token", false),
-        ("per dispatch (profiling, with a round trip each)", true),
+        (
+            "per dispatch, GPU time from command-buffer timestamps",
+            true,
+        ),
     ] {
         rt.sync = sync;
         rt.reset();
@@ -59,14 +62,16 @@ fn main() -> Result<(), String> {
         );
         println!(
             "  {:<22} {:>7} {:>10} {:>9} {:>7}",
-            "call site", "calls", "ms/token", "us/call", "share"
+            "call site", "calls", "ms/token", "us/call", "of sum"
         );
-        for (label, n, s) in rt.profile() {
+        let prof = rt.profile();
+        let sum: f64 = prof.iter().map(|p| p.2).sum();
+        for (label, n, s) in prof {
             println!(
                 "  {label:<22} {n:>7} {:>10.2} {:>9.1} {:>6.1}%",
                 1e3 * s / tokens as f64,
                 1e6 * s / n as f64,
-                100.0 * s / total
+                100.0 * s / sum
             );
         }
     }

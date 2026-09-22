@@ -11,35 +11,37 @@ there is in [`docs/roadmap.md`](docs/roadmap.md).
 
 **Where it stands:** a Llama-3.1-8B served by Ollama, in 4-bit, runs entirely
 on kernels this compiler generated, and produces the same tokens as Ollama.
-Speed is now the work: decode is at half of Ollama's speed on the 8B and
-three quarters on the 1B, up 6.7× and 16× from where correctness left it.
+Decode now runs at about 70% of Ollama's speed on the 8B and about 80% on
+the 1B, 9× and 16× faster than where correctness left it. Prefill is next.
 
 | Phase | State | Details |
 | --- | --- | --- |
 | **P0** Spine | closed | RMSNorm at 98.1% of the copy ceiling (463.6 GB/s) on an M4 Max, matching the reference. [`docs/P0.md`](docs/P0.md) |
 | **P1** Types | closed (in the interpreter) | Linear tiles, effect-typed copies and barrier-synchronised pipes check a flash-attention decode loop: plain, double-buffered, and warp-specialised for Hopper. All variants match PyTorch. [`docs/P1.md`](docs/P1.md) |
 | **P2** Metal, correct | **exit test met** | Llama-3.1-8B in int4 (Q4_K_M, from Ollama) runs on tile kernels on the GPU, and its greedy tokens are identical to Ollama's. [`docs/P2.md`](docs/P2.md) |
-| **P3** Metal, fast | in progress | One command buffer per token, split-K reductions, dequantisation fused into the matvec, weights read in the file's own scale format with group terms hoisted. The 1B has passed the 70%-of-Ollama decode target; the 8B is at 51%. Next: single-pass Q4_K, packed Q6_K, graph fusion, prefill. [`docs/P3.md`](docs/P3.md) |
+| **P3** Metal, fast | decode target met; prefill next | Decode is at ≥ 70% of Ollama on both models (8B 68–72%, 1B ~81%), reading as many bytes per token as llama.cpp. Dequantisation is fused into the matvec by the lowering, weights stay in their native packing, and reductions are parallel. Next: prefill (batched matmul, `simdgroup_matrix`) and graph fusion. [`docs/P3.md`](docs/P3.md) |
 
 Measured on an M4 Max, each model greedy-decoded on 4 prompts × 24 tokens
 next to Ollama itself (`scripts/tile_vs_ollama.py`):
 
 | Model | Weights | Tokens identical to Ollama | Log-prob gap vs Ollama | vs f32 reference | tile | Ollama |
 | --- | --- | --- | --- | --- | --- | --- |
-| `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.009 | ≤ 0.007 | ~211 tok/s | ~276 tok/s |
-| `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.08 | ≤ 0.006 | ~45 tok/s | ~88 tok/s |
+| `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.009 | ≤ 0.007 | ~214–218 tok/s | ~268 tok/s |
+| `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.08 | ≤ 0.007 | ~60–64 tok/s | ~88 tok/s |
 
 How to read the table:
 - **Correctness:** tile agrees with an f32 PyTorch reference to within 0.007 on
   both models. Ollama differs from both by more, up to 0.09 on the 8B,
   because llama.cpp's quantised kernels round differently. So the remaining
   gap is on Ollama's side, not tile's.
-- **Speed:** tile reaches 76% of Ollama on the 1B and 51% on the 8B. At P2's
+- **Speed:** tile reaches about 80% of Ollama on the 1B and 68–72% on the
+  8B, reading 4.71 GB of weights per token against llama.cpp's 4.62. At P2's
   end it was 13 and 6.8 tok/s: every op was a separate dispatch that waited
   for the last, and the kernels were the simplest correct ones.
   `cargo run --release -p tile-rt --example profile -- --model llama3.1:8b`
-  shows where the time goes now. [`docs/P3.md`](docs/P3.md) lists what
-  closes the rest: single-pass Q4_K, packed Q6_K, fused small ops, prefill.
+  shows where the time goes now, per kernel from GPU timestamps.
+  [`docs/P3.md`](docs/P3.md) covers what's left: prefill and fused small
+  ops.
 
 What runs where:
 - **Copy and RMSNorm** are hand-planned P0 kernels. They run on the GPU at
@@ -72,14 +74,19 @@ token and every top-5 log-probability. On `llama3.1:8b`:
 ```text
 'The capital of France is'
   tile   : ' a city of grandeur and beauty, with a rich history and culture that is reflected in its stunning architecture, world-class'
-  24/24 tokens identical to Ollama, worst |dlogprob| 0.0207 (tolerance 0.1)  PASS
-  tile decode 45.4 tok/s on the GPU
+  24/24 tokens identical to Ollama, worst |dlogprob| 0.0202 (tolerance 0.1)  PASS
+  tile decode 33.9 tok/s on the GPU
 
 'def fibonacci(n):'
   tile   : ' \n    if n <= 0: \n        return "Input should be a positive integer" \n    elif n =='
-  24/24 tokens identical to Ollama, worst |dlogprob| 0.0800 (tolerance 0.1)  PASS
+  24/24 tokens identical to Ollama, worst |dlogprob| 0.0828 (tolerance 0.1)  PASS
+  tile decode 64.3 tok/s on the GPU
   ...
 ```
+
+In this run the first prompt measured slower than the other three, which
+settled at ~63–64 tok/s against Ollama's ~88. That outlier isn't explained
+yet (it didn't show up in the previous run), so it's shown as measured.
 
 The weights are the GGUF blob in Ollama's own store, found through its
 manifest; there is no conversion step. `--prompt "..."` and `--steps N` take
