@@ -22,10 +22,21 @@
 //! The schedule — `bq`, `bk`, `stages`, where K/V live — is a parameter of the
 //! builder, not part of the algorithm. The same function builds the Metal and
 //! the Hopper variants; the checker decides whether each fits its target.
+//!
+//! With `consumers > 0` the kernel is warp-specialised the way FlashAttention-3
+//! is on Hopper: one producer warp fills a K/V pipe, and `consumers` consumer
+//! warpgroups each own a slice of the query blocks and read every slot:
+//!
+//! ```text
+//! role producer (1 warp):         for i: slot = acquire; commit [K_i, V_i] -> slot
+//! role consumer c (4 warps each): for i: kv = receive; attend(&kv.0, &kv.1); release kv
+//! ```
 
 use tile_ir::{DType, Space};
 
-use crate::ir::{Arg, BinOp, Builder, IdxExpr, Op, Program, Reduce, TileTy, Ty, Var, View};
+use crate::ir::{
+    Arg, BinOp, Builder, IdxExpr, Op, Program, Reduce, RoleDef, TileTy, Ty, Var, View,
+};
 
 /// Problem shape plus schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +57,9 @@ pub struct FlashDecode {
     pub dtype: DType,
     /// Where K/V tiles are staged. Async copies need `Threadgroup`.
     pub kv_space: Space,
+    /// 0: one role does everything. N > 0: a producer warp and N consumer
+    /// warpgroups connected by a `stages`-deep pipe.
+    pub consumers: usize,
 }
 
 impl FlashDecode {
@@ -103,25 +117,12 @@ impl FlashDecode {
         let acc_ty = reg(DType::F32, &[c.bq, c.d]);
         let kv = c.kv_tile();
 
-        // Query blocks, loaded once and only ever borrowed.
-        let q_blocks: Vec<Var> = (0..c.n_qb())
-            .map(|qb| {
-                let view = rows(pq, IdxExpr::lit(qb * c.bq), c.bq, c.d);
-                b.op("q", Op::Load(view, reg(c.dtype, &[c.bq, c.d])))
-            })
-            .collect();
-        let qs = b.op("qs", Op::MakeArray(q_blocks));
+        if c.consumers > 0 {
+            c.specialized(&mut b, [pq, pk, pv, po])?;
+            return Ok(b.finish());
+        }
 
-        // Online-softmax state, one entry per query block.
-        let state = |b: &mut Builder, name: &str, ty: &TileTy, x: f32| {
-            let v: Vec<Var> = (0..c.n_qb())
-                .map(|_| b.op(name, Op::Fill(ty.clone(), x)))
-                .collect();
-            b.op(name, Op::MakeArray(v))
-        };
-        let ms = state(&mut b, "m", &m_ty, f32::NEG_INFINITY);
-        let ls = state(&mut b, "l", &m_ty, 0.0);
-        let accs = state(&mut b, "acc", &acc_ty, 0.0);
+        let (qs, [ms, ls, accs]) = setup(&mut b, &c, pq, 0, c.n_qb());
 
         if c.kv_space != Space::Threadgroup {
             // Synchronous loads straight into registers: nothing to rotate.
@@ -131,12 +132,19 @@ impl FlashDecode {
                 let at = IdxExpr::scaled(i, c.bk, 0);
                 let k = b.op("k", Op::Load(rows(pk, at.clone(), c.bk, c.d), kv.clone()));
                 let v = b.op("v", Op::Load(rows(pv, at, c.bk, c.d), kv.clone()));
-                let out = attend(b, &c, qs, k, v, [p[0], p[1], p[2]]);
+                let out = attend(
+                    b,
+                    &c,
+                    qs,
+                    Arg::Borrow(k),
+                    Arg::Borrow(v),
+                    [p[0], p[1], p[2]],
+                );
                 b.drop(k);
                 b.drop(v);
                 out.to_vec()
             });
-            finish(&mut b, &c, po, qs, [out[0], out[1], out[2]]);
+            finish(&mut b, &c, po, 0, qs, [out[0], out[1], out[2]]);
             return Ok(b.finish());
         }
 
@@ -193,7 +201,14 @@ impl FlashDecode {
             let kcur = b.op("k", Op::Wait(kq.remove(0)));
             let vcur = b.op("v", Op::Wait(vq.remove(0)));
 
-            let [ms, ls, accs] = attend(b, &c, qs, kcur, vcur, [ms, ls, accs]);
+            let [ms, ls, accs] = attend(
+                b,
+                &c,
+                qs,
+                Arg::Borrow(kcur),
+                Arg::Borrow(vcur),
+                [ms, ls, accs],
+            );
 
             // The tiles just consumed become the free buffers.
             let mut y = vec![ms, ls, accs];
@@ -211,19 +226,130 @@ impl FlashDecode {
         for (&kf, &vf) in kq.iter().zip(vq) {
             let kcur = b.op("k", Op::Wait(kf));
             let vcur = b.op("v", Op::Wait(vf));
-            [ms, ls, accs] = attend(&mut b, &c, qs, kcur, vcur, [ms, ls, accs]);
+            [ms, ls, accs] = attend(
+                &mut b,
+                &c,
+                qs,
+                Arg::Borrow(kcur),
+                Arg::Borrow(vcur),
+                [ms, ls, accs],
+            );
             b.drop(kcur);
             b.drop(vcur);
         }
         b.drop(kfree);
         b.drop(vfree);
-        finish(&mut b, &c, po, qs, [ms, ls, accs]);
+        finish(&mut b, &c, po, 0, qs, [ms, ls, accs]);
         Ok(b.finish())
+    }
+
+    /// Producer warp + `consumers` consumer warpgroups over one K/V pipe.
+    fn specialized(&self, b: &mut Builder, [pq, pk, pv, po]: [usize; 4]) -> Result<(), String> {
+        let c = *self;
+        if c.kv_space != Space::Threadgroup {
+            return Err("a pipe's slots live in threadgroup memory".into());
+        }
+        if !c.n_qb().is_multiple_of(c.consumers) {
+            return Err(format!(
+                "{} query blocks do not split over {} consumers",
+                c.n_qb(),
+                c.consumers
+            ));
+        }
+        let per = c.n_qb() / c.consumers;
+        let kv = c.kv_tile();
+        let pipe = b.pipe(vec![kv.clone(), kv], c.stages, c.consumers);
+
+        let mut roles = vec![RoleDef {
+            name: "producer",
+            warps: 1,
+            inputs: vec![(pipe.ty.id, Ty::Producer(pipe.ty.clone()))],
+            n_results: 0,
+            body: Box::new(move |b: &mut Builder, p: &[Var]| {
+                let h = p[0];
+                b.for_range(0, c.n_kb(), vec![], vec![], |b, i, _| {
+                    let at = IdxExpr::scaled(i, c.bk, 0);
+                    let slot = b.op("slot", Op::Acquire(h));
+                    let views = vec![rows(pk, at.clone(), c.bk, c.d), rows(pv, at, c.bk, c.d)];
+                    b.effect(Op::Commit(h, views, slot));
+                    vec![]
+                });
+                vec![]
+            }),
+        }];
+        for (k, &cons) in pipe.consumers.iter().enumerate() {
+            let ty = Ty::Consumer(pipe.ty.clone(), k);
+            roles.push(RoleDef {
+                name: "consumer",
+                warps: 4,
+                inputs: vec![(cons, ty)],
+                n_results: 0,
+                body: Box::new(move |b: &mut Builder, p: &[Var]| {
+                    let h = p[0];
+                    let q0 = k * per * c.bq;
+                    let (qs, state) = setup(b, &c, pq, q0, per);
+                    let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
+                    let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
+                    let carry = vec![
+                        Ty::Array(m_ty.clone(), per),
+                        Ty::Array(m_ty, per),
+                        Ty::Array(acc_ty, per),
+                    ];
+                    let out = b.for_range(0, c.n_kb(), state.to_vec(), carry, |b, _, p| {
+                        let kv = b.op("kv", Op::Receive(h));
+                        let out = attend(
+                            b,
+                            &c,
+                            qs,
+                            Arg::BorrowPart(kv, 0),
+                            Arg::BorrowPart(kv, 1),
+                            [p[0], p[1], p[2]],
+                        );
+                        b.effect(Op::Release(h, kv));
+                        out.to_vec()
+                    });
+                    finish(b, &c, po, q0, qs, [out[0], out[1], out[2]]);
+                    vec![]
+                }),
+            });
+        }
+        b.specialize(vec![pipe], roles);
+        Ok(())
     }
 }
 
+/// Load `n` query blocks starting at row `q0` (only ever borrowed after
+/// this), and the online-softmax state for each.
+fn setup(b: &mut Builder, c: &FlashDecode, pq: usize, q0: usize, n: usize) -> (Var, [Var; 3]) {
+    let reg = |dt, shape: &[usize]| TileTy::new(dt, shape, Space::Reg);
+    let q_blocks: Vec<Var> = (0..n)
+        .map(|qb| {
+            let view = rows(pq, IdxExpr::lit(q0 + qb * c.bq), c.bq, c.d);
+            b.op("q", Op::Load(view, reg(c.dtype, &[c.bq, c.d])))
+        })
+        .collect();
+    let qs = b.op("qs", Op::MakeArray(q_blocks));
+    let mut state = |name: &str, ty: TileTy, x: f32| {
+        let v: Vec<Var> = (0..n)
+            .map(|_| b.op(name, Op::Fill(ty.clone(), x)))
+            .collect();
+        b.op(name, Op::MakeArray(v))
+    };
+    let ms = state("m", reg(DType::F32, &[c.bq]), f32::NEG_INFINITY);
+    let ls = state("l", reg(DType::F32, &[c.bq]), 0.0);
+    let accs = state("acc", reg(DType::F32, &[c.bq, c.d]), 0.0);
+    (qs, [ms, ls, accs])
+}
+
 /// `o[qb] = acc / l`, then release the query blocks.
-fn finish(b: &mut Builder, c: &FlashDecode, po: usize, qs: Var, [ms, ls, accs]: [Var; 3]) {
+fn finish(
+    b: &mut Builder,
+    c: &FlashDecode,
+    po: usize,
+    q0: usize,
+    qs: Var,
+    [ms, ls, accs]: [Var; 3],
+) {
     let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
     let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
     b.map_each(
@@ -240,7 +366,7 @@ fn finish(b: &mut Builder, c: &FlashDecode, po: usize, qs: Var, [ms, ls, accs]: 
                 Op::Binary(BinOp::Div, Arg::Move(p[2]), Arg::Move(p[1])),
             );
             b.drop(p[0]);
-            let view = rows(po, IdxExpr::scaled(qb, c.bq, 0), c.bq, c.d);
+            let view = rows(po, IdxExpr::scaled(qb, c.bq, q0), c.bq, c.d);
             b.effect(Op::Store(Arg::Move(o), view));
             vec![]
         },
@@ -259,7 +385,7 @@ fn rows(param: usize, start: IdxExpr, rows: usize, d: usize) -> View {
 
 /// One KV block against every query block: the online-softmax update.
 /// `k` and `v` are borrowed by every iteration of the inner loop.
-fn attend(b: &mut Builder, c: &FlashDecode, qs: Var, k: Var, v: Var, state: [Var; 3]) -> [Var; 3] {
+fn attend(b: &mut Builder, c: &FlashDecode, qs: Var, k: Arg, v: Arg, state: [Var; 3]) -> [Var; 3] {
     use Arg::{Borrow, Move};
     let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
     let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
@@ -267,10 +393,7 @@ fn attend(b: &mut Builder, c: &FlashDecode, qs: Var, k: Var, v: Var, state: [Var
     let scale = 1.0 / (c.d as f32).sqrt();
     let out = b.map_each(state.to_vec(), elem, 3, |b, qb, p| {
         let (m, l, acc) = (p[0], p[1], p[2]);
-        let s = b.op(
-            "s",
-            Op::MatMulNT(Arg::BorrowElem(qs, qb), Borrow(k), DType::F32),
-        );
+        let s = b.op("s", Op::MatMulNT(Arg::BorrowElem(qs, qb), k, DType::F32));
         let s = b.op("s", Op::Scale(Move(s), scale));
         let mb = b.op("mb", Op::RowReduce(Reduce::Max, Borrow(s)));
         let m_new = b.op("m", Op::Binary(BinOp::Max, Borrow(m), Move(mb)));
@@ -281,7 +404,7 @@ fn attend(b: &mut Builder, c: &FlashDecode, qs: Var, k: Var, v: Var, state: [Var
         let ps = b.op("ps", Op::RowReduce(Reduce::Sum, Borrow(p)));
         let l = b.op("l", Op::Binary(BinOp::Mul, Move(l), Borrow(alpha)));
         let l = b.op("l", Op::Binary(BinOp::Add, Move(l), Move(ps)));
-        let pv = b.op("pv", Op::MatMul(Move(p), Borrow(v), DType::F32));
+        let pv = b.op("pv", Op::MatMul(Move(p), v, DType::F32));
         let acc = b.op("acc", Op::Binary(BinOp::Mul, Move(acc), Move(alpha)));
         let acc = b.op("acc", Op::Binary(BinOp::Add, Move(acc), Move(pv)));
         vec![m_new, l, acc]

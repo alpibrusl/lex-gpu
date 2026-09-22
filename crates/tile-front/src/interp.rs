@@ -11,13 +11,24 @@
 //! so this is observationally the same as copying eagerly — but it is the
 //! semantics a hardware backend has, and it keeps the interpreter honest if
 //! kernels ever read what they write.
+//!
+//! Roles of a warp-specialised region run on real threads, so their
+//! interleaving is whatever the OS makes of it, and pipes block exactly as
+//! barriers would. A share re-reads its slot on every borrow and fails if the
+//! producer has refilled it — so a protocol bug shows up as a race, not as a
+//! quietly different answer. A wait that cannot finish is reported as a
+//! deadlock after [`RunOptions::deadlock_after`].
 
 use std::collections::HashMap;
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use half::f16;
 use tile_ir::DType;
 
-use crate::ir::{Arg, Block, IdxExpr, Op, Program, Reduce, Stmt, TileTy, Var, View};
+use crate::ir::{
+    Arg, Block, IdxExpr, Op, PipeDecl, Program, Reduce, Role, Stmt, TileTy, Var, View,
+};
 
 /// A global tensor. Values are held as f32, already rounded to `dtype`.
 #[derive(Clone, Debug, PartialEq)]
@@ -69,19 +80,77 @@ enum Val {
     Future(Box<Pending>),
     Array(Vec<Tile>),
     Index(i64),
+    Producer(Var),
+    Consumer(Var, usize),
+    Slot {
+        pipe: Var,
+        slot: usize,
+    },
+    Share {
+        pipe: Var,
+        slot: usize,
+        generation: u64,
+    },
+}
+
+/// One pipe's ring, as the barriers would see it.
+struct Ring {
+    stages: usize,
+    consumers: usize,
+    data: Vec<Option<Vec<Tile>>>,
+    /// Bumped on every commit into a slot; a share remembers the one it saw.
+    generation: Vec<u64>,
+    /// Releases the slot has had since it was last acquired. The slot is
+    /// empty — acquirable — when this equals `consumers`.
+    released: Vec<usize>,
+    acquired: usize,
+    /// Slot of the n-th commit. Consumer k's r-th receive reads `log[r]`.
+    log: Vec<usize>,
+    received: Vec<usize>,
+}
+
+#[derive(Default)]
+struct SyncState {
+    rings: HashMap<Var, Ring>,
+    abort: Option<String>,
+}
+
+struct Shared {
+    globals: Mutex<Vec<Tensor>>,
+    sync: Mutex<SyncState>,
+    cv: Condvar,
+    deadlock_after: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RunOptions {
+    /// How long a pipe wait may block before the run is declared deadlocked.
+    pub deadlock_after: Duration,
+}
+
+impl Default for RunOptions {
+    fn default() -> RunOptions {
+        RunOptions {
+            deadlock_after: Duration::from_secs(10),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, String>;
 
 struct Interp<'a> {
     prog: &'a Program,
-    globals: &'a mut [Tensor],
+    shared: &'a Shared,
     env: HashMap<Var, Val>,
 }
 
 /// Run `prog` over `globals`, one tensor per parameter in declaration order.
 /// Writable parameters are updated in place.
 pub fn run(prog: &Program, globals: &mut [Tensor]) -> Result<()> {
+    run_with(prog, globals, RunOptions::default())
+}
+
+pub fn run_with(prog: &Program, globals: &mut [Tensor], opts: RunOptions) -> Result<()> {
     if globals.len() != prog.params.len() {
         return Err(format!(
             "{} expects {} tensors, got {}",
@@ -98,13 +167,62 @@ pub fn run(prog: &Program, globals: &mut [Tensor]) -> Result<()> {
             ));
         }
     }
+    let shared = Shared {
+        globals: Mutex::new(globals.to_vec()),
+        sync: Mutex::new(SyncState::default()),
+        cv: Condvar::new(),
+        deadlock_after: opts.deadlock_after,
+    };
     let mut it = Interp {
         prog,
-        globals,
+        shared: &shared,
         env: HashMap::new(),
     };
     it.block(&prog.body)?;
+    globals.clone_from_slice(&shared.globals.into_inner().expect("globals lock"));
     Ok(())
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, SyncState> {
+        self.sync.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn abort(&self, why: String) {
+        let mut st = self.lock();
+        st.abort.get_or_insert(why);
+        self.cv.notify_all();
+    }
+
+    /// Block until `ready` holds, as a barrier wait would.
+    fn wait_until<'g>(
+        &'g self,
+        mut st: MutexGuard<'g, SyncState>,
+        what: &str,
+        mut ready: impl FnMut(&SyncState) -> bool,
+    ) -> Result<MutexGuard<'g, SyncState>> {
+        let deadline = Instant::now() + self.deadlock_after;
+        loop {
+            if st.abort.is_some() {
+                return Err("aborted: another role failed".into());
+            }
+            if ready(&st) {
+                return Ok(st);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let why = format!("deadlock: {what} waited {:?}", self.deadlock_after);
+                st.abort = Some(why.clone());
+                self.cv.notify_all();
+                return Err(why);
+            }
+            st = self
+                .cv
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
 }
 
 impl Interp<'_> {
@@ -140,7 +258,7 @@ impl Interp<'_> {
     }
 
     fn offsets(&self, view: &View) -> Result<Vec<usize>> {
-        let p = &self.globals[view.param];
+        let p = &self.prog.params[view.param];
         let mut out = vec![];
         for (d, e) in view.offset.iter().enumerate() {
             let o = self.eval(e)?;
@@ -154,7 +272,7 @@ impl Interp<'_> {
 
     /// Linear element offsets of a view, in row-major order of the view.
     fn view_elems(&self, param: usize, offset: &[usize], shape: &[usize]) -> Vec<usize> {
-        let dims = &self.globals[param].shape;
+        let dims = &self.prog.params[param].shape;
         let n: usize = shape.iter().product();
         let mut out = Vec::with_capacity(n);
         for flat in 0..n {
@@ -173,12 +291,14 @@ impl Interp<'_> {
     }
 
     fn read_global(&self, param: usize, offset: &[usize], ty: &TileTy) -> Tile {
-        let src = &self.globals[param].data;
-        let data = self
-            .view_elems(param, offset, &ty.shape)
-            .into_iter()
-            .map(|i| round(ty.dtype, src[i]))
-            .collect();
+        let idx = self.view_elems(param, offset, &ty.shape);
+        let globals = self
+            .shared
+            .globals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let src = &globals[param].data;
+        let data = idx.into_iter().map(|i| round(ty.dtype, src[i])).collect();
         Tile {
             ty: ty.clone(),
             data,
@@ -208,6 +328,25 @@ impl Interp<'_> {
                         .ok_or_else(|| format!("index {i} out of bounds"))?,
                     _ => return Err(format!("`{}` is not an array", self.name(arr))),
                 }
+            }
+            Arg::BorrowPart(share, part) => {
+                let &Val::Share {
+                    pipe,
+                    slot,
+                    generation,
+                } = self.get(share)?
+                else {
+                    return Err(format!("`{}` is not a share", self.name(share)));
+                };
+                let st = self.shared.lock();
+                let ring = st.rings.get(&pipe).ok_or("share of a closed pipe")?;
+                if ring.generation[slot] != generation {
+                    return Err(format!(
+                        "race: slot {slot} was refilled while `{}` still shared it",
+                        self.name(share)
+                    ));
+                }
+                ring.data[slot].as_ref().ok_or("share of an empty slot")?[part].clone()
             }
         };
         if !t.init {
@@ -260,7 +399,12 @@ impl Interp<'_> {
                 let t = self.arg(*a)?;
                 let off = self.offsets(view)?;
                 let idx = self.view_elems(view.param, &off, &view.shape);
-                let g = &mut self.globals[view.param];
+                let mut globals = self
+                    .shared
+                    .globals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let g = &mut globals[view.param];
                 for (i, x) in idx.into_iter().zip(t.data) {
                     g.data[i] = round(g.dtype, x);
                 }
@@ -335,6 +479,91 @@ impl Interp<'_> {
             Op::Convert(a, dt) => {
                 let t = self.arg(*a)?;
                 Some(Val::Tile(self.fresh(*dt, &t.ty.shape, t.data)))
+            }
+            Op::Acquire(h) => {
+                let Val::Producer(pipe) = *self.get(*h)? else {
+                    return Err("acquire through a non-producer".into());
+                };
+                let st = self.shared.lock();
+                let mut st = self.shared.wait_until(st, "acquire", |st| {
+                    let r = &st.rings[&pipe];
+                    r.released[r.acquired % r.stages] == r.consumers
+                })?;
+                let r = st.rings.get_mut(&pipe).expect("ring");
+                let slot = r.acquired % r.stages;
+                r.released[slot] = 0;
+                r.acquired += 1;
+                drop(st);
+                std::thread::yield_now();
+                Some(Val::Slot { pipe, slot })
+            }
+            Op::Commit(h, views, slot) => {
+                let Val::Producer(pipe) = *self.get(*h)? else {
+                    return Err("commit through a non-producer".into());
+                };
+                let Val::Slot { pipe: sp, slot } = self.take(*slot)? else {
+                    return Err("commit of a non-slot".into());
+                };
+                if sp != pipe {
+                    return Err("commit into another pipe's slot".into());
+                }
+                let mut parts = vec![];
+                for v in views {
+                    let off = self.offsets(v)?;
+                    let ty = TileTy::new(
+                        self.prog.params[v.param].dtype,
+                        &v.shape,
+                        tile_ir::Space::Threadgroup,
+                    );
+                    parts.push(self.read_global(v.param, &off, &ty));
+                }
+                let mut st = self.shared.lock();
+                let r = st.rings.get_mut(&pipe).expect("ring");
+                r.data[slot] = Some(parts);
+                r.generation[slot] += 1;
+                r.log.push(slot);
+                self.shared.cv.notify_all();
+                drop(st);
+                std::thread::yield_now();
+                None
+            }
+            Op::Receive(h) => {
+                let Val::Consumer(pipe, k) = *self.get(*h)? else {
+                    return Err("receive through a non-consumer".into());
+                };
+                let st = self.shared.lock();
+                let mut st = self.shared.wait_until(st, "receive", |st| {
+                    let r = &st.rings[&pipe];
+                    r.log.len() > r.received[k]
+                })?;
+                let r = st.rings.get_mut(&pipe).expect("ring");
+                let slot = r.log[r.received[k]];
+                r.received[k] += 1;
+                let generation = r.generation[slot];
+                drop(st);
+                std::thread::yield_now();
+                Some(Val::Share {
+                    pipe,
+                    slot,
+                    generation,
+                })
+            }
+            Op::Release(h, share) => {
+                let Val::Consumer(pipe, _) = *self.get(*h)? else {
+                    return Err("release through a non-consumer".into());
+                };
+                let Val::Share { pipe: sp, slot, .. } = self.take(*share)? else {
+                    return Err("release of a non-share".into());
+                };
+                if sp != pipe {
+                    return Err("release into another pipe".into());
+                }
+                let mut st = self.shared.lock();
+                st.rings.get_mut(&pipe).expect("ring").released[slot] += 1;
+                self.shared.cv.notify_all();
+                drop(st);
+                std::thread::yield_now();
+                None
             }
             Op::MakeArray(vs) => {
                 let mut ts = vec![];
@@ -420,6 +649,85 @@ impl Interp<'_> {
                 for (&r, ts) in results.iter().zip(outs) {
                     self.env.insert(r, Val::Array(ts));
                 }
+            }
+            Stmt::Specialize { pipes, roles } => self.specialize(pipes, roles)?,
+        }
+        Ok(())
+    }
+
+    fn specialize(&mut self, pipes: &[PipeDecl], roles: &[Role]) -> Result<()> {
+        {
+            let mut st = self.shared.lock();
+            for p in pipes {
+                let t = &p.ty;
+                st.rings.insert(
+                    t.id,
+                    Ring {
+                        stages: t.stages,
+                        consumers: t.consumers,
+                        data: vec![None; t.stages],
+                        generation: vec![0; t.stages],
+                        released: vec![t.consumers; t.stages],
+                        acquired: 0,
+                        log: vec![],
+                        received: vec![0; t.consumers],
+                    },
+                );
+            }
+        }
+        for p in pipes {
+            self.env.insert(p.ty.id, Val::Producer(p.ty.id));
+            for (k, &c) in p.consumers.iter().enumerate() {
+                self.env.insert(c, Val::Consumer(p.ty.id, k));
+            }
+        }
+        let mut moved = vec![];
+        for r in roles {
+            let vals: Vec<Val> = r
+                .inputs
+                .iter()
+                .map(|&i| self.take(i))
+                .collect::<Result<_>>()?;
+            moved.push(vals);
+        }
+
+        // Each role sees what it may borrow from the enclosing scope, plus
+        // what was moved into it, and runs on its own thread.
+        let (prog, shared, outer) = (self.prog, self.shared, &self.env);
+        let results: Vec<Result<Vec<Val>>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = roles
+                .iter()
+                .zip(moved)
+                .map(|(r, vals)| {
+                    let mut env = outer.clone();
+                    env.extend(r.params.iter().copied().zip(vals));
+                    sc.spawn(move || {
+                        let out = Interp { prog, shared, env }.block(&r.body);
+                        if let Err(e) = &out {
+                            shared.abort(format!("role `{}`: {e}", r.name));
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err("role panicked".into())))
+                .collect()
+        });
+        self.shared
+            .lock()
+            .rings
+            .retain(|id, _| !pipes.iter().any(|p| p.ty.id == *id));
+
+        // Report the root cause, not the roles that were aborted by it.
+        if results.iter().any(Result::is_err) {
+            let why = self.shared.lock().abort.clone();
+            return Err(why.unwrap_or_else(|| "a role failed".into()));
+        }
+        for (r, out) in roles.iter().zip(results) {
+            for (&v, val) in r.results.iter().zip(out?) {
+                self.env.insert(v, val);
             }
         }
         Ok(())

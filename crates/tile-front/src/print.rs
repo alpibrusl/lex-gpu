@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::ir::{Arg, Block, IdxExpr, Op, Program, Reduce, Stmt, TileTy, Ty, Var, View};
+use crate::ir::{Arg, Block, IdxExpr, Op, PipeTy, Program, Reduce, Stmt, TileTy, Ty, Var, View};
 
 pub fn program(p: &Program) -> String {
     let mut out = String::new();
@@ -30,7 +30,21 @@ fn ty(t: &Ty) -> String {
         Ty::Future(t) => format!("Future<{}>", tile(t)),
         Ty::Array(t, n) => format!("[{}; {n}]", tile(t)),
         Ty::Index => "index".into(),
+        Ty::Producer(q) => format!("Producer<{}>", pipe(q)),
+        Ty::Consumer(q, k) => format!("Consumer#{k}<{}>", pipe(q)),
+        Ty::Slot(q) => format!("Slot<{}>", pipe(q)),
+        Ty::Share(q, k) => format!("Share#{k}<{}>", pipe(q)),
     }
+}
+
+fn pipe(q: &PipeTy) -> String {
+    let parts: Vec<String> = q.elem.iter().map(tile).collect();
+    format!(
+        "({}) x{}, {} consumers",
+        parts.join(", "),
+        q.stages,
+        q.consumers
+    )
 }
 
 fn var(p: &Program, v: Var) -> String {
@@ -42,6 +56,7 @@ fn arg(p: &Program, a: Arg) -> String {
         Arg::Move(v) => var(p, v),
         Arg::Borrow(v) => format!("&{}", var(p, v)),
         Arg::BorrowElem(a, i) => format!("&{}[{}]", var(p, a), var(p, i)),
+        Arg::BorrowPart(s, k) => format!("&{}.{k}", var(p, s)),
     }
 }
 
@@ -101,6 +116,18 @@ fn op(p: &Program, o: &Op) -> String {
         }
         Op::Convert(a, dt) => format!("convert {} -> {dt:?}", arg(p, *a)),
         Op::MakeArray(vs) => format!("array [{}]", vars(p, vs)),
+        Op::Acquire(h) => format!("acquire {}", var(p, *h)),
+        Op::Commit(h, views, slot) => {
+            let vs: Vec<String> = views.iter().map(|v| view(p, v)).collect();
+            format!(
+                "commit {} [{}] -> {}",
+                var(p, *h),
+                vs.join(", "),
+                var(p, *slot)
+            )
+        }
+        Op::Receive(h) => format!("receive {}", var(p, *h)),
+        Op::Release(h, s) => format!("release {}, {}", var(p, *h), var(p, *s)),
     }
 }
 
@@ -134,16 +161,16 @@ fn block(p: &Program, b: &Block, depth: usize, out: &mut String) {
                         format!("{}: {t} = {}", var(p, q), var(p, i))
                     })
                     .collect();
-                let _ = writeln!(
-                    out,
-                    "{pad}{} = for {} in {start}..{end} carry(",
-                    vars(p, results),
-                    var(p, *index)
-                );
-                for c in carry {
-                    let _ = writeln!(out, "{pad}    {c},");
+                let head = format!("for {} in {start}..{end}", var(p, *index));
+                if carry.is_empty() {
+                    let _ = writeln!(out, "{pad}{head} {{");
+                } else {
+                    let _ = writeln!(out, "{pad}{} = {head} carry(", vars(p, results));
+                    for c in carry {
+                        let _ = writeln!(out, "{pad}    {c},");
+                    }
+                    let _ = writeln!(out, "{pad}) {{");
                 }
-                let _ = writeln!(out, "{pad}) {{");
                 block(p, body, depth + 1, out);
                 let _ = writeln!(out, "{pad}}}");
             }
@@ -167,6 +194,41 @@ fn block(p: &Program, b: &Block, depth: usize, out: &mut String) {
                     vars(p, arrays)
                 );
                 block(p, body, depth + 1, out);
+                let _ = writeln!(out, "{pad}}}");
+            }
+            Stmt::Specialize { pipes, roles } => {
+                let _ = writeln!(out, "{pad}specialize {{");
+                for q in pipes {
+                    let _ = writeln!(
+                        out,
+                        "{pad}  pipe {} -> [{}]: {}",
+                        var(p, q.ty.id),
+                        vars(p, &q.consumers),
+                        pipe(&q.ty)
+                    );
+                }
+                for r in roles {
+                    let lhs = if r.results.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} = ", vars(p, &r.results))
+                    };
+                    let binds: Vec<String> = r
+                        .params
+                        .iter()
+                        .zip(&r.inputs)
+                        .map(|(&q, &i)| format!("{} = {}", var(p, q), var(p, i)))
+                        .collect();
+                    let _ = writeln!(
+                        out,
+                        "{pad}  {lhs}role {} x{} warps ({}) {{",
+                        r.name,
+                        r.warps,
+                        binds.join(", ")
+                    );
+                    block(p, &r.body, depth + 2, out);
+                    let _ = writeln!(out, "{pad}  }}");
+                }
                 let _ = writeln!(out, "{pad}}}");
             }
         }
