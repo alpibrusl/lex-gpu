@@ -11,41 +11,43 @@ there is in [`docs/roadmap.md`](docs/roadmap.md).
 
 **Where it stands:** a Llama-3.1-8B served by Ollama, in 4-bit, runs entirely
 on kernels this compiler generated, and produces the same tokens as Ollama.
-At short contexts, decode runs at about 70% of Ollama's speed on the 8B and
-80% on the 1B, 9× and 16× faster than where correctness left it. **At
-realistic contexts it's about 45%**: tile's attention slows as the context
-grows and Ollama's doesn't. Split-KV attention is the next job. Prefill has
-a correct batched path, but it's 8–10× short of Ollama.
+Decode runs at 70–73% of Ollama's speed on the 8B and 80–84% on the 1B,
+and that holds from an empty context to 1,440 positions: split-KV attention
+made decode flat with context, as Ollama's is. That's 9× and 16× faster than
+where correctness left it. Prefill has a correct batched path, but it's
+8–10× short of Ollama.
 
 | Phase | State | Details |
 | --- | --- | --- |
 | **P0** Spine | closed | RMSNorm at 98.1% of the copy ceiling (463.6 GB/s) on an M4 Max, matching the reference. [`docs/P0.md`](docs/P0.md) |
 | **P1** Types | closed (in the interpreter) | Linear tiles, effect-typed copies and barrier-synchronised pipes check a flash-attention decode loop: plain, double-buffered, and warp-specialised for Hopper. All variants match PyTorch. [`docs/P1.md`](docs/P1.md) |
 | **P2** Metal, correct | **exit test met** | Llama-3.1-8B in int4 (Q4_K_M, from Ollama) runs on tile kernels on the GPU, and its greedy tokens are identical to Ollama's. [`docs/P2.md`](docs/P2.md) |
-| **P3** Metal, fast | in progress | Short-context decode at ≥ 70% of Ollama, reading as many bytes per token as llama.cpp. At 512 tokens of context it falls to ~45%. A batched forward pass (prefill, speculative verify) is correct but slow. Next: split-KV attention, then `simdgroup_matrix` for prefill. [`docs/P3.md`](docs/P3.md) |
+| **P3** Metal, fast | in progress | Decode at ≥ 70% of Ollama at every context measured (0–1,440 positions), reading as many bytes per token as llama.cpp. A batched forward pass (prefill, speculative verify) is correct but slow. Next: `simdgroup_matrix` and split-KV for prefill. [`docs/P3.md`](docs/P3.md) |
 
 Measured on an M4 Max, each model greedy-decoded on 4 prompts × 24 tokens
 next to Ollama itself (`scripts/tile_vs_ollama.py`):
 
-| Model | Weights | Tokens identical to Ollama | Log-prob gap vs Ollama | vs f32 reference | tile (short context) | Ollama |
+| Model | Weights | Tokens identical to Ollama | Log-prob gap vs Ollama | vs f32 reference | tile decode, 0–1,440 context | Ollama |
 | --- | --- | --- | --- | --- | --- | --- |
-| `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.009 | ≤ 0.007 | ~214–218 tok/s | ~268 tok/s |
-| `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.08 | ≤ 0.007 | ~60–64 tok/s | ~88 tok/s |
+| `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.009 | ≤ 0.007 | ~214–227 tok/s | ~267–269 tok/s |
+| `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.08 | ≤ 0.007 | ~58–62 tok/s | ~83–88 tok/s |
 
 How to read the table:
 - **Correctness:** tile agrees with an f32 PyTorch reference to within 0.007 on
   both models. Ollama differs from both by more, up to 0.09 on the 8B,
   because llama.cpp's quantised kernels round differently. So the remaining
   gap is on Ollama's side, not tile's.
-- **Speed:** at short contexts, tile reaches about 80% of Ollama on the 1B
-  and 68–72% on the 8B, reading 4.71 GB of weights per token against
-  llama.cpp's 4.62. At 512 tokens of context it's about 45% on both
-  (8B ~37 vs ~85 tok/s), because tile's attention slows with context and
-  Ollama's doesn't. [`docs/P3.md`](docs/P3.md) has the table. At P2's
-  end it was 13 and 6.8 tok/s: every op was a separate dispatch that waited
-  for the last, and the kernels were the simplest correct ones.
-  `cargo run --release -p tile-rt --example profile -- --model llama3.1:8b`
-  shows where the time goes now, per kernel from GPU timestamps.
+- **Speed:** tile reaches 80–84% of Ollama on the 1B and 70–73% on the 8B,
+  reading 4.71 GB of weights per token against llama.cpp's 4.62. Like
+  Ollama's, the speed barely moves with context: split-KV attention spreads
+  the cache over many threadgroups and merges their partial softmaxes
+  (before it, the 8B fell to 20 tok/s at 1,440 positions).
+  [`docs/P3.md`](docs/P3.md) has the table. At P2's end it was 13 and
+  6.8 tok/s: every op was a separate dispatch that waited for the last, and
+  the kernels were the simplest correct ones.
+  `cargo run --release -p tile-rt --example profile -- --model llama3.1:8b --context 512`
+  shows where the time goes at a given context, per kernel from GPU
+  timestamps.
   [`docs/P3.md`](docs/P3.md) covers what's left: prefill and fused small
   ops.
 
@@ -53,9 +55,9 @@ What runs where:
 - **Copy and RMSNorm** are hand-planned P0 kernels. They run on the GPU at
   parity with PyTorch (example 3).
 - **Llama inference** is typed `tile-front` programs: RMSNorm, quantised
-  matvec (Q8_0 / Q4_K / Q6_K), RoPE, flash-decode attention, SiLU·mul. They
-  are checked, run in the interpreter, and are lowered to MSL to run on the
-  GPU.
+  matvec (Q8_0 / Q4_K / Q6_K), RoPE, flash-decode attention (serial and
+  split-KV), SiLU·mul. They are checked, run in the interpreter, and are
+  lowered to MSL to run on the GPU.
 - **Host glue:** the embedding-row lookup and the RoPE tables are written by
   the CPU, on unified memory, before each token's command buffer. Everything
   inside the token, KV-cache append included, runs on the GPU.

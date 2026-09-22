@@ -145,6 +145,10 @@ pub fn check(prog: &Program, target: &Target) -> Result<Report, Vec<Diag>> {
         c.define(pid, Ty::Index, &mut top);
         c.ranges.insert(pid, Some((0, prog.grid as i64 - 1)));
     }
+    if let Some(pid2) = prog.pid2 {
+        c.define(pid2, Ty::Index, &mut top);
+        c.ranges.insert(pid2, Some((0, prog.grid2 as i64 - 1)));
+    }
     for &(v, max) in &prog.dyn_scalars {
         c.define(v, Ty::Index, &mut top);
         c.ranges.insert(v, Some((0, max as i64)));
@@ -579,7 +583,11 @@ impl Checker<'_> {
                 let (dt, shape) = self.view(view, true)?;
                 let ty = self.args(&[*a])?.remove(0);
                 let t = self.tile(ty, "stored value")?;
-                if t.shape != shape {
+                // A view's unit dimensions are squeezed: a `[n]` tile stores
+                // into a `[n, 1]` column as well as a `[1, n]` row.
+                let squeeze =
+                    |s: &[usize]| -> Vec<usize> { s.iter().copied().filter(|&d| d != 1).collect() };
+                if squeeze(&t.shape) != squeeze(&shape) {
                     self.err(
                         Kind::Shape,
                         format!("store of {:?} into {shape:?}", t.shape),

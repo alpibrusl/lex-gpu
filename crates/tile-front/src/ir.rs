@@ -416,6 +416,10 @@ pub struct Program {
     /// `pid` is the instance index, usable in view offsets like a loop index.
     pub grid: usize,
     pub pid: Option<Var>,
+    /// A second, independent grid dimension (`pid2` over `0..grid2`): e.g.
+    /// KV heads × cache splits. 1 when unused.
+    pub grid2: usize,
+    pub pid2: Option<Var>,
     /// Runtime scalars, in buffer order, with their inclusive upper bounds.
     /// Usable like loop indices; the bound is what the checker proves
     /// accesses against.
@@ -439,6 +443,8 @@ pub struct Builder {
     stack: Vec<Vec<Stmt>>,
     grid: usize,
     pid: Option<Var>,
+    grid2: usize,
+    pid2: Option<Var>,
     dyn_scalars: Vec<(Var, usize)>,
 }
 
@@ -452,6 +458,8 @@ impl Builder {
             stack: vec![vec![]],
             grid: 1,
             pid: None,
+            grid2: 1,
+            pid2: None,
             dyn_scalars: vec![],
         }
     }
@@ -464,6 +472,17 @@ impl Builder {
         self.grid = n;
         self.pid = Some(pid);
         pid
+    }
+
+    /// A second grid dimension of `n` instances; returns its index. A
+    /// runtime may launch fewer than `n` along it (only the splits a
+    /// sequence needs, say): every instance is independent.
+    pub fn grid2(&mut self, n: usize) -> Var {
+        assert!(self.pid2.is_none(), "grid2 declared twice");
+        let pid2 = self.fresh("pid2", Some(Ty::Index));
+        self.grid2 = n;
+        self.pid2 = Some(pid2);
+        pid2
     }
 
     pub fn param(&mut self, name: &str, dtype: DType, shape: &[usize], writable: bool) -> usize {
@@ -655,6 +674,8 @@ impl Builder {
             declared: self.declared,
             grid: self.grid,
             pid: self.pid,
+            grid2: self.grid2,
+            pid2: self.pid2,
             dyn_scalars: self.dyn_scalars,
         }
     }

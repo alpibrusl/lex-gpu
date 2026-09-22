@@ -215,11 +215,16 @@ fn run_full(
     for (&(v, _), &x) in prog.dyn_scalars.iter().zip(scalars) {
         it.env.insert(v, Val::Index(x as i64));
     }
-    for g in 0..prog.grid {
-        if let Some(pid) = prog.pid {
-            it.env.insert(pid, Val::Index(g as i64));
+    for g2 in 0..prog.grid2 {
+        if let Some(pid2) = prog.pid2 {
+            it.env.insert(pid2, Val::Index(g2 as i64));
         }
-        it.block(&prog.body)?;
+        for g in 0..prog.grid {
+            if let Some(pid) = prog.pid {
+                it.env.insert(pid, Val::Index(g as i64));
+            }
+            it.block(&prog.body)?;
+        }
     }
     globals.clone_from_slice(&shared.globals.into_inner().expect("globals lock"));
     Ok(())

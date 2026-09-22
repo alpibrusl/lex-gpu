@@ -203,7 +203,7 @@ pub fn log_softmax(logits: &[f32]) -> Vec<f64> {
 }
 
 #[cfg(target_os = "macos")]
-pub use gpu::Runner;
+pub use gpu::{Attention, Runner};
 
 #[cfg(target_os = "macos")]
 mod gpu {
@@ -213,14 +213,14 @@ mod gpu {
     use std::time::Instant;
 
     use half::f16;
-    use tile_front::flash::FlashDecode;
+    use tile_front::flash::{COMBINE_CHUNK, FlashDecode};
     use tile_front::llama::{
         QLayout, kv_append, kv_append_rows, matmul_q, matvec_q, rmsnorm, rmsnorm_rows, rope,
         rope_rows, rope_tables, silu_mul,
     };
     use tile_front::{Program, check};
     use tile_ir::{DType, Space, Target};
-    use tile_metal::{Buffer, Gpu, Pipeline};
+    use tile_metal::{Buffer, Gpu, Pipeline, Step};
     use tile_msl::program::lower;
 
     use super::{Config, QMat, Weights};
@@ -230,8 +230,43 @@ mod gpu {
     /// a whole number of them.
     const ATTN_BK: usize = 16;
 
-    /// One dispatch of a step: a profiling label, the pipeline, its buffers.
-    type Dispatch<'a> = (&'static str, &'a Pipeline, Vec<&'a Buffer>);
+    /// How a decode step attends over the cache.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Attention {
+        /// Blocks of the cache per split of split-KV attention (see
+        /// [`FlashDecode::build_split`]).
+        pub bps: usize,
+        /// Fewest splits worth splitting for: below it, the serial kernel
+        /// (one threadgroup per KV head) is cheaper than split + combine.
+        pub min_splits: usize,
+    }
+
+    impl Default for Attention {
+        /// Two blocks per split, split from two splits up (measured on the
+        /// 8B: one split costs 1.17 ms/token split + combined, 0.78 serial).
+        /// `TILE_BPS` and `TILE_MIN_SPLITS` override it for tuning.
+        fn default() -> Attention {
+            let env = |k: &str, d: usize| {
+                std::env::var(k)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(d)
+            };
+            Attention {
+                bps: env("TILE_BPS", 2),
+                min_splits: env("TILE_MIN_SPLITS", 2),
+            }
+        }
+    }
+
+    /// One dispatch of a step: a profiling label, the pipeline, its buffers,
+    /// and a launch smaller than the pipeline's planned grid (x, y), if any.
+    type Dispatch<'a> = (
+        &'static str,
+        &'a Pipeline,
+        Vec<&'a Buffer>,
+        Option<[usize; 2]>,
+    );
     const BO: usize = 8;
 
     fn compile(gpu: &Gpu, prog: &Program, threads: usize) -> Result<Pipeline, String> {
@@ -292,7 +327,12 @@ mod gpu {
         rope_k: Pipeline,
         silu: Pipeline,
         /// Flash decode over a runtime length: one pipeline for every step.
+        /// Serial over the cache, for contexts under `attention.min_splits`.
         attn: Pipeline,
+        /// Split-KV decode attention: (head, split) partials, then a merge.
+        attn_split: Pipeline,
+        attn_combine: Pipeline,
+        attention: Attention,
         kv_k: Pipeline,
         kv_v: Pipeline,
     }
@@ -314,6 +354,10 @@ mod gpu {
         cos: Buffer,
         sin: Buffer,
         logits: Buffer,
+        /// Split-KV partial states (max, sum, accumulator), shared by layers.
+        part_m: Buffer,
+        part_l: Buffer,
+        part_acc: Buffer,
     }
 
     /// A matmul dispatch for weight `w`: the pipeline for its shape and
@@ -384,6 +428,10 @@ mod gpu {
         cap: usize,
         scalars_pos: Buffer,
         scalars_attn: Buffer,
+        /// Split attention's live length; its combine's split and chunk
+        /// counts.
+        scalars_len: Buffer,
+        scalars_nsplit: Buffer,
         batches: HashMap<usize, Batch>,
         bacts: BatchActs,
         pos: usize,
@@ -400,6 +448,11 @@ mod gpu {
 
     impl<'w> Runner<'w> {
         pub fn new(w: &'w Weights) -> Result<Runner<'w>, String> {
+            Runner::with_attention(w, Attention::default())
+        }
+
+        pub fn with_attention(w: &'w Weights, attention: Attention) -> Result<Runner<'w>, String> {
+            let bps = attention.bps;
             let gpu = Gpu::open()?;
             let c: &Config = &w.cfg;
             let kvd = c.n_kv * c.head_dim;
@@ -426,7 +479,8 @@ mod gpu {
                     slot.insert(compile(&gpu, &p, THREADS)?);
                 }
             }
-            let cap = c.max_seq.next_multiple_of(ATTN_BK);
+            let cap = c.max_seq.next_multiple_of(ATTN_BK * bps * COMBINE_CHUNK);
+            let splits = cap / (ATTN_BK * bps);
             let group = c.n_head / c.n_kv;
             let attn = FlashDecode {
                 q_rows: group,
@@ -443,6 +497,9 @@ mod gpu {
             };
             let k = Kernels {
                 attn: compile(&gpu, &attn.build_dynamic()?, 128)?,
+                attn_split: compile(&gpu, &attn.build_split(bps)?, 128)?,
+                attn_combine: compile(&gpu, &attn.build_combine(bps)?, 128)?,
+                attention,
                 kv_k: compile(&gpu, &kv_append(c.n_kv, c.head_dim, cap, DType::F16), 64)?,
                 kv_v: compile(&gpu, &kv_append(c.n_kv, c.head_dim, cap, DType::F32), 64)?,
                 rms: compile(&gpu, &rmsnorm(c.dim, c.eps), THREADS)?,
@@ -485,9 +542,14 @@ mod gpu {
                 cos: f(c.head_dim),
                 sin: f(c.head_dim),
                 logits: f(c.vocab),
+                part_m: f(splits * c.n_head),
+                part_l: f(splits * c.n_head),
+                part_acc: f(splits * c.n_head * c.head_dim),
             };
             let gpu_scalars_pos = gpu.zeroed::<u32>(1);
             let gpu_scalars_attn = gpu.zeroed::<u32>(2);
+            let gpu_scalars_len = gpu.zeroed::<u32>(1);
+            let gpu_scalars_nsplit = gpu.zeroed::<u32>(2);
             let bt = MAX_BATCH;
             let bacts = BatchActs {
                 x: f(bt * c.dim),
@@ -519,6 +581,8 @@ mod gpu {
                 cap,
                 scalars_pos: gpu_scalars_pos,
                 scalars_attn: gpu_scalars_attn,
+                scalars_len: gpu_scalars_len,
+                scalars_nsplit: gpu_scalars_nsplit,
                 batches: HashMap::new(),
                 bacts,
                 pos: 0,
@@ -745,24 +809,33 @@ mod gpu {
                 0,
                 &[len as u32, len.div_ceil(ATTN_BK) as u32],
             );
+            self.gpu.write(&self.scalars_len, 0, &[len as u32]);
+            let nsplit = self.nsplit(len);
+            self.gpu.write(
+                &self.scalars_nsplit,
+                0,
+                &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
+            );
 
             let plan = self.plan();
             let n = plan.len();
             if self.sync {
                 // GPU time per dispatch, from the command buffer's own
                 // timestamps: the CPU round trip is not the kernel's cost.
-                for (label, p, bufs) in &plan {
-                    let t = self.gpu.run_gpu_timed(p, bufs);
+                for (label, p, bufs, groups) in &plan {
+                    let (_, t) = self.gpu.run_launches(&[(p, bufs, *groups)]);
                     let mut prof = self.prof.borrow_mut();
                     let e = prof.entry(label).or_insert((0, 0.0));
                     e.0 += 1;
                     e.1 += t;
                 }
             } else {
-                let steps: Vec<(&Pipeline, &[&Buffer])> =
-                    plan.iter().map(|(_, p, b)| (*p, b.as_slice())).collect();
+                let steps: Vec<Step<'_>> = plan
+                    .iter()
+                    .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
+                    .collect();
                 let t = Instant::now();
-                let (encode, gpu) = self.gpu.run_all_timed(&steps);
+                let (encode, gpu) = self.gpu.run_launches(&steps);
                 let wall = t.elapsed().as_secs_f64();
                 let mut prof = self.prof.borrow_mut();
                 for (label, secs) in [
@@ -819,7 +892,12 @@ mod gpu {
             bufs.extend(w.scales.iter());
             bufs.extend(r);
             bufs.push(y);
-            (label, p, bufs)
+            (label, p, bufs, None)
+        }
+
+        /// Splits of the cache a step at live length `len` launches.
+        fn nsplit(&self, len: usize) -> usize {
+            len.div_ceil(ATTN_BK * self.k.attention.bps)
         }
 
         /// Every dispatch of one decode step, in order.
@@ -827,35 +905,79 @@ mod gpu {
             let (a, k) = (&self.acts, &self.k);
             let mut d: Vec<Dispatch<'_>> = vec![];
             for l in &self.layers {
-                d.push(("rmsnorm", &k.rms, vec![&a.x, &l.attn_norm, &a.h]));
+                d.push(("rmsnorm", &k.rms, vec![&a.x, &l.attn_norm, &a.h], None));
                 d.push(self.mv("matvec q", &l.wq, &a.h, None, &a.q32));
                 d.push(self.mv("matvec k/v", &l.wk, &a.h, None, &a.k32));
                 d.push(self.mv("matvec k/v", &l.wv, &a.h, None, &a.v32));
-                d.push(("rope", &k.rope_q, vec![&a.q32, &a.cos, &a.sin, &a.q16]));
-                d.push(("rope", &k.rope_k, vec![&a.k32, &a.cos, &a.sin, &a.k16]));
+                d.push((
+                    "rope",
+                    &k.rope_q,
+                    vec![&a.q32, &a.cos, &a.sin, &a.q16],
+                    None,
+                ));
+                d.push((
+                    "rope",
+                    &k.rope_k,
+                    vec![&a.k32, &a.cos, &a.sin, &a.k16],
+                    None,
+                ));
                 d.push((
                     "kv append",
                     &k.kv_k,
                     vec![&a.k16, &l.kcache, &self.scalars_pos],
+                    None,
                 ));
                 d.push((
                     "kv append",
                     &k.kv_v,
                     vec![&a.v32, &l.vcache, &self.scalars_pos],
+                    None,
                 ));
-                d.push((
-                    "attention",
-                    &k.attn,
-                    vec![&a.q16, &l.kcache, &l.vcache, &a.o, &self.scalars_attn],
-                ));
+                let nsplit = self.nsplit(self.pos + 1);
+                if nsplit >= k.attention.min_splits {
+                    let n_kv = self.w.cfg.n_kv;
+                    d.push((
+                        "attention split",
+                        &k.attn_split,
+                        vec![
+                            &a.q16,
+                            &l.kcache,
+                            &l.vcache,
+                            &a.part_m,
+                            &a.part_l,
+                            &a.part_acc,
+                            &self.scalars_len,
+                        ],
+                        Some([n_kv, nsplit]),
+                    ));
+                    d.push((
+                        "attention combine",
+                        &k.attn_combine,
+                        vec![
+                            &a.part_m,
+                            &a.part_l,
+                            &a.part_acc,
+                            &a.o,
+                            &self.scalars_nsplit,
+                        ],
+                        None,
+                    ));
+                } else {
+                    d.push((
+                        "attention",
+                        &k.attn,
+                        vec![&a.q16, &l.kcache, &l.vcache, &a.o, &self.scalars_attn],
+                        None,
+                    ));
+                }
                 d.push(self.mv("matvec o", &l.wo, &a.o, Some(&a.x), &a.x2));
-                d.push(("rmsnorm", &k.rms, vec![&a.x2, &l.ffn_norm, &a.h]));
+                d.push(("rmsnorm", &k.rms, vec![&a.x2, &l.ffn_norm, &a.h], None));
                 d.push(self.mv("matvec gate/up", &l.gate, &a.h, None, &a.g));
                 d.push(self.mv("matvec gate/up", &l.up, &a.h, None, &a.u));
-                d.push(("silu_mul", &k.silu, vec![&a.g, &a.u, &a.a]));
+                d.push(("silu_mul", &k.silu, vec![&a.g, &a.u, &a.a], None));
                 d.push(self.mv("matvec down", &l.down, &a.a, Some(&a.x2), &a.x));
             }
-            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h]));
+            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
             let out = self.out.as_ref().unwrap_or(&self.emb);
             d.push(self.mv("matvec lm head", out, &a.h, None, &a.logits));
             d

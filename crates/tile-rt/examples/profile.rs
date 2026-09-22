@@ -5,7 +5,11 @@
 //! timed: that is where the time goes, at the price of a CPU round trip per
 //! dispatch that the first pass does not pay.
 //!
+//! `--context N` first fills the cache with N positions (untimed, batched),
+//! so the steps measure decode at that context length.
+//!
 //! cargo run --release -p tile-rt --example profile -- --model llama3.1:8b --tokens 32
+//! cargo run --release -p tile-rt --example profile -- --model llama3.1:8b --context 512
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), String> {
@@ -16,17 +20,19 @@ fn main() -> Result<(), String> {
 
     let mut model = "llama3.2:1b".to_string();
     let mut tokens = 32usize;
+    let mut context = 0usize;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
             "--model" => model = val()?,
             "--tokens" => tokens = val()?.parse().map_err(|_| "bad --tokens")?,
+            "--context" => context = val()?.parse().map_err(|_| "bad --context")?,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
     let t = Instant::now();
-    let w = Weights::load(&ollama_model(&model)?, tokens)?;
+    let w = Weights::load(&ollama_model(&model)?, context + tokens)?;
     let mut rt = Runner::new(&w)?;
     println!(
         "{model}: loaded and compiled in {:.1} s on {}",
@@ -43,6 +49,8 @@ fn main() -> Result<(), String> {
     ] {
         rt.sync = sync;
         rt.reset();
+        let fill: Vec<u32> = (0..context).map(|i| (500 + i % 20000) as u32).collect();
+        rt.prefill(&fill, 16)?;
         rt.clear_profile();
         let d0 = rt.dispatches;
         let t = Instant::now();
@@ -52,8 +60,9 @@ fn main() -> Result<(), String> {
         let total = t.elapsed().as_secs_f64();
         let per = total / tokens as f64;
         println!(
-            "\n{pass}: {:.1} ms/token ({:.1} tok/s), {} dispatches/token, \
+            "\n{pass}, context {context}..{}: {:.1} ms/token ({:.1} tok/s), {} dispatches/token, \
              {:.2} GB of weights/token = {:.0} GB/s effective",
+            context + tokens,
             1e3 * per,
             1.0 / per,
             (rt.dispatches - d0) / tokens,
