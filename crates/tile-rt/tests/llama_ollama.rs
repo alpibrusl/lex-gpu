@@ -1,22 +1,24 @@
-//! P2's end-to-end test: Llama 3.2 1B, as Ollama serves it, run by tile
-//! kernels on the GPU.
+//! P2's end-to-end tests: Llama models, as Ollama serves them, run by tile
+//! kernels on the GPU. One test per golden file:
+//!
+//! - `llama3.2:1b`: Q8_0 weights;
+//! - `llama3.1:8b`: Q4_K_M (Q4_K + Q6_K) — P2's exit test, Llama-3-8B int4.
 //!
 //! The oracle chain:
 //! - `scripts/llama_ref.py` checks a PyTorch reference against Ollama's own
 //!   log-probabilities (same GGUF file, same prompts), and writes what the
-//!   reference computed to `tests/data/llama32_1b_golden.txt`;
+//!   reference computed to `tests/data/<model>_golden.txt`;
 //! - this test runs the same prompts through tile and checks, at every step,
 //!   that tile's greedy token matches and its top-5 log-probabilities agree
 //!   with the reference's.
 //!
-//! It needs the model in the local Ollama store (`ollama pull llama3.2:1b`)
-//! and a Metal device. Without the model it skips, loudly.
+//! Each needs its model in the local Ollama store (`ollama pull <tag>`) and
+//! a Metal device. Without the model it skips, loudly.
 #![cfg(target_os = "macos")]
 
 use tile_rt::gguf::ollama_model;
 use tile_rt::llama::{Runner, Weights, log_softmax};
 
-const GOLDEN: &str = include_str!("data/llama32_1b_golden.txt");
 /// tile keeps its KV cache in f16 (as llama.cpp does); the reference keeps
 /// K and V in f32. That, not the kernels, is most of the budget.
 const TOL: f64 = 0.02;
@@ -31,10 +33,10 @@ struct Case {
     steps: Vec<Step>,
 }
 
-fn golden() -> (String, Vec<Case>) {
+fn parse(golden: &str) -> (String, Vec<Case>) {
     let mut model = String::new();
     let mut cases: Vec<Case> = vec![];
-    for line in GOLDEN.lines() {
+    for line in golden.lines() {
         let mut w = line.split_whitespace();
         match w.next() {
             Some("model") => model = w.next().unwrap().to_string(),
@@ -60,7 +62,18 @@ fn golden() -> (String, Vec<Case>) {
 
 #[test]
 fn llama32_1b_matches_the_reference_that_matches_ollama() {
-    let (model, cases) = golden();
+    check_golden(include_str!("data/llama32_1b_golden.txt"));
+}
+
+/// P2's exit test: Llama-3-8B in int4, as Ollama serves it (Q4_K_M).
+#[test]
+fn llama31_8b_q4_k_m_matches_the_reference_that_matches_ollama() {
+    check_golden(include_str!("data/llama31_8b_golden.txt"));
+}
+
+/// Run every case of a golden file through tile and compare.
+fn check_golden(golden: &str) {
+    let (model, cases) = parse(golden);
     let path = match ollama_model(&model) {
         Ok(p) if p.exists() => p,
         other => {
@@ -70,7 +83,12 @@ fn llama32_1b_matches_the_reference_that_matches_ollama() {
             return;
         }
     };
-    let w = Weights::load(&path, 64).expect("load");
+    let longest = cases
+        .iter()
+        .map(|c| c.prompt.len() + c.steps.len())
+        .max()
+        .unwrap_or(0);
+    let w = Weights::load(&path, longest + 1).expect("load");
     let mut rt = Runner::new(&w).expect("runner");
 
     let mut worst = 0.0f64;
@@ -106,7 +124,8 @@ fn llama32_1b_matches_the_reference_that_matches_ollama() {
         }
     }
     eprintln!(
-        "{steps} steps over {} prompts on {}: worst |dlogprob| vs reference {worst:.5} (tolerance {TOL})",
+        "{model}: {steps} steps over {} prompts on {}: worst |dlogprob| vs reference {worst:.5} \
+         (tolerance {TOL})",
         cases.len(),
         rt.device()
     );

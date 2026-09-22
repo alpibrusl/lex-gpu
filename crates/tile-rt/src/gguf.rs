@@ -34,12 +34,16 @@ impl Value {
     }
 }
 
-/// ggml tensor types this reader knows the block layout of.
+/// ggml tensor types this reader knows the block layout of. Named as ggml
+/// names them, so they can be grepped for in its source.
+#[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgmlType {
     F32,
     F16,
     Q8_0,
+    Q4_K,
+    Q6_K,
     Other(u32),
 }
 
@@ -49,6 +53,8 @@ impl GgmlType {
             0 => GgmlType::F32,
             1 => GgmlType::F16,
             8 => GgmlType::Q8_0,
+            12 => GgmlType::Q4_K,
+            14 => GgmlType::Q6_K,
             x => GgmlType::Other(x),
         }
     }
@@ -59,6 +65,8 @@ impl GgmlType {
             GgmlType::F32 => Some((1, 4)),
             GgmlType::F16 => Some((1, 2)),
             GgmlType::Q8_0 => Some((32, 34)),
+            GgmlType::Q4_K => Some((256, 144)),
+            GgmlType::Q6_K => Some((256, 210)),
             GgmlType::Other(_) => None,
         }
     }

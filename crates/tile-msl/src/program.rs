@@ -701,18 +701,22 @@ impl Gen<'_> {
                     &[format!("{name}[k] = {}({src});", ty.dtype.msl_scalar())],
                 );
             }
-            Op::Dequant(q, s, group) => {
+            Op::Dequant(q, s, m, group) => {
                 let x = dst.ok_or("op without a result")?;
                 let tq = self.arg_ty(*q)?;
                 let (n, c) = (tq.elems(), tq.shape[1]);
-                let ops = self.operands(&[*q, *s], &[true, false], n)?;
+                let mut args = vec![*q, *s];
+                args.extend(*m);
+                let local: Vec<bool> = (0..args.len()).map(|i| i == 0).collect();
+                let ops = self.operands(&args, &local, n)?;
+                let at = format!("(e / {c}u) * {}u + (e % {c}u) / {group}u", c / group);
                 let qv = Self::read(&ops[0].0, "e");
-                let sv = Self::read(
-                    &ops[1].0,
-                    &format!("(e / {c}u) * {}u + (e % {c}u) / {group}u", c / group),
-                );
+                let sv = Self::read(&ops[1].0, &at);
+                let mv = ops
+                    .get(2)
+                    .map_or(String::new(), |o| format!(" - {}", Self::read(&o.0, &at)));
                 let name = self.declare_reg(x, &reg(DType::F32, &tq.shape));
-                self.owned(n, &[format!("{name}[k] = {qv} * {sv};")]);
+                self.owned(n, &[format!("{name}[k] = {qv} * {sv}{mv};")]);
             }
             Op::MatMulNT(a, b, acc) | Op::MatMul(a, b, acc) => {
                 let x = dst.ok_or("matmul without a result")?;

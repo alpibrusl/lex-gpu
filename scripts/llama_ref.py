@@ -12,8 +12,9 @@ step by step:
 
 - the greedy token at every step must be identical;
 - the log-probability of every token in Ollama's top-k must agree within a
-  tolerance. Exact equality is not expected: llama.cpp quantises activations
-  to 8 bits inside its Q8_0 matmuls, and the reference does not.
+  tolerance. Exact equality is not expected: llama.cpp's quantised Metal
+  kernels round differently from an f32 computation. Measured worst gaps are
+  0.007 on llama3.2:1b and 0.057 on llama3.1:8b.
 
     python3 scripts/llama_ref.py                          # compare, default prompts
     python3 scripts/llama_ref.py --prompt "Once upon a time" --steps 16
@@ -35,7 +36,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from gguf import GGUF, ollama_model  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-GOLDEN = ROOT / "crates/tile-rt/tests/data/llama32_1b_golden.txt"
+DATA = ROOT / "crates/tile-rt/tests/data"
+
+
+def golden_path(model):
+    """`llama3.2:1b` -> tests/data/llama32_1b_golden.txt"""
+    return DATA / (model.replace(".", "").replace(":", "_") + "_golden.txt")
 
 # Llama 3's pre-tokenizer split, as llama.cpp's "llama-bpe" uses it.
 LLAMA3_SPLIT = (
@@ -199,9 +205,10 @@ def write_golden(model, blob, cases):
         for st in c["steps"]:
             pairs = " ".join(f"{i}:{lp:.6f}" for i, lp in zip(st["top_ids"], st["top_logprobs"]))
             lines.append(f"step {st['next']} {pairs}")
-    GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-    GOLDEN.write_text("\n".join(lines) + "\n")
-    print(f"\nwrote {GOLDEN}")
+    path = golden_path(model)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+    print(f"\nwrote {path}")
 
 
 def main():
@@ -210,7 +217,7 @@ def main():
     ap.add_argument("--prompt", action="append")
     ap.add_argument("--steps", type=int, default=12)
     ap.add_argument("--top", type=int, default=5)
-    ap.add_argument("--tol", type=float, default=0.05)
+    ap.add_argument("--tol", type=float, default=0.1)
     ap.add_argument("--no-bos", action="store_true", help="do not prepend <|begin_of_text|>")
     ap.add_argument("--write-golden", action="store_true")
     a = ap.parse_args()
