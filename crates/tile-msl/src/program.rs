@@ -26,7 +26,9 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use tile_front::ir::{Arg, BinOp, Block, IdxExpr, Op, Program, Reduce, Stmt, TileTy, Var, View};
+use tile_front::ir::{
+    Arg, BinOp, Block, IdxExpr, Op, Program, Reduce, Stmt, TileTy, UnOp, Var, View,
+};
 use tile_ir::{DType, Space, Target};
 
 /// A lowered kernel and everything needed to launch it.
@@ -641,7 +643,7 @@ impl Gen<'_> {
                 }
             }
             Op::Drop(_) => {}
-            Op::Dup(a) | Op::Exp(a) | Op::Scale(a, _) | Op::Convert(a, _) => {
+            Op::Dup(a) | Op::Exp(a) | Op::Scale(a, _) | Op::Convert(a, _) | Op::Unary(_, a) => {
                 let x = dst.ok_or("op without a result")?;
                 let ty = self.arg_ty(*a)?;
                 let n = ty.elems();
@@ -652,6 +654,10 @@ impl Gen<'_> {
                     Op::Exp(_) => (ty.dtype, format!("precise::exp({src})")),
                     Op::Scale(_, f) => (ty.dtype, format!("{src} * {}", lit(*f))),
                     Op::Convert(_, d) => (*d, src),
+                    Op::Unary(UnOp::Rsqrt, _) => (ty.dtype, format!("precise::rsqrt({src})")),
+                    Op::Unary(UnOp::Sigmoid, _) => {
+                        (ty.dtype, format!("1.0f / (1.0f + precise::exp(-{src}))"))
+                    }
                     _ => unreachable!(),
                 };
                 let name = self.declare_reg(x, &reg(dt, &ty.shape));
@@ -662,10 +668,16 @@ impl Gen<'_> {
                 let (ta, tb) = (self.arg_ty(*a)?, self.arg_ty(*b)?);
                 let n = ta.elems();
                 let bcast = ta.shape != tb.shape;
+                let col = bcast && tb.shape == [1, ta.shape[1]];
                 let ops = self.operands(&[*a, *b], &[true, !bcast], n)?;
                 let cols = if bcast { ta.shape[1] } else { 1 };
+                let at = if col {
+                    format!("e % {cols}u")
+                } else {
+                    format!("e / {cols}u")
+                };
                 let lhs = Self::read(&ops[0].0, "e");
-                let rhs = Self::read(&ops[1].0, &format!("e / {cols}u"));
+                let rhs = Self::read(&ops[1].0, &at);
                 let expr = match bop {
                     BinOp::Add => format!("{lhs} + {rhs}"),
                     BinOp::Sub => format!("{lhs} - {rhs}"),
@@ -676,6 +688,31 @@ impl Gen<'_> {
                 let dt = ta.dtype;
                 let name = self.declare_reg(x, &reg(dt, &ta.shape));
                 self.owned(n, &[format!("{name}[k] = {}({expr});", dt.msl_scalar())]);
+            }
+            Op::SwapPairs(a) => {
+                let x = dst.ok_or("op without a result")?;
+                let ty = self.arg_ty(*a)?;
+                let n = ty.elems();
+                let ops = self.operands(&[*a], &[false], n)?;
+                let src = Self::read(&ops[0].0, "e ^ 1u");
+                let name = self.declare_reg(x, &reg(ty.dtype, &ty.shape));
+                self.owned(
+                    n,
+                    &[format!("{name}[k] = {}({src});", ty.dtype.msl_scalar())],
+                );
+            }
+            Op::Dequant(q, s, group) => {
+                let x = dst.ok_or("op without a result")?;
+                let tq = self.arg_ty(*q)?;
+                let (n, c) = (tq.elems(), tq.shape[1]);
+                let ops = self.operands(&[*q, *s], &[true, false], n)?;
+                let qv = Self::read(&ops[0].0, "e");
+                let sv = Self::read(
+                    &ops[1].0,
+                    &format!("(e / {c}u) * {}u + (e % {c}u) / {group}u", c / group),
+                );
+                let name = self.declare_reg(x, &reg(DType::F32, &tq.shape));
+                self.owned(n, &[format!("{name}[k] = {qv} * {sv};")]);
             }
             Op::MatMulNT(a, b, acc) | Op::MatMul(a, b, acc) => {
                 let x = dst.ok_or("matmul without a result")?;

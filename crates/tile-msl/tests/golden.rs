@@ -43,6 +43,7 @@ fn flash_decode_lowered() {
         kv_space: Space::Threadgroup,
         consumers: 0,
         heads: 2,
+        kv_cap: 0,
     };
     let prog = cfg.build().unwrap();
     let target = Target::apple_m_series();

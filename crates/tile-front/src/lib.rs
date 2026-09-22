@@ -17,6 +17,7 @@ pub mod check;
 pub mod flash;
 pub mod interp;
 pub mod ir;
+pub mod llama;
 pub mod print;
 
 pub use check::{Diag, Kind, Report, check};

@@ -33,6 +33,7 @@ pub fn config(args: &Args) -> FlashDecode {
         kv_space: Space::Threadgroup,
         consumers: 0,
         heads: args.batch * KV_HEADS,
+        kv_cap: 0,
     }
 }
 

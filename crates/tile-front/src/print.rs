@@ -109,6 +109,9 @@ fn op(p: &Program, o: &Op) -> String {
         Op::MatMul(a, b, acc) => format!("matmul {}, {} acc {acc:?}", arg(p, *a), arg(p, *b)),
         Op::Binary(bop, a, b) => format!("{} {}, {}", bop.name(), arg(p, *a), arg(p, *b)),
         Op::Exp(a) => format!("exp {}", arg(p, *a)),
+        Op::Unary(u, a) => format!("{} {}", u.name(), arg(p, *a)),
+        Op::SwapPairs(a) => format!("swap_pairs {}", arg(p, *a)),
+        Op::Dequant(q, s, g) => format!("dequant {}, {} group {g}", arg(p, *q), arg(p, *s)),
         Op::Scale(a, s) => format!("scale {}, {s}", arg(p, *a)),
         Op::RowReduce(r, a) => {
             let n = match r {

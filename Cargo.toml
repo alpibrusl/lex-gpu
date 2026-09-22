@@ -6,6 +6,7 @@ members = [
     "crates/tile-msl",
     "crates/tile-metal",
     "crates/tile-bench",
+    "crates/tile-rt",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ tile-ir = { path = "crates/tile-ir" }
 tile-front = { path = "crates/tile-front" }
 tile-msl = { path = "crates/tile-msl" }
 tile-metal = { path = "crates/tile-metal" }
+tile-rt = { path = "crates/tile-rt" }
 half = "2"
 
 [profile.release]

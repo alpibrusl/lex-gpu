@@ -2,3 +2,4 @@
 **/*.rs.bk
 *.metallib
 .DS_Store
+__pycache__/
