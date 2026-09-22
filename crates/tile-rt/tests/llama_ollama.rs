@@ -139,6 +139,8 @@ fn check_golden_fed(golden: &str, feed: Feed) {
             Attention {
                 bps: 1,
                 min_splits: 1,
+                bk: 16,
+                ..Attention::default()
             },
         ),
         _ => Runner::new(&w),

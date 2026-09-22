@@ -3,6 +3,7 @@
 //! cargo run -p tile-msl --example emit -- matvec q4k 4096 14336
 //! cargo run -p tile-msl --example emit -- matvec q6k|q8 <n_in> <n_out>
 //! cargo run -p tile-msl --example emit -- rmsnorm 4096
+//! cargo run -p tile-msl --example emit -- split <cap> <bps> [direct]   (8B attention shapes)
 
 use tile_front::llama::{QLayout, matvec_q, rmsnorm};
 use tile_ir::Target;
@@ -16,6 +17,7 @@ fn main() -> Result<(), String> {
             .parse()
             .map_err(|_| "bad size".to_string())
     };
+    let mut threads = 256;
     let prog = match a.first().map(String::as_str) {
         Some("matvec") => {
             let layout = match a.get(1).map(String::as_str) {
@@ -28,11 +30,40 @@ fn main() -> Result<(), String> {
             matvec_q(n_in, n_out, 8, n_in, layout, false)?
         }
         Some("rmsnorm") => rmsnorm(num(1)?, 1e-5),
+        Some(k @ ("split" | "combine")) => {
+            let (cap, bps) = (num(1)?, num(2)?);
+            let f = tile_front::flash::FlashDecode {
+                q_rows: 4,
+                d: 128,
+                seq: cap,
+                bq: 4,
+                bk: 16,
+                stages: 1,
+                dtype: tile_ir::DType::F16,
+                kv_space: if a.get(3).is_some_and(|x| x == "direct") {
+                    tile_ir::Space::Reg
+                } else {
+                    tile_ir::Space::Threadgroup
+                },
+                consumers: 0,
+                heads: 8,
+                kv_cap: cap,
+            };
+            threads = 128;
+            if k == "split" {
+                f.build_split(bps)?
+            } else {
+                f.build_combine(bps)?
+            }
+        }
         _ => {
-            return Err("usage: emit matvec <q4k|q6k|q8> <n_in> <n_out> | emit rmsnorm <n>".into());
+            return Err("usage: emit matvec <q4k|q6k|q8> <n_in> <n_out> | rmsnorm <n> | split|combine <cap> <bps> [direct]".into());
         }
     };
     tile_front::check(&prog, &Target::apple_m_series()).map_err(|e| format!("{e:?}"))?;
-    print!("{}", lower(&prog, &Target::apple_m_series(), 256)?.source);
+    print!(
+        "{}",
+        lower(&prog, &Target::apple_m_series(), threads)?.source
+    );
     Ok(())
 }

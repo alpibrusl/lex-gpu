@@ -226,9 +226,6 @@ mod gpu {
     use super::{Config, QMat, Weights};
 
     const THREADS: usize = 256;
-    /// KV positions per attention block; the cache capacity is rounded up to
-    /// a whole number of them.
-    const ATTN_BK: usize = 16;
 
     /// How a decode step attends over the cache.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,12 +236,32 @@ mod gpu {
         /// Fewest splits worth splitting for: below it, the serial kernel
         /// (one threadgroup per KV head) is cheaper than split + combine.
         pub min_splits: usize,
+        /// KV positions per attention block, for every attention kernel;
+        /// the cache capacity is rounded up to whole splits of them.
+        pub bk: usize,
+        /// Read K and V blocks straight from device memory (lazy register
+        /// tiles) instead of staging them through threadgroup memory. On by
+        /// default: it halves the split kernel's time (8B at 1,440
+        /// positions: 57 -> 29 µs per layer) and saves 4 barriers per block.
+        pub kv_direct: bool,
+    }
+
+    impl Attention {
+        fn kv_space(&self) -> Space {
+            if self.kv_direct {
+                Space::Reg
+            } else {
+                Space::Threadgroup
+            }
+        }
     }
 
     impl Default for Attention {
-        /// Two blocks per split, split from two splits up (measured on the
-        /// 8B: one split costs 1.17 ms/token split + combined, 0.78 serial).
-        /// `TILE_BPS` and `TILE_MIN_SPLITS` override it for tuning.
+        /// Two 16-position blocks per split, split from two splits up
+        /// (measured on the 8B: one split costs 1.17 ms/token split +
+        /// combined, 0.78 serial), K/V read directly. `TILE_BPS`,
+        /// `TILE_MIN_SPLITS`, `TILE_ATTN_BK` and `TILE_KV_DIRECT=0` override
+        /// it for tuning.
         fn default() -> Attention {
             let env = |k: &str, d: usize| {
                 std::env::var(k)
@@ -255,6 +272,8 @@ mod gpu {
             Attention {
                 bps: env("TILE_BPS", 2),
                 min_splits: env("TILE_MIN_SPLITS", 2),
+                bk: env("TILE_ATTN_BK", 16),
+                kv_direct: env("TILE_KV_DIRECT", 1) != 0,
             }
         }
     }
@@ -479,18 +498,19 @@ mod gpu {
                     slot.insert(compile(&gpu, &p, THREADS)?);
                 }
             }
-            let cap = c.max_seq.next_multiple_of(ATTN_BK * bps * COMBINE_CHUNK);
-            let splits = cap / (ATTN_BK * bps);
+            let bk = attention.bk;
+            let cap = c.max_seq.next_multiple_of(bk * bps * COMBINE_CHUNK);
+            let splits = cap / (bk * bps);
             let group = c.n_head / c.n_kv;
             let attn = FlashDecode {
                 q_rows: group,
                 d: c.head_dim,
                 seq: cap,
                 bq: group,
-                bk: ATTN_BK,
+                bk,
                 stages: 1,
                 dtype: DType::F16,
-                kv_space: Space::Threadgroup,
+                kv_space: attention.kv_space(),
                 consumers: 0,
                 heads: c.n_kv,
                 kv_cap: cap,
@@ -649,10 +669,10 @@ mod gpu {
                 d: c.head_dim,
                 seq: self.cap,
                 bq: group,
-                bk: ATTN_BK,
+                bk: self.k.attention.bk,
                 stages: 1,
                 dtype: DType::F16,
-                kv_space: Space::Threadgroup,
+                kv_space: self.k.attention.kv_space(),
                 consumers: 0,
                 heads: c.n_kv,
                 kv_cap: self.cap,
@@ -710,7 +730,7 @@ mod gpu {
             self.gpu.write(
                 &self.bacts.scalars_attn,
                 0,
-                &[pos0 as u32, (pos0 + t).div_ceil(ATTN_BK) as u32],
+                &[pos0 as u32, (pos0 + t).div_ceil(self.k.attention.bk) as u32],
             );
             let n = {
                 let bk = &self.batches[&t];
@@ -807,7 +827,7 @@ mod gpu {
             self.gpu.write(
                 &self.scalars_attn,
                 0,
-                &[len as u32, len.div_ceil(ATTN_BK) as u32],
+                &[len as u32, len.div_ceil(self.k.attention.bk) as u32],
             );
             self.gpu.write(&self.scalars_len, 0, &[len as u32]);
             let nsplit = self.nsplit(len);
@@ -897,7 +917,7 @@ mod gpu {
 
         /// Splits of the cache a step at live length `len` launches.
         fn nsplit(&self, len: usize) -> usize {
-            len.div_ceil(ATTN_BK * self.k.attention.bps)
+            len.div_ceil(self.k.attention.bk * self.k.attention.bps)
         }
 
         /// Every dispatch of one decode step, in order.
