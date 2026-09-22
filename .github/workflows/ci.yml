@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Everything above the device boundary: IR, planner, MSL emitter, reference
+  # interpreter. No Metal toolchain involved, so it runs anywhere.
+  frontend:
+    name: frontend (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets
+      - run: cargo test --workspace
+      - name: emitter produces MSL
+        run: cargo run -q -p tile-bench -- --emit
+
+  # The only job that compiles tile-metal. It catches metal-rs API drift
+  # without anyone having to be sitting at a Mac.
+  metal:
+    name: metal backend (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      # Informational: whether a GitHub macOS runner exposes a usable Metal
+      # device varies, and a missing GPU must not be reported as a red build.
+      # The numbers that count come from the developer's own machine.
+      - name: bandwidth harness (informational)
+        continue-on-error: true
+        run: cargo run --release -p tile-bench -- --mib 64 --rows 2048 --iters 20
