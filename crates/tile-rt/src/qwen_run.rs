@@ -291,6 +291,11 @@ mod gpu {
         acts: Acts,
         cap: usize,
         pos: usize,
+        /// Time each dispatch on its own, from the command buffer's
+        /// timestamps, instead of one buffer per token. The step is much
+        /// slower this way; it says where the time goes.
+        pub sync: bool,
+        prof: std::cell::RefCell<std::collections::BTreeMap<&'static str, (usize, f64)>>,
     }
 
     impl Runner {
@@ -504,6 +509,8 @@ mod gpu {
                 acts,
                 cap,
                 pos: 0,
+                sync: std::env::var_os("TILE_SYNC").is_some(),
+                prof: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             })
         }
 
@@ -552,8 +559,21 @@ mod gpu {
             );
 
             let plan = self.plan();
-            let steps: Vec<Step<'_>> = plan.iter().map(|(p, b)| (*p, b.as_slice(), None)).collect();
-            self.gpu.run_launches(&steps);
+            if self.sync {
+                for (label, p, b) in &plan {
+                    let (_, t) = self.gpu.run_launches(&[(p, b.as_slice(), None)]);
+                    let mut prof = self.prof.borrow_mut();
+                    let e = prof.entry(label).or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 += t;
+                }
+            } else {
+                let steps: Vec<Step<'_>> = plan
+                    .iter()
+                    .map(|(_, p, b)| (*p, b.as_slice(), None))
+                    .collect();
+                self.gpu.run_launches(&steps);
+            }
             drop(plan);
             self.pos += 1;
             let mut logits = vec![0.0f32; c.vocab];
@@ -565,66 +585,141 @@ mod gpu {
             &self.k.mv[&(w.cols, w.rows, res)]
         }
 
+        /// Per-call-site GPU time so far, slowest first.
+        pub fn profile(&self) -> Vec<(&'static str, usize, f64)> {
+            let mut v: Vec<_> = self
+                .prof
+                .borrow()
+                .iter()
+                .map(|(k, (n, t))| (*k, *n, *t))
+                .collect();
+            v.sort_by(|a, b| b.2.total_cmp(&a.2));
+            v
+        }
+
+        pub fn clear_profile(&self) {
+            self.prof.borrow_mut().clear();
+        }
+
         /// Every dispatch of one step, in order.
-        fn plan(&self) -> Vec<(&Pipeline, Vec<&Buffer>)> {
+        fn plan(&self) -> Vec<(&'static str, &Pipeline, Vec<&Buffer>)> {
             let (a, k) = (&self.acts, &self.k);
-            let mut d: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
+            let mut d: Vec<(&'static str, &Pipeline, Vec<&Buffer>)> = vec![];
             for layer in &self.layers {
-                d.push((&k.rms, vec![&a.x, layer_norm(&layer.mixer), &a.h]));
+                d.push((
+                    "rmsnorm",
+                    &k.rms,
+                    vec![&a.x, layer_norm(&layer.mixer), &a.h],
+                ));
                 match &layer.mixer {
                     Mixer::Linear(l) => {
-                        d.push((self.mv(&l.qkv, false), l.qkv.bind(&a.h, None, &a.qkv)));
-                        d.push((self.mv(&l.z, false), l.z.bind(&a.h, None, &a.z)));
-                        d.push((&k.dense, vec![&a.h, &l.a, &a.a]));
-                        d.push((&k.dense, vec![&a.h, &l.b, &a.b]));
-                        d.push((&k.conv, vec![&l.conv_state, &a.qkv, &l.conv_w, &a.conv]));
-                        d.push((&k.qk_q, vec![&a.conv, &a.qe]));
-                        d.push((&k.qk_k, vec![&a.conv, &a.ke]));
                         d.push((
+                            "matvec qkv",
+                            self.mv(&l.qkv, false),
+                            l.qkv.bind(&a.h, None, &a.qkv),
+                        ));
+                        d.push(("matvec z", self.mv(&l.z, false), l.z.bind(&a.h, None, &a.z)));
+                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.a, &a.a]));
+                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.b, &a.b]));
+                        d.push((
+                            "conv",
+                            &k.conv,
+                            vec![&l.conv_state, &a.qkv, &l.conv_w, &a.conv],
+                        ));
+                        d.push(("delta q/k", &k.qk_q, vec![&a.conv, &a.qe]));
+                        d.push(("delta q/k", &k.qk_k, vec![&a.conv, &a.ke]));
+                        d.push((
+                            "gates",
                             &k.gates,
                             vec![&a.a, &a.b, &l.amp, &l.dt_bias, &a.g, &a.beta],
                         ));
                         d.push((
+                            "delta step",
                             &k.delta,
                             vec![&l.state, &a.qe, &a.ke, &a.conv, &a.g, &a.beta, &a.y],
                         ));
-                        d.push((&k.gated_norm, vec![&a.y, &l.gnorm, &a.z, &a.mixed]));
                         d.push((
+                            "gated norm",
+                            &k.gated_norm,
+                            vec![&a.y, &l.gnorm, &a.z, &a.mixed],
+                        ));
+                        d.push((
+                            "matvec out_proj",
                             self.mv(&l.out, true),
                             l.out.bind(&a.mixed, Some(&a.x), &a.x2),
                         ));
                     }
                     Mixer::Attn(at) => {
-                        d.push((self.mv(&at.q, false), at.q.bind(&a.h, None, &a.q32)));
-                        d.push((self.mv(&at.k, false), at.k.bind(&a.h, None, &a.k32)));
-                        d.push((self.mv(&at.v, false), at.v.bind(&a.h, None, &a.v32)));
                         d.push((
+                            "matvec q",
+                            self.mv(&at.q, false),
+                            at.q.bind(&a.h, None, &a.q32),
+                        ));
+                        d.push((
+                            "matvec k/v",
+                            self.mv(&at.k, false),
+                            at.k.bind(&a.h, None, &a.k32),
+                        ));
+                        d.push((
+                            "matvec k/v",
+                            self.mv(&at.v, false),
+                            at.v.bind(&a.h, None, &a.v32),
+                        ));
+                        d.push((
+                            "rope",
                             &k.rope_q,
                             vec![&a.q32, &at.q_norm, &a.cos, &a.sin, &a.q16, &a.gate],
                         ));
-                        d.push((&k.rope_k, vec![&a.k32, &at.k_norm, &a.cos, &a.sin, &a.k16]));
-                        d.push((&k.kv_k, vec![&a.k16, &at.kcache, &a.scalars_pos]));
-                        d.push((&k.kv_v, vec![&a.v32, &at.vcache, &a.scalars_pos]));
                         d.push((
+                            "rope",
+                            &k.rope_k,
+                            vec![&a.k32, &at.k_norm, &a.cos, &a.sin, &a.k16],
+                        ));
+                        d.push((
+                            "kv append",
+                            &k.kv_k,
+                            vec![&a.k16, &at.kcache, &a.scalars_pos],
+                        ));
+                        d.push((
+                            "kv append",
+                            &k.kv_v,
+                            vec![&a.v32, &at.vcache, &a.scalars_pos],
+                        ));
+                        d.push((
+                            "attention",
                             &k.attn,
                             vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
                         ));
-                        d.push((&k.mul, vec![&a.attn, &a.gate, &a.gated]));
-                        d.push((self.mv(&at.o, true), at.o.bind(&a.gated, Some(&a.x), &a.x2)));
+                        d.push(("gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated]));
+                        d.push((
+                            "matvec o_proj",
+                            self.mv(&at.o, true),
+                            at.o.bind(&a.gated, Some(&a.x), &a.x2),
+                        ));
                     }
                 }
                 let f = &layer.ffn;
-                d.push((&k.rms, vec![&a.x2, &f.norm, &a.h]));
-                d.push((self.mv(&f.gate, false), f.gate.bind(&a.h, None, &a.ffn_g)));
-                d.push((self.mv(&f.up, false), f.up.bind(&a.h, None, &a.ffn_u)));
-                d.push((&k.silu, vec![&a.ffn_g, &a.ffn_u, &a.ffn_a]));
+                d.push(("rmsnorm", &k.rms, vec![&a.x2, &f.norm, &a.h]));
                 d.push((
+                    "matvec gate/up",
+                    self.mv(&f.gate, false),
+                    f.gate.bind(&a.h, None, &a.ffn_g),
+                ));
+                d.push((
+                    "matvec gate/up",
+                    self.mv(&f.up, false),
+                    f.up.bind(&a.h, None, &a.ffn_u),
+                ));
+                d.push(("silu_mul", &k.silu, vec![&a.ffn_g, &a.ffn_u, &a.ffn_a]));
+                d.push((
+                    "matvec down",
                     self.mv(&f.down, true),
                     f.down.bind(&a.ffn_a, Some(&a.x2), &a.x),
                 ));
             }
-            d.push((&k.rms, vec![&a.x, &self.out_norm, &a.h]));
+            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h]));
             d.push((
+                "matvec lm head",
                 self.mv(&self.lm_head, false),
                 self.lm_head.bind(&a.h, None, &a.logits),
             ));

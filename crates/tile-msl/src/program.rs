@@ -116,109 +116,32 @@ struct Gen<'a> {
 /// inner loop then decodes both with a load from the constant cache
 /// instead of the shifts, compare and `exp2` the formats spell out.
 const FP4_TABLES: &str = concat!(
-    // Both nibbles of a byte, decoded: one constant-cache load per
-    // byte instead of one per value. E2M1 by arithmetic measured far
-    // slower (203 GB/s against 400) -- the table stays.
-    "constant float2 FP4_P[256] = {\n",
-    "    float2(0.0f, 0.0f), float2(0.5f, 0.0f), float2(1.0f, 0.0f), float2(1.5f, 0.0f),\n",
-    "    float2(2.0f, 0.0f), float2(3.0f, 0.0f), float2(4.0f, 0.0f), float2(6.0f, 0.0f),\n",
-    "    float2(-0.0f, 0.0f), float2(-0.5f, 0.0f), float2(-1.0f, 0.0f), float2(-1.5f, 0.0f),\n",
-    "    float2(-2.0f, 0.0f), float2(-3.0f, 0.0f), float2(-4.0f, 0.0f), float2(-6.0f, 0.0f),\n",
-    "    float2(0.0f, 0.5f), float2(0.5f, 0.5f), float2(1.0f, 0.5f), float2(1.5f, 0.5f),\n",
-    "    float2(2.0f, 0.5f), float2(3.0f, 0.5f), float2(4.0f, 0.5f), float2(6.0f, 0.5f),\n",
-    "    float2(-0.0f, 0.5f), float2(-0.5f, 0.5f), float2(-1.0f, 0.5f), float2(-1.5f, 0.5f),\n",
-    "    float2(-2.0f, 0.5f), float2(-3.0f, 0.5f), float2(-4.0f, 0.5f), float2(-6.0f, 0.5f),\n",
-    "    float2(0.0f, 1.0f), float2(0.5f, 1.0f), float2(1.0f, 1.0f), float2(1.5f, 1.0f),\n",
-    "    float2(2.0f, 1.0f), float2(3.0f, 1.0f), float2(4.0f, 1.0f), float2(6.0f, 1.0f),\n",
-    "    float2(-0.0f, 1.0f), float2(-0.5f, 1.0f), float2(-1.0f, 1.0f), float2(-1.5f, 1.0f),\n",
-    "    float2(-2.0f, 1.0f), float2(-3.0f, 1.0f), float2(-4.0f, 1.0f), float2(-6.0f, 1.0f),\n",
-    "    float2(0.0f, 1.5f), float2(0.5f, 1.5f), float2(1.0f, 1.5f), float2(1.5f, 1.5f),\n",
-    "    float2(2.0f, 1.5f), float2(3.0f, 1.5f), float2(4.0f, 1.5f), float2(6.0f, 1.5f),\n",
-    "    float2(-0.0f, 1.5f), float2(-0.5f, 1.5f), float2(-1.0f, 1.5f), float2(-1.5f, 1.5f),\n",
-    "    float2(-2.0f, 1.5f), float2(-3.0f, 1.5f), float2(-4.0f, 1.5f), float2(-6.0f, 1.5f),\n",
-    "    float2(0.0f, 2.0f), float2(0.5f, 2.0f), float2(1.0f, 2.0f), float2(1.5f, 2.0f),\n",
-    "    float2(2.0f, 2.0f), float2(3.0f, 2.0f), float2(4.0f, 2.0f), float2(6.0f, 2.0f),\n",
-    "    float2(-0.0f, 2.0f), float2(-0.5f, 2.0f), float2(-1.0f, 2.0f), float2(-1.5f, 2.0f),\n",
-    "    float2(-2.0f, 2.0f), float2(-3.0f, 2.0f), float2(-4.0f, 2.0f), float2(-6.0f, 2.0f),\n",
-    "    float2(0.0f, 3.0f), float2(0.5f, 3.0f), float2(1.0f, 3.0f), float2(1.5f, 3.0f),\n",
-    "    float2(2.0f, 3.0f), float2(3.0f, 3.0f), float2(4.0f, 3.0f), float2(6.0f, 3.0f),\n",
-    "    float2(-0.0f, 3.0f), float2(-0.5f, 3.0f), float2(-1.0f, 3.0f), float2(-1.5f, 3.0f),\n",
-    "    float2(-2.0f, 3.0f), float2(-3.0f, 3.0f), float2(-4.0f, 3.0f), float2(-6.0f, 3.0f),\n",
-    "    float2(0.0f, 4.0f), float2(0.5f, 4.0f), float2(1.0f, 4.0f), float2(1.5f, 4.0f),\n",
-    "    float2(2.0f, 4.0f), float2(3.0f, 4.0f), float2(4.0f, 4.0f), float2(6.0f, 4.0f),\n",
-    "    float2(-0.0f, 4.0f), float2(-0.5f, 4.0f), float2(-1.0f, 4.0f), float2(-1.5f, 4.0f),\n",
-    "    float2(-2.0f, 4.0f), float2(-3.0f, 4.0f), float2(-4.0f, 4.0f), float2(-6.0f, 4.0f),\n",
-    "    float2(0.0f, 6.0f), float2(0.5f, 6.0f), float2(1.0f, 6.0f), float2(1.5f, 6.0f),\n",
-    "    float2(2.0f, 6.0f), float2(3.0f, 6.0f), float2(4.0f, 6.0f), float2(6.0f, 6.0f),\n",
-    "    float2(-0.0f, 6.0f), float2(-0.5f, 6.0f), float2(-1.0f, 6.0f), float2(-1.5f, 6.0f),\n",
-    "    float2(-2.0f, 6.0f), float2(-3.0f, 6.0f), float2(-4.0f, 6.0f), float2(-6.0f, 6.0f),\n",
-    "    float2(0.0f, -0.0f), float2(0.5f, -0.0f), float2(1.0f, -0.0f), float2(1.5f, -0.0f),\n",
-    "    float2(2.0f, -0.0f), float2(3.0f, -0.0f), float2(4.0f, -0.0f), float2(6.0f, -0.0f),\n",
-    "    float2(-0.0f, -0.0f), float2(-0.5f, -0.0f), float2(-1.0f, -0.0f), float2(-1.5f, -0.0f),\n",
-    "    float2(-2.0f, -0.0f), float2(-3.0f, -0.0f), float2(-4.0f, -0.0f), float2(-6.0f, -0.0f),\n",
-    "    float2(0.0f, -0.5f), float2(0.5f, -0.5f), float2(1.0f, -0.5f), float2(1.5f, -0.5f),\n",
-    "    float2(2.0f, -0.5f), float2(3.0f, -0.5f), float2(4.0f, -0.5f), float2(6.0f, -0.5f),\n",
-    "    float2(-0.0f, -0.5f), float2(-0.5f, -0.5f), float2(-1.0f, -0.5f), float2(-1.5f, -0.5f),\n",
-    "    float2(-2.0f, -0.5f), float2(-3.0f, -0.5f), float2(-4.0f, -0.5f), float2(-6.0f, -0.5f),\n",
-    "    float2(0.0f, -1.0f), float2(0.5f, -1.0f), float2(1.0f, -1.0f), float2(1.5f, -1.0f),\n",
-    "    float2(2.0f, -1.0f), float2(3.0f, -1.0f), float2(4.0f, -1.0f), float2(6.0f, -1.0f),\n",
-    "    float2(-0.0f, -1.0f), float2(-0.5f, -1.0f), float2(-1.0f, -1.0f), float2(-1.5f, -1.0f),\n",
-    "    float2(-2.0f, -1.0f), float2(-3.0f, -1.0f), float2(-4.0f, -1.0f), float2(-6.0f, -1.0f),\n",
-    "    float2(0.0f, -1.5f), float2(0.5f, -1.5f), float2(1.0f, -1.5f), float2(1.5f, -1.5f),\n",
-    "    float2(2.0f, -1.5f), float2(3.0f, -1.5f), float2(4.0f, -1.5f), float2(6.0f, -1.5f),\n",
-    "    float2(-0.0f, -1.5f), float2(-0.5f, -1.5f), float2(-1.0f, -1.5f), float2(-1.5f, -1.5f),\n",
-    "    float2(-2.0f, -1.5f), float2(-3.0f, -1.5f), float2(-4.0f, -1.5f), float2(-6.0f, -1.5f),\n",
-    "    float2(0.0f, -2.0f), float2(0.5f, -2.0f), float2(1.0f, -2.0f), float2(1.5f, -2.0f),\n",
-    "    float2(2.0f, -2.0f), float2(3.0f, -2.0f), float2(4.0f, -2.0f), float2(6.0f, -2.0f),\n",
-    "    float2(-0.0f, -2.0f), float2(-0.5f, -2.0f), float2(-1.0f, -2.0f), float2(-1.5f, -2.0f),\n",
-    "    float2(-2.0f, -2.0f), float2(-3.0f, -2.0f), float2(-4.0f, -2.0f), float2(-6.0f, -2.0f),\n",
-    "    float2(0.0f, -3.0f), float2(0.5f, -3.0f), float2(1.0f, -3.0f), float2(1.5f, -3.0f),\n",
-    "    float2(2.0f, -3.0f), float2(3.0f, -3.0f), float2(4.0f, -3.0f), float2(6.0f, -3.0f),\n",
-    "    float2(-0.0f, -3.0f), float2(-0.5f, -3.0f), float2(-1.0f, -3.0f), float2(-1.5f, -3.0f),\n",
-    "    float2(-2.0f, -3.0f), float2(-3.0f, -3.0f), float2(-4.0f, -3.0f), float2(-6.0f, -3.0f),\n",
-    "    float2(0.0f, -4.0f), float2(0.5f, -4.0f), float2(1.0f, -4.0f), float2(1.5f, -4.0f),\n",
-    "    float2(2.0f, -4.0f), float2(3.0f, -4.0f), float2(4.0f, -4.0f), float2(6.0f, -4.0f),\n",
-    "    float2(-0.0f, -4.0f), float2(-0.5f, -4.0f), float2(-1.0f, -4.0f), float2(-1.5f, -4.0f),\n",
-    "    float2(-2.0f, -4.0f), float2(-3.0f, -4.0f), float2(-4.0f, -4.0f), float2(-6.0f, -4.0f),\n",
-    "    float2(0.0f, -6.0f), float2(0.5f, -6.0f), float2(1.0f, -6.0f), float2(1.5f, -6.0f),\n",
-    "    float2(2.0f, -6.0f), float2(3.0f, -6.0f), float2(4.0f, -6.0f), float2(6.0f, -6.0f),\n",
-    "    float2(-0.0f, -6.0f), float2(-0.5f, -6.0f), float2(-1.0f, -6.0f), float2(-1.5f, -6.0f),\n",
-    "    float2(-2.0f, -6.0f), float2(-3.0f, -6.0f), float2(-4.0f, -6.0f), float2(-6.0f, -6.0f),\n",
-    "};\n",
-    "constant float FP8_E4M3[256] = {\n",
-    "    0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,\n",
-    "    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,\n",
-    "    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,\n",
-    "    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,\n",
-    "    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,\n",
-    "    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,\n",
-    "    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,\n",
-    "    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,\n",
-    "    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,\n",
-    "    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,\n",
-    "    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,\n",
-    "    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,\n",
-    "    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,\n",
-    "    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,\n",
-    "    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,\n",
-    "    256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, NAN,\n",
-    "    -0.0f, -0.001953125f, -0.00390625f, -0.005859375f, -0.0078125f, -0.009765625f, -0.01171875f, -0.013671875f,\n",
-    "    -0.015625f, -0.017578125f, -0.01953125f, -0.021484375f, -0.0234375f, -0.025390625f, -0.02734375f, -0.029296875f,\n",
-    "    -0.03125f, -0.03515625f, -0.0390625f, -0.04296875f, -0.046875f, -0.05078125f, -0.0546875f, -0.05859375f,\n",
-    "    -0.0625f, -0.0703125f, -0.078125f, -0.0859375f, -0.09375f, -0.1015625f, -0.109375f, -0.1171875f,\n",
-    "    -0.125f, -0.140625f, -0.15625f, -0.171875f, -0.1875f, -0.203125f, -0.21875f, -0.234375f,\n",
-    "    -0.25f, -0.28125f, -0.3125f, -0.34375f, -0.375f, -0.40625f, -0.4375f, -0.46875f,\n",
-    "    -0.5f, -0.5625f, -0.625f, -0.6875f, -0.75f, -0.8125f, -0.875f, -0.9375f,\n",
-    "    -1.0f, -1.125f, -1.25f, -1.375f, -1.5f, -1.625f, -1.75f, -1.875f,\n",
-    "    -2.0f, -2.25f, -2.5f, -2.75f, -3.0f, -3.25f, -3.5f, -3.75f,\n",
-    "    -4.0f, -4.5f, -5.0f, -5.5f, -6.0f, -6.5f, -7.0f, -7.5f,\n",
-    "    -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,\n",
-    "    -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f,\n",
-    "    -32.0f, -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f,\n",
-    "    -64.0f, -72.0f, -80.0f, -88.0f, -96.0f, -104.0f, -112.0f, -120.0f,\n",
-    "    -128.0f, -144.0f, -160.0f, -176.0f, -192.0f, -208.0f, -224.0f, -240.0f,\n",
-    "    -256.0f, -288.0f, -320.0f, -352.0f, -384.0f, -416.0f, -448.0f, NAN,\n",
-    "};\n\n"
+    // The sixteen E2M1 values. Each lane keeps one (see `fp4_lane`), so
+    // decoding a code is `simd_shuffle`, not a memory read.
+    "constant float FP4_V[16] = {\n",
+    "    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,\n",
+    "    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};\n",
+    // FP8 E4M3 straight into IEEE bits: exponent e - 7 + 127, the
+    // mantissa in the top three bits, and a subnormal below that. A table
+    // costs a data-dependent gather per group, and real weights scatter.
+    // Both E2M1 codes of a byte, on vector ALU. `(c & 7) << 22` lands the
+    // exponent and mantissa where an IEEE float wants them, so the bias is
+    // one add; the format's two subnormals (codes 0 and 1) are the only
+    // values that needs fixing, and `2t - 1` maps them from 0.5 and 0.75
+    // to 0 and 0.5.
+    "inline float2 fp4_pair(uint b) {\n",
+    "    const uint2 c = uint2(b & 0xFu, b >> 4u);\n",
+    "    const float2 t = as_type<float2>(((c & 7u) << 22u) + 0x3F000000u);\n",
+    "    const float2 lo = float2((c & 7u) < 2u);\n",
+    "    const float2 v = t * (1.0f + lo) - lo;\n",
+    "    return as_type<float2>(as_type<uint2>(v) | ((c & 8u) << 28u));\n",
+    "}\n",
+    "inline float fp8_e4m3(uint b) {\n",
+    "    const uint e = (b >> 3u) & 0xFu, m = b & 7u;\n",
+    "    const uint bits = select(((e + 120u) << 23u) | (m << 20u),\n",
+    "                             as_type<uint>(float(m) * 0.001953125f), e == 0u);\n",
+    "    return as_type<float>(bits | ((b & 0x80u) << 24u));\n",
+    "}\n\n"
 );
 
 /// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
@@ -352,6 +275,13 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
     }
     if g.scratch > 0 {
         let _ = writeln!(s, "    threadgroup float scratch[{}];", g.scratch);
+    }
+    if g.fp4 {
+        // The sixteen E2M1 values, one per lane of the simdgroup, read
+        // once. A code then costs a shuffle instead of a load: with real
+        // weights the indices scatter, and a constant-memory gather runs
+        // at about half the bandwidth an arithmetic decode does.
+        s.push_str("    const float fp4_lane = FP4_V[tid & 15u];\n");
     }
     s.push_str(&g.body);
     s.push_str("}\n");
@@ -1016,12 +946,12 @@ impl Gen<'_> {
                     &format!("({AT} / {c}u) * {}u + ({AT} % {c}u) / 2u", tq.shape[1]),
                 );
                 let v = format!(
-                    "((({AT} & 1u) == 0u) ? FP4_P[(uint)(uchar)({byte}) & 0xFFu].x : FP4_P[(uint)(uchar)({byte}) & 0xFFu].y)"
+                    "simd_shuffle(fp4_lane, ((uint)(uchar)({byte}) >> (({AT} & 1u) * 4u)) & 0xFu)"
                 );
                 // Inside a reduction the scale is formed once per group, so
                 // the row scale rides along with it: group G is row
                 // `G / per_row`.
-                let s_of_group = format!("FP8_E4M3[(uint)(uchar)({se}) & 0xFFu]");
+                let s_of_group = format!("fp8_e4m3((uint)(uchar)({se}) & 0xFFu)");
                 let row_of_group = at_index(&ge, &format!("({AT}) / {per_row}u"));
                 let gidx = format!("({AT} / {c}u) * {per_row}u + ({AT} % {c}u) / {group}u");
                 let e = format!(
@@ -1216,8 +1146,8 @@ impl Gen<'_> {
                 self.owned(
                     n,
                     &[format!(
-                        "{name}[k] = (((e & 1u) == 0u) ? FP4_P[(uint)(uchar)({byte}) & 0xFFu].x : FP4_P[(uint)(uchar)({byte}) & 0xFFu].y) \
-                         * FP8_E4M3[(uint)(uchar)({sv}) & 0xFFu] * {gv};"
+                        "{name}[k] = simd_shuffle(fp4_lane, ((uint)(uchar)({byte}) >> ((e & 1u) * 4u)) & 0xFu) \
+                         * fp8_e4m3((uint)(uchar)({sv}) & 0xFFu) * {gv};"
                     )],
                 );
             }
@@ -1382,13 +1312,20 @@ impl Gen<'_> {
                             }
                             Pack::Fp4(qe, qc) => {
                                 // One byte, two E2M1 codes: p and p + 1.
+                                // A run shares one scale, so it accumulates
+                                // unscaled and pays a single multiply at
+                                // the end rather than one per value: this
+                                // loop is short of ALU, not of bandwidth.
                                 let byte = at_index(qe, &format!("j * {qc}u + p0 / 2u + u / 2u"));
                                 let a1 = Self::read(&ops[0].0, &format!("i * {kd}u + p + 1u"));
+                                self.line("    float run = 0.0f;");
                                 self.line(&format!(
                                     "    for (uint u = 0; u < {vec}u; u += 2u) {{ const uint p = p0 + u; \
-                                     const float2 bq = FP4_P[(uint)(uchar)({byte}) & 0xFFu]; \
-                                     s += {av} * (bq.x * sg) + {a1} * (bq.y * sg); }}"
+                                     const uint bq = (uint)(uchar)({byte}); \
+                                     const float2 w = fp4_pair(bq); \
+                                     run += {av} * w.x + {a1} * w.y; }}"
                                 ));
+                                self.line("    s += run * sg;");
                             }
                             Pack::Pairs(qe, qc) => {
                                 // One byte, two values: low nibble for p,
@@ -1633,7 +1570,11 @@ impl Gen<'_> {
                         let byte = at_index(qe, &format!("j * {qc}u + p0 / 2u + u / 2u"));
                         (
                             2,
-                            format!("const float2 bq = FP4_P[(uint)(uchar)({byte}) & 0xFFu]; "),
+                            format!(
+                                "const uint bqb = (uint)(uchar)({byte}); \
+                                 const float2 bq = float2(simd_shuffle(fp4_lane, bqb & 0xFu), \
+                                 simd_shuffle(fp4_lane, bqb >> 4u)); "
+                            ),
                             vec![
                                 "(bq.x * sgr[rr])".to_string(),
                                 "(bq.y * sgr[rr])".to_string(),

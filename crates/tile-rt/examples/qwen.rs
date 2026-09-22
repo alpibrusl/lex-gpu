@@ -46,6 +46,29 @@ fn main() -> Result<(), String> {
     }
     let per = t.elapsed().as_secs_f64() / steps as f64;
     println!("{:.1} ms/token ({:.1} tok/s)", 1e3 * per, 1.0 / per);
+
+    // Where the time goes, per call site, from the command buffer's own
+    // timestamps. Each dispatch waits, so the step itself is slower here.
+    rt.sync = true;
+    rt.clear_profile();
+    let n = 4;
+    for _ in 0..n {
+        logits = rt.step(top(&logits).0)?;
+    }
+    println!(
+        "\n  {:<20} {:>7} {:>10} {:>9}",
+        "call site", "calls", "ms/token", "of sum"
+    );
+    let prof = rt.profile();
+    let sum: f64 = prof.iter().map(|p| p.2).sum();
+    for (label, calls, secs) in prof {
+        println!(
+            "  {label:<20} {:>7} {:>10.2} {:>8.1}%",
+            calls / n,
+            1e3 * secs / n as f64,
+            100.0 * secs / sum
+        );
+    }
     Ok(())
 }
 

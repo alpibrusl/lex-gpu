@@ -34,6 +34,17 @@ fn main() -> Result<(), String> {
         ("qwen down (nvfp4)", 17408, 5120, QLayout::NVFP4),
         ("qwen qkv-in (nvfp4)", 5120, 12288, QLayout::NVFP4),
         ("qwen lm head (nvfp4)", 5120, 248320, QLayout::NVFP4),
+        // NVFP4 with a 32-value scale group (not the real layout): does
+        // the scale's frequency explain the gap to Q4_K?
+        (
+            "qwen gate/up (fp4 g32)",
+            5120,
+            17408,
+            QLayout {
+                group: 32,
+                ..QLayout::NVFP4
+            },
+        ),
         // The same shapes in Q4_K, to separate format from shape.
         ("qwen gate/up (Q4_K)", 5120, 17408, QLayout::Q4_K),
         ("qwen down (Q4_K)", 17408, 5120, QLayout::Q4_K),
@@ -64,11 +75,23 @@ fn main() -> Result<(), String> {
         let copies = (1usize << 30).div_ceil(wbytes).clamp(2, 64);
         let x = gpu.zeroed::<u8>(bytes(&prog.params[0]));
         let y = gpu.zeroed::<u8>(bytes(&prog.params[np - 1]));
+        // Real bytes, not `zeroed`: a buffer that has never been written
+        // may read from a shared zero page rather than from DRAM, which
+        // flatters the measurement.
+        let filler: Vec<u8> = (0..1 << 16).map(|i| (i * 37 + 11) as u8).collect();
         let sets: Vec<Vec<Buffer>> = (0..copies)
             .map(|_| {
                 prog.params[1..np - 1]
                     .iter()
-                    .map(|p| gpu.zeroed::<u8>(bytes(p)))
+                    .map(|p| {
+                        let n = bytes(p);
+                        let mut v = Vec::with_capacity(n);
+                        while v.len() < n {
+                            let take = filler.len().min(n - v.len());
+                            v.extend_from_slice(&filler[..take]);
+                        }
+                        gpu.upload(&v)
+                    })
                     .collect()
             })
             .collect();
