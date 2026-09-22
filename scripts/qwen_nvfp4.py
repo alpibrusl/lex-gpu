@@ -76,8 +76,13 @@ def read_tensor(model, name):
         rows, words = e["shape"]
         codes = np.frombuffer(buf, dtype=np.uint32).reshape(rows, words)
         nib = np.empty((rows, words * 8), dtype=np.uint8)
-        for k in range(8):  # little-endian: value k is bits 4k..4k+3
-            nib[:, k::8] = (codes >> (4 * k)) & 0xF
+        # Little-endian: value k is bits 4k..4k+3. `QWEN_NIBBLE=high`
+        # reverses it, to test the packing end to end.
+        import os
+
+        high = os.environ.get("QWEN_NIBBLE") == "high"
+        for k in range(8):
+            nib[:, k::8] = (codes >> (4 * (7 - k) if high else 4 * k)) & 0xF
         se, sbuf = part(name + ".scale")
         scale = E4M3[np.frombuffer(sbuf, dtype=np.uint8).reshape(se["shape"])]
         _, gbuf = part(name + ".global_scale")
