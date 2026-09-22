@@ -144,6 +144,21 @@ pub fn matvec_q(
     layout: QLayout,
     residual: bool,
 ) -> Result<Program, String> {
+    matmul_q(1, n_in, n_out, bo, kc, layout, residual)
+}
+
+/// [`matvec_q`] for `t` rows of activations at once (`x: [t, n_in]`,
+/// `y: [t, n_out]`): prefill's shape, where each weight is read once for
+/// every token of the batch.
+pub fn matmul_q(
+    t: usize,
+    n_in: usize,
+    n_out: usize,
+    bo: usize,
+    kc: usize,
+    layout: QLayout,
+    residual: bool,
+) -> Result<Program, String> {
     use Arg::Move;
     let g = layout.group;
     let sup = g * layout.super_groups.unwrap_or(1);
@@ -154,12 +169,17 @@ pub fn matvec_q(
         ));
     }
     let name = format!(
-        "matvec_{}_{n_out}x{n_in}{}",
+        "{}_{}_{n_out}x{n_in}{}",
+        if t == 1 {
+            "matvec".to_string()
+        } else {
+            format!("matmul{t}")
+        },
         layout.tag(),
         if residual { "_res" } else { "" }
     );
     let mut b = Builder::new(&name);
-    let px = b.param("x", DType::F32, &[1, n_in], false);
+    let px = b.param("x", DType::F32, &[t, n_in], false);
     let qcols = if layout.packed4 || layout.six {
         n_in / 2
     } else {
@@ -174,11 +194,11 @@ pub fn matvec_q(
         .into_iter()
         .map(|(name, dt, per)| (b.param(name, dt, &[n_out, n_in / per], false), dt, per))
         .collect();
-    let pr = residual.then(|| b.param("r", DType::F32, &[1, n_out], false));
-    let py = b.param("y", DType::F32, &[1, n_out], true);
+    let pr = residual.then(|| b.param("r", DType::F32, &[t, n_out], false));
+    let py = b.param("y", DType::F32, &[t, n_out], true);
     let pid = b.grid(n_out / bo);
 
-    let acc_ty = reg(DType::F32, &[1, bo]);
+    let acc_ty = reg(DType::F32, &[t, bo]);
     let acc = b.op("acc", Op::Fill(acc_ty.clone(), 0.0));
     let out = b.for_range(
         0,
@@ -194,9 +214,9 @@ pub fn matvec_q(
                         at(
                             px,
                             [IdxExpr::lit(0), IdxExpr::scaled(c, kc, col0)],
-                            [1, cols],
+                            [t, cols],
                         ),
-                        reg(DType::F32, &[1, cols]),
+                        reg(DType::F32, &[t, cols]),
                     ),
                 )
             };
@@ -284,13 +304,13 @@ pub fn matvec_q(
         },
     );
     let mut y = out[0];
-    let dst = at(py, [IdxExpr::lit(0), IdxExpr::scaled(pid, bo, 0)], [1, bo]);
+    let dst = at(py, [IdxExpr::lit(0), IdxExpr::scaled(pid, bo, 0)], [t, bo]);
     if let Some(pr) = pr {
         let r = b.op(
             "r",
             Op::Load(
-                at(pr, [IdxExpr::lit(0), IdxExpr::scaled(pid, bo, 0)], [1, bo]),
-                reg(DType::F32, &[1, bo]),
+                at(pr, [IdxExpr::lit(0), IdxExpr::scaled(pid, bo, 0)], [t, bo]),
+                reg(DType::F32, &[t, bo]),
             ),
         );
         y = b.op("y", Op::Binary(BinOp::Add, Move(y), Move(r)));
