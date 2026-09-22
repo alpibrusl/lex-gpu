@@ -816,7 +816,7 @@ impl Checker<'_> {
                     return None;
                 }
                 self.expr_range(first)?;
-                self.range_of(*limit)?;
+                self.expr_range(limit)?;
                 Some(reg(t.dtype, &t.shape))
             }
             Op::Convert(a, dt) => {

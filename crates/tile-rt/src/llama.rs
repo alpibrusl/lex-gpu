@@ -214,7 +214,10 @@ mod gpu {
 
     use half::f16;
     use tile_front::flash::FlashDecode;
-    use tile_front::llama::{QLayout, kv_append, matvec_q, rmsnorm, rope, rope_tables, silu_mul};
+    use tile_front::llama::{
+        QLayout, kv_append, kv_append_rows, matmul_q, matvec_q, rmsnorm, rmsnorm_rows, rope,
+        rope_rows, rope_tables, silu_mul,
+    };
     use tile_front::{Program, check};
     use tile_ir::{DType, Space, Target};
     use tile_metal::{Buffer, Gpu, Pipeline};
@@ -313,6 +316,60 @@ mod gpu {
         logits: Buffer,
     }
 
+    /// A matmul dispatch for weight `w`: the pipeline for its shape and
+    /// layout, and its buffers in parameter order.
+    fn mv_dispatch<'a>(
+        mv: &'a HashMap<MvKey, Pipeline>,
+        w: &'a QBuf,
+        x: &'a Buffer,
+        r: Option<&'a Buffer>,
+        y: &'a Buffer,
+    ) -> (&'a Pipeline, Vec<&'a Buffer>) {
+        let p = &mv[&(w.cols, w.rows, w.layout, r.is_some())];
+        let mut bufs = vec![x, &w.q];
+        bufs.extend(w.qh.as_ref());
+        bufs.extend(w.scales.iter());
+        bufs.extend(r);
+        bufs.push(y);
+        (p, bufs)
+    }
+
+    /// Largest batch of tokens one [`Runner::forward`] takes.
+    pub const MAX_BATCH: usize = 16;
+
+    /// Kernels for a batch of `t` tokens, compiled on first use.
+    struct Batch {
+        rms: Pipeline,
+        rms_last: Pipeline,
+        mv: HashMap<MvKey, Pipeline>,
+        rope_q: Pipeline,
+        rope_k: Pipeline,
+        kv_k: Pipeline,
+        kv_v: Pipeline,
+        attn: Pipeline,
+        silu: Pipeline,
+    }
+
+    /// Activations for up to `MAX_BATCH` tokens.
+    struct BatchActs {
+        x: Buffer,
+        x2: Buffer,
+        h: Buffer,
+        q32: Buffer,
+        k32: Buffer,
+        v32: Buffer,
+        q16: Buffer,
+        k16: Buffer,
+        o: Buffer,
+        g: Buffer,
+        u: Buffer,
+        a: Buffer,
+        cos: Buffer,
+        sin: Buffer,
+        logits: Buffer,
+        scalars_attn: Buffer,
+    }
+
     /// Runs decode steps for one sequence on the Metal device.
     pub struct Runner<'w> {
         gpu: Gpu,
@@ -327,6 +384,8 @@ mod gpu {
         cap: usize,
         scalars_pos: Buffer,
         scalars_attn: Buffer,
+        batches: HashMap<usize, Batch>,
+        bacts: BatchActs,
         pos: usize,
         /// Dispatch one kernel at a time and record each call site's GPU
         /// time, instead of one command buffer per token. For profiling; the
@@ -429,6 +488,25 @@ mod gpu {
             };
             let gpu_scalars_pos = gpu.zeroed::<u32>(1);
             let gpu_scalars_attn = gpu.zeroed::<u32>(2);
+            let bt = MAX_BATCH;
+            let bacts = BatchActs {
+                x: f(bt * c.dim),
+                x2: f(bt * c.dim),
+                h: f(bt * c.dim),
+                q32: f(bt * c.dim),
+                k32: f(bt * kvd),
+                v32: f(bt * kvd),
+                q16: gpu.zeroed::<f16>(bt * c.dim),
+                k16: gpu.zeroed::<f16>(bt * kvd),
+                o: f(bt * c.dim),
+                g: f(bt * c.ffn),
+                u: f(bt * c.ffn),
+                a: f(bt * c.ffn),
+                cos: f(bt * c.head_dim),
+                sin: f(bt * c.head_dim),
+                logits: f(bt * c.vocab),
+                scalars_attn: gpu.zeroed::<u32>(2),
+            };
             Ok(Runner {
                 emb: upload_q(&gpu, &w.emb),
                 out: w.out.as_ref().map(|o| upload_q(&gpu, o)),
@@ -441,6 +519,8 @@ mod gpu {
                 cap,
                 scalars_pos: gpu_scalars_pos,
                 scalars_attn: gpu_scalars_attn,
+                batches: HashMap::new(),
+                bacts,
                 pos: 0,
                 sync: std::env::var_os("TILE_SYNC").is_some(),
                 dispatches: 0,
@@ -459,6 +539,187 @@ mod gpu {
         /// Forget the sequence; the cache is overwritten from position 0.
         pub fn reset(&mut self) {
             self.pos = 0;
+        }
+
+        /// Roll the sequence back to `pos` positions (speculative decoding
+        /// rejecting drafted tokens). Cache entries past it are simply
+        /// overwritten later; attention never reads past the live length.
+        pub fn truncate(&mut self, pos: usize) {
+            assert!(pos <= self.pos, "truncate forward");
+            self.pos = pos;
+        }
+
+        fn batch(&mut self, t: usize) -> Result<(), String> {
+            if self.batches.contains_key(&t) {
+                return Ok(());
+            }
+            let c = self.w.cfg.clone();
+            let gpu = &self.gpu;
+            // Rows per threadgroup: 32 for the smallest batches, 16 beyond
+            // (measured: register pressure at larger t).
+            let bo = if t <= 4 { 32 } else { 16 };
+            let mut mv = HashMap::new();
+            let key = |m: &QMat, res: bool| (m.cols, m.rows, m.w.layout, res);
+            let mut keys = vec![key(self.w.out.as_ref().unwrap_or(&self.w.emb), false)];
+            for l in &self.w.layers {
+                keys.extend([
+                    key(&l.wq, false),
+                    key(&l.wk, false),
+                    key(&l.wv, false),
+                    key(&l.wo, true),
+                    key(&l.gate, false),
+                    key(&l.up, false),
+                    key(&l.down, true),
+                ]);
+            }
+            for kk in keys {
+                if let Entry::Vacant(slot) = mv.entry(kk) {
+                    let (n_in, n_out, layout, res) = kk;
+                    let p = matmul_q(t, n_in, n_out, bo, n_in, layout, res)?;
+                    slot.insert(compile(gpu, &p, THREADS)?);
+                }
+            }
+            let group = c.n_head / c.n_kv;
+            let attn = FlashDecode {
+                q_rows: group,
+                d: c.head_dim,
+                seq: self.cap,
+                bq: group,
+                bk: ATTN_BK,
+                stages: 1,
+                dtype: DType::F16,
+                kv_space: Space::Threadgroup,
+                consumers: 0,
+                heads: c.n_kv,
+                kv_cap: self.cap,
+            };
+            let b = Batch {
+                rms: compile(gpu, &rmsnorm_rows(t, c.dim, c.eps, None), THREADS)?,
+                rms_last: compile(gpu, &rmsnorm_rows(t, c.dim, c.eps, Some(t - 1)), THREADS)?,
+                mv,
+                rope_q: compile(
+                    gpu,
+                    &rope_rows(t, c.n_head, c.head_dim, DType::F16),
+                    THREADS,
+                )?,
+                rope_k: compile(gpu, &rope_rows(t, c.n_kv, c.head_dim, DType::F16), THREADS)?,
+                kv_k: compile(
+                    gpu,
+                    &kv_append_rows(t, c.n_kv, c.head_dim, self.cap, DType::F16),
+                    64,
+                )?,
+                kv_v: compile(
+                    gpu,
+                    &kv_append_rows(t, c.n_kv, c.head_dim, self.cap, DType::F32),
+                    64,
+                )?,
+                attn: compile(gpu, &attn.build_causal(t)?, 128)?,
+                silu: compile(gpu, &silu_mul(t * c.ffn, THREADS)?, THREADS)?,
+            };
+            self.batches.insert(t, b);
+            Ok(())
+        }
+
+        /// Feed `tokens` (at most [`MAX_BATCH`]) at the next positions in one
+        /// pass. Returns the logits after every token (`all`: speculative
+        /// verify) or only after the last (prefill).
+        pub fn forward(&mut self, tokens: &[u32], all: bool) -> Result<Vec<Vec<f32>>, String> {
+            let t = tokens.len();
+            if t == 0 || t > MAX_BATCH {
+                return Err(format!("a batch is 1..={MAX_BATCH} tokens, not {t}"));
+            }
+            if self.pos + t > self.cap {
+                return Err(format!("KV cache is full ({} positions)", self.cap));
+            }
+            self.batch(t)?;
+            let c = self.w.cfg.clone();
+            let pos0 = self.pos;
+            let (dim, hd) = (c.dim, c.head_dim);
+            for (i, &tok) in tokens.iter().enumerate() {
+                self.gpu
+                    .write(&self.bacts.x, i * dim, &self.w.emb.row(tok as usize));
+                let (cs, sn) = rope_tables(pos0 + i, hd, c.rope_base, c.rope_factors.as_deref());
+                self.gpu.write(&self.bacts.cos, i * hd, &cs);
+                self.gpu.write(&self.bacts.sin, i * hd, &sn);
+            }
+            self.gpu.write(&self.scalars_pos, 0, &[pos0 as u32]);
+            self.gpu.write(
+                &self.bacts.scalars_attn,
+                0,
+                &[pos0 as u32, (pos0 + t).div_ceil(ATTN_BK) as u32],
+            );
+            let n = {
+                let bk = &self.batches[&t];
+                let a = &self.bacts;
+                let mv = |w, x, r, y| mv_dispatch(&bk.mv, w, x, r, y);
+                let mut d: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
+                for l in &self.layers {
+                    d.push((&bk.rms, vec![&a.x, &l.attn_norm, &a.h]));
+                    d.push(mv(&l.wq, &a.h, None, &a.q32));
+                    d.push(mv(&l.wk, &a.h, None, &a.k32));
+                    d.push(mv(&l.wv, &a.h, None, &a.v32));
+                    d.push((&bk.rope_q, vec![&a.q32, &a.cos, &a.sin, &a.q16]));
+                    d.push((&bk.rope_k, vec![&a.k32, &a.cos, &a.sin, &a.k16]));
+                    d.push((&bk.kv_k, vec![&a.k16, &l.kcache, &self.scalars_pos]));
+                    d.push((&bk.kv_v, vec![&a.v32, &l.vcache, &self.scalars_pos]));
+                    d.push((
+                        &bk.attn,
+                        vec![&a.q16, &l.kcache, &l.vcache, &a.o, &a.scalars_attn],
+                    ));
+                    d.push(mv(&l.wo, &a.o, Some(&a.x), &a.x2));
+                    d.push((&bk.rms, vec![&a.x2, &l.ffn_norm, &a.h]));
+                    d.push(mv(&l.gate, &a.h, None, &a.g));
+                    d.push(mv(&l.up, &a.h, None, &a.u));
+                    d.push((&bk.silu, vec![&a.g, &a.u, &a.a]));
+                    d.push(mv(&l.down, &a.a, Some(&a.x2), &a.x));
+                }
+                let out = self.out.as_ref().unwrap_or(&self.emb);
+                if all {
+                    d.push((&bk.rms, vec![&a.x, &self.out_norm, &a.h]));
+                    d.push(mv(out, &a.h, None, &a.logits));
+                } else {
+                    // Only the last token's logits: its row, then the
+                    // single-token output head.
+                    d.push((&bk.rms_last, vec![&a.x, &self.out_norm, &self.acts.h]));
+                    let p = &self.k.mv[&(out.cols, out.rows, out.layout, false)];
+                    let mut bufs = vec![&self.acts.h, &out.q];
+                    bufs.extend(out.qh.as_ref());
+                    bufs.extend(out.scales.iter());
+                    bufs.push(&self.acts.logits);
+                    d.push((p, bufs));
+                }
+                let steps: Vec<(&Pipeline, &[&Buffer])> =
+                    d.iter().map(|(p, b)| (*p, b.as_slice())).collect();
+                let t0 = Instant::now();
+                self.gpu.run_all(&steps);
+                let mut prof = self.prof.borrow_mut();
+                let e = prof.entry("batch (one command buffer)").or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += t0.elapsed().as_secs_f64();
+                d.len()
+            };
+            self.dispatches += n;
+            self.pos += t;
+            let v = c.vocab;
+            if all {
+                let mut flat = vec![0.0f32; t * v];
+                self.gpu.download(&self.bacts.logits, &mut flat);
+                Ok(flat.chunks(v).map(|r| r.to_vec()).collect())
+            } else {
+                let mut last = vec![0.0f32; v];
+                self.gpu.download(&self.acts.logits, &mut last);
+                Ok(vec![last])
+            }
+        }
+
+        /// Feed a whole prompt in batches of `chunk` tokens; returns the logits
+        /// after its last token.
+        pub fn prefill(&mut self, tokens: &[u32], chunk: usize) -> Result<Vec<f32>, String> {
+            let mut last = vec![];
+            for part in tokens.chunks(chunk.clamp(1, MAX_BATCH)) {
+                last = self.forward(part, false)?.pop().expect("one row");
+            }
+            Ok(last)
         }
 
         /// Feed one token at the next position; returns the logits.

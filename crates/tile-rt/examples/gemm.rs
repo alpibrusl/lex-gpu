@@ -14,8 +14,11 @@ fn main() -> Result<(), String> {
     let (n_in, n_out) = (4096usize, 14336usize); // Llama-3-8B gate/up
     println!("{} — Q4_K {n_out}x{n_in}", gpu.info().name);
     println!("{:>5} {:>10} {:>12} {:>10}", "T", "ms", "GFLOP/s", "tok/s*");
-    for t in [1usize, 8, 32, 128] {
-        let bo = 8;
+    for t in [1usize, 2, 4, 8, 16] {
+        let bo: usize = std::env::var("BO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if t == 1 { 8 } else { 32 });
         let prog = matmul_q(t, n_in, n_out, bo, n_in, QLayout::Q4_K, false)?;
         tile_front::check(&prog, gpu.target()).map_err(|e| format!("{e:?}"))?;
         let pipe = gpu.build_lowered(&lower(&prog, gpu.target(), 256)?)?;

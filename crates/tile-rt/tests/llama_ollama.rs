@@ -71,8 +71,51 @@ fn llama31_8b_q4_k_m_matches_the_reference_that_matches_ollama() {
     check_golden(include_str!("data/llama31_8b_golden.txt"));
 }
 
-/// Run every case of a golden file through tile and compare.
+/// How the tokens reach the model: the three paths must agree.
+#[derive(Clone, Copy, Debug)]
+enum Feed {
+    /// One token at a time (decode).
+    Steps,
+    /// The prompt in batches of `n` (prefill), then one token at a time.
+    Prefill(usize),
+    /// Prompt prefilled in 4s, then the continuation in batches of `n` with
+    /// every position's logits (speculative verification).
+    Verify(usize),
+}
+
+fn check_logits(what: &str, lp: &[f64], st: &Step, worst: &mut f64) {
+    let argmax = (0..lp.len())
+        .max_by(|&a, &b| lp[a].total_cmp(&lp[b]))
+        .unwrap() as u32;
+    assert_eq!(
+        argmax, st.top[0].0,
+        "{what}: tile picks {argmax}, reference {}",
+        st.top[0].0
+    );
+    for &(id, want) in &st.top {
+        let d = (lp[id as usize] - want).abs();
+        *worst = worst.max(d);
+        assert!(
+            d <= TOL,
+            "{what}: token {id} logprob {} vs reference {want}",
+            lp[id as usize]
+        );
+    }
+}
+
+/// Run every case of a golden file through tile, fed each way, and compare.
 fn check_golden(golden: &str) {
+    for feed in [
+        Feed::Steps,
+        Feed::Prefill(4),
+        Feed::Prefill(16),
+        Feed::Verify(5),
+    ] {
+        check_golden_fed(golden, feed);
+    }
+}
+
+fn check_golden_fed(golden: &str, feed: Feed) {
     let (model, cases) = parse(golden);
     let path = match ollama_model(&model) {
         Ok(p) if p.exists() => p,
@@ -88,44 +131,54 @@ fn check_golden(golden: &str) {
         .map(|c| c.prompt.len() + c.steps.len())
         .max()
         .unwrap_or(0);
-    let w = Weights::load(&path, longest + 1).expect("load");
+    let w = Weights::load(&path, longest + 16).expect("load");
     let mut rt = Runner::new(&w).expect("runner");
 
     let mut worst = 0.0f64;
     let mut steps = 0;
     for case in &cases {
         rt.reset();
-        let mut logits = vec![];
-        for &t in &case.prompt {
-            logits = rt.step(t).expect("step");
-        }
-        for (i, st) in case.steps.iter().enumerate() {
-            let lp = log_softmax(&logits);
-            let argmax = (0..lp.len())
-                .max_by(|&a, &b| lp[a].total_cmp(&lp[b]))
-                .unwrap() as u32;
-            assert_eq!(
-                argmax, st.top[0].0,
-                "prompt {:?} step {i}: tile picks {argmax}, reference {}",
-                case.prompt, st.top[0].0
-            );
-            for &(id, want) in &st.top {
-                let d = (lp[id as usize] - want).abs();
-                worst = worst.max(d);
-                assert!(
-                    d <= TOL,
-                    "prompt {:?} step {i}: token {id} logprob {} vs reference {want}",
-                    case.prompt,
-                    lp[id as usize]
-                );
+        let what = |i: usize| format!("{feed:?} prompt {:?} step {i}", case.prompt);
+        let mut logits = match feed {
+            Feed::Steps => {
+                let mut l = vec![];
+                for &t in &case.prompt {
+                    l = rt.step(t).expect("step");
+                }
+                l
             }
-            steps += 1;
-            logits = rt.step(st.next).expect("step");
+            Feed::Prefill(n) => rt.prefill(&case.prompt, n).expect("prefill"),
+            Feed::Verify(_) => rt.prefill(&case.prompt, 4).expect("prefill"),
+        };
+        match feed {
+            Feed::Verify(n) => {
+                // Step 0 comes from the prompt; then each batch of `n`
+                // continuation tokens yields the next `n` predictions at once.
+                check_logits(&what(0), &log_softmax(&logits), &case.steps[0], &mut worst);
+                steps += 1;
+                let nexts: Vec<u32> = case.steps.iter().map(|s| s.next).collect();
+                let mut i = 1;
+                for batch in nexts[..nexts.len() - 1].chunks(n) {
+                    let rows = rt.forward(batch, true).expect("verify");
+                    for row in rows {
+                        check_logits(&what(i), &log_softmax(&row), &case.steps[i], &mut worst);
+                        i += 1;
+                        steps += 1;
+                    }
+                }
+            }
+            _ => {
+                for (i, st) in case.steps.iter().enumerate() {
+                    check_logits(&what(i), &log_softmax(&logits), st, &mut worst);
+                    steps += 1;
+                    logits = rt.step(st.next).expect("step");
+                }
+            }
         }
     }
     eprintln!(
-        "{model}: {steps} steps over {} prompts on {}: worst |dlogprob| vs reference {worst:.5} \
-         (tolerance {TOL})",
+        "{model} [{feed:?}]: {steps} steps over {} prompts on {}: worst |dlogprob| vs reference \
+         {worst:.5} (tolerance {TOL})",
         cases.len(),
         rt.device()
     );

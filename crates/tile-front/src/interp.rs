@@ -592,7 +592,7 @@ impl Interp<'_> {
             }
             Op::MaskCols(a, first, limit) => {
                 let t = self.arg(*a)?;
-                let (f, lim) = (self.eval(first)?, self.index(*limit)?);
+                let (f, lim) = (self.eval(first)?, self.eval(limit)?);
                 let n = t.ty.shape[1];
                 let out = t
                     .data

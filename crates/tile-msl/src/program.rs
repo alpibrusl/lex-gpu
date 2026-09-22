@@ -951,9 +951,7 @@ impl Gen<'_> {
                 let (n, cols) = (ty.elems(), ty.shape[1]);
                 let ops = self.operands(&[*a], &[true], n)?;
                 let src = Self::read(&ops[0].0, "e");
-                let Loc::Index(lim) = self.loc(*limit)? else {
-                    return Err("mask limit is not a scalar".into());
-                };
+                let lim = self.idx(limit)?;
                 let f = self.idx(first)?;
                 let name = self.declare_reg(x, &reg(ty.dtype, &ty.shape));
                 self.owned(
@@ -1037,6 +1035,18 @@ impl Gen<'_> {
                 } else {
                     Self::read(&ops[1].0, &format!("p * {n}u + j"))
                 };
+                // A few rows against a weight matrix (a small batch of
+                // tokens): each lane group owns one weight row and keeps an
+                // accumulator per token, so every weight is read and
+                // dequantised once for the whole batch.
+                // Weights from device memory only: attention's tiles already
+                // live in threadgroup memory and keep the split-K path.
+                let weight = matches!(b, Arg::Move(v) | Arg::Borrow(v)
+                    if matches!(self.locs.get(v), Some(Loc::Lazy(..))));
+                if nt && weight && m > 1 && m <= 16 && n < self.threads {
+                    self.batched_rows(x, *acc, (m, n, kd), b, &ops)?;
+                    return Ok(());
+                }
                 let outs = m * n;
                 // Fewer outputs than threads (a matrix-vector product): give
                 // each output a power-of-two group of lanes within one
@@ -1309,6 +1319,186 @@ impl Gen<'_> {
                 return Err("pipes have no Metal lowering (no split barriers)".into());
             }
         }
+        Ok(())
+    }
+
+    /// `out[i, j] = sum_p a[i, p] * b[j, p]` for a few rows `i` (a small
+    /// batch of tokens). Each simdgroup owns `r` weight rows and keeps an
+    /// accumulator per (weight row, token); per step it loads each token's
+    /// activation once and each weight once, and multiplies every pair. Lazy
+    /// dequantised weights get their group terms hoisted and their packed
+    /// bytes read once, as in the single-row reduction.
+    fn batched_rows(
+        &mut self,
+        x: Var,
+        acc: DType,
+        (m, n, kd): (usize, usize, usize),
+        b: &Arg,
+        ops: &[(Access, TileTy)],
+    ) -> Result<(), String> {
+        let simd = 32;
+        let groups = (self.threads / simd).max(1);
+        // Weight rows per simdgroup; the rest of the lowering assumes they
+        // tile the output evenly.
+        let r = n.div_ceil(groups);
+        let lanes = simd;
+        let dq = match b {
+            Arg::Move(v) | Arg::Borrow(v) => self.dq.get(v).cloned(),
+            _ => None,
+        };
+        let packed = dq.as_ref().is_some_and(|d| !matches!(d.pack, Pack::None));
+        let vec = split_k_vec(kd, lanes, if packed { 16 } else { 8 });
+        let dq = dq.filter(|d| {
+            vec > 1
+                && d.cols == kd
+                && d.group.is_multiple_of(vec)
+                && match d.pack {
+                    Pack::None => true,
+                    Pack::Pairs(..) => vec.is_multiple_of(2),
+                    Pack::Six(..) => vec.is_multiple_of(4),
+                }
+        });
+        // Per step: loads for row `j`, and the weights for p + k.
+        let (step, pre, weights): (usize, String, Vec<String>) = match &dq {
+            Some(d) => {
+                let mg = if d.m.is_some() { " - mgr[rr]" } else { "" };
+                match &d.pack {
+                    Pack::Pairs(qe, qc) => {
+                        let byte = at_index(qe, &format!("j * {qc}u + p / 2u"));
+                        (
+                            2,
+                            format!("const uint bq = (uint)(uchar)({byte}); "),
+                            vec![
+                                format!("(float(bq & 0xFu) * sgr[rr]{mg})"),
+                                format!("(float(bq >> 4u) * sgr[rr]{mg})"),
+                            ],
+                        )
+                    }
+                    Pack::Six(lo, lc, hi, hc) => {
+                        let b0 = at_index(lo, &format!("j * {lc}u + p / 2u"));
+                        let b1 = at_index(lo, &format!("j * {lc}u + p / 2u + 1u"));
+                        let h = at_index(hi, &format!("j * {hc}u + p / 4u"));
+                        let q = |l: &str, sh: u32, hs: u32| {
+                            format!(
+                                "(float(int((({l} >> {sh}u) & 0xFu) | (((hh >> {hs}u) & 3u) << 4u)) - 32) * sgr[rr])"
+                            )
+                        };
+                        (
+                            4,
+                            format!(
+                                "const uint l0 = (uint)(uchar)({b0}), l1 = (uint)(uchar)({b1}), \
+                                 hh = (uint)(uchar)({h}); "
+                            ),
+                            vec![q("l0", 0, 0), q("l0", 4, 2), q("l1", 0, 4), q("l1", 4, 6)],
+                        )
+                    }
+                    Pack::None => {
+                        let vv = at_index(&d.v, &format!("j * {kd}u + p"));
+                        (1, String::new(), vec![format!("({vv} * sgr[rr]{mg})")])
+                    }
+                }
+            }
+            None => (
+                1,
+                String::new(),
+                vec![Self::read(&ops[1].0, &format!("j * {kd}u + p"))],
+            ),
+        };
+        let res = self.staged;
+        self.scratch = self.scratch.max(res + m * n);
+        if self.staged == 0 {
+            self.barrier();
+        }
+        let v = vec.max(1);
+        self.line("{");
+        self.depth += 1;
+        self.line(&format!(
+            "const uint sgid = tid / {simd}u, lane = tid % {simd}u;"
+        ));
+        self.line(&format!("float s[{r}][{m}];"));
+        self.line(&format!(
+            "for (uint rr = 0; rr < {r}u; ++rr) for (uint i = 0; i < {m}u; ++i) s[rr][i] = 0.0f;"
+        ));
+        self.line(&format!(
+            "for (uint p0 = lane * {v}u; p0 < {kd}u; p0 += {}u) {{",
+            lanes * v
+        ));
+        self.depth += 1;
+        if let Some(d) = &dq {
+            let g = d.group;
+            self.line(&format!("float sgr[{r}], mgr[{r}];"));
+            self.line(&format!("for (uint rr = 0; rr < {r}u; ++rr) {{"));
+            self.line(&format!(
+                "    const uint j = min(sgid * {r}u + rr, {}u); const uint grp = j * {}u + p0 / {g}u;",
+                n - 1,
+                kd / g
+            ));
+            self.line(&format!("    sgr[rr] = {};", at_index(&d.s, "grp")));
+            match &d.m {
+                Some(mm) => self.line(&format!("    mgr[rr] = {};", at_index(mm, "grp"))),
+                None => self.line("    mgr[rr] = 0.0f;"),
+            }
+            self.line("}");
+        }
+        self.line(&format!("for (uint u = 0; u < {v}u; u += {step}u) {{"));
+        self.depth += 1;
+        self.line("const uint p = p0 + u;");
+        // Each token's activations for this step, loaded once.
+        self.line(&format!("float xa[{m}][{step}];"));
+        for k in 0..step {
+            self.line(&format!(
+                "for (uint i = 0; i < {m}u; ++i) xa[i][{k}] = {};",
+                Self::read(&ops[0].0, &format!("i * {kd}u + p + {k}u"))
+            ));
+        }
+        self.line(&format!("for (uint rr = 0; rr < {r}u; ++rr) {{"));
+        self.depth += 1;
+        self.line(&format!(
+            "const uint j = min(sgid * {r}u + rr, {}u);",
+            n - 1
+        ));
+        let names: Vec<String> = (0..weights.len()).map(|k| format!("w{k}")).collect();
+        let decl: Vec<String> = weights
+            .iter()
+            .zip(&names)
+            .map(|(w, nm)| format!("const float {nm} = {w};"))
+            .collect();
+        let terms: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(k, nm)| format!("xa[i][{k}] * {nm}"))
+            .collect();
+        self.line(&format!("{pre}{}", decl.join(" ")));
+        self.line(&format!(
+            "for (uint i = 0; i < {m}u; ++i) s[rr][i] += {};",
+            terms.join(" + ")
+        ));
+        self.depth -= 1;
+        self.line("}");
+        self.depth -= 1;
+        self.line("}");
+        self.depth -= 1;
+        self.line("}");
+        self.line(&format!(
+            "for (uint rr = 0; rr < {r}u; ++rr) for (uint i = 0; i < {m}u; ++i) \
+             for (uint d = {}u; d > 0; d /= 2) s[rr][i] += simd_shuffle_down(s[rr][i], d);",
+            lanes / 2
+        ));
+        self.line(&format!(
+            "if (lane == 0) for (uint rr = 0; rr < {r}u; ++rr) {{ const uint j = sgid * {r}u + rr; \
+             if (j < {n}u) for (uint i = 0; i < {m}u; ++i) scratch[{res} + i * {n}u + j] = s[rr][i]; }}"
+        ));
+        self.depth -= 1;
+        self.line("}");
+        self.barrier();
+        let name = self.declare_reg(x, &TileTy::new(acc, &[m, n], Space::Reg));
+        self.owned(
+            m * n,
+            &[format!(
+                "{name}[k] = {}(scratch[{res} + e]);",
+                acc.msl_scalar()
+            )],
+        );
         Ok(())
     }
 

@@ -143,7 +143,7 @@ fn op(p: &Program, o: &Op) -> String {
             "mask_cols {} from {} past {}",
             arg(p, *a),
             expr(p, f),
-            var(p, *l)
+            expr(p, l)
         ),
         Op::MakeArray(vs) => format!("array [{}]", vars(p, vs)),
         Op::Acquire(h) => format!("acquire {}", var(p, *h)),

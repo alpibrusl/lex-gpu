@@ -11,20 +11,23 @@ there is in [`docs/roadmap.md`](docs/roadmap.md).
 
 **Where it stands:** a Llama-3.1-8B served by Ollama, in 4-bit, runs entirely
 on kernels this compiler generated, and produces the same tokens as Ollama.
-Decode now runs at about 70% of Ollama's speed on the 8B and about 80% on
-the 1B, 9× and 16× faster than where correctness left it. Prefill is next.
+At short contexts, decode runs at about 70% of Ollama's speed on the 8B and
+80% on the 1B, 9× and 16× faster than where correctness left it. **At
+realistic contexts it's about 45%**: tile's attention slows as the context
+grows and Ollama's doesn't. Split-KV attention is the next job. Prefill has
+a correct batched path, but it's 8–10× short of Ollama.
 
 | Phase | State | Details |
 | --- | --- | --- |
 | **P0** Spine | closed | RMSNorm at 98.1% of the copy ceiling (463.6 GB/s) on an M4 Max, matching the reference. [`docs/P0.md`](docs/P0.md) |
 | **P1** Types | closed (in the interpreter) | Linear tiles, effect-typed copies and barrier-synchronised pipes check a flash-attention decode loop: plain, double-buffered, and warp-specialised for Hopper. All variants match PyTorch. [`docs/P1.md`](docs/P1.md) |
 | **P2** Metal, correct | **exit test met** | Llama-3.1-8B in int4 (Q4_K_M, from Ollama) runs on tile kernels on the GPU, and its greedy tokens are identical to Ollama's. [`docs/P2.md`](docs/P2.md) |
-| **P3** Metal, fast | decode target met; prefill next | Decode is at ≥ 70% of Ollama on both models (8B 68–72%, 1B ~81%), reading as many bytes per token as llama.cpp. Dequantisation is fused into the matvec by the lowering, weights stay in their native packing, and reductions are parallel. Next: prefill (batched matmul, `simdgroup_matrix`) and graph fusion. [`docs/P3.md`](docs/P3.md) |
+| **P3** Metal, fast | in progress | Short-context decode at ≥ 70% of Ollama, reading as many bytes per token as llama.cpp. At 512 tokens of context it falls to ~45%. A batched forward pass (prefill, speculative verify) is correct but slow. Next: split-KV attention, then `simdgroup_matrix` for prefill. [`docs/P3.md`](docs/P3.md) |
 
 Measured on an M4 Max, each model greedy-decoded on 4 prompts × 24 tokens
 next to Ollama itself (`scripts/tile_vs_ollama.py`):
 
-| Model | Weights | Tokens identical to Ollama | Log-prob gap vs Ollama | vs f32 reference | tile | Ollama |
+| Model | Weights | Tokens identical to Ollama | Log-prob gap vs Ollama | vs f32 reference | tile (short context) | Ollama |
 | --- | --- | --- | --- | --- | --- | --- |
 | `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.009 | ≤ 0.007 | ~214–218 tok/s | ~268 tok/s |
 | `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.08 | ≤ 0.007 | ~60–64 tok/s | ~88 tok/s |
@@ -34,8 +37,11 @@ How to read the table:
   both models. Ollama differs from both by more, up to 0.09 on the 8B,
   because llama.cpp's quantised kernels round differently. So the remaining
   gap is on Ollama's side, not tile's.
-- **Speed:** tile reaches about 80% of Ollama on the 1B and 68–72% on the
-  8B, reading 4.71 GB of weights per token against llama.cpp's 4.62. At P2's
+- **Speed:** at short contexts, tile reaches about 80% of Ollama on the 1B
+  and 68–72% on the 8B, reading 4.71 GB of weights per token against
+  llama.cpp's 4.62. At 512 tokens of context it's about 45% on both
+  (8B ~37 vs ~85 tok/s), because tile's attention slows with context and
+  Ollama's doesn't. [`docs/P3.md`](docs/P3.md) has the table. At P2's
   end it was 13 and 6.8 tok/s: every op was a separate dispatch that waited
   for the last, and the kernels were the simplest correct ones.
   `cargo run --release -p tile-rt --example profile -- --model llama3.1:8b`
@@ -252,8 +258,10 @@ included) and reference, plus these suites:
 - tile-metal `llama_kernels_gpu`: every Llama kernel on the GPU against the
   interpreter, at real sizes and in every weight layout.
 - tile-rt `llama_ollama`: Llama 3.2 1B and Llama 3.1 8B on the GPU against
-  the Ollama-checked reference. It needs macOS and the models pulled; for any
-  model missing, it prints `SKIPPED`.
+  the Ollama-checked reference, fed four ways (token by token, prefill in 4s
+  and 16s, batched verify). It needs macOS and the models pulled; for any
+  model missing, it prints `SKIPPED`. Run it with `--release`: in a debug
+  build it takes many minutes.
 
 ## Layering
 

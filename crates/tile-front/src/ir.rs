@@ -298,8 +298,10 @@ pub enum Op {
     /// `[m,n] -> [m]`.
     RowReduce(Reduce, Arg),
     /// `a[i, j]`, or `-inf` where `first + j >= limit`: masks the columns of
-    /// a score block that lie past a runtime length.
-    MaskCols(Arg, IdxExpr, Var),
+    /// a score block that lie past a runtime length (decode) or past a
+    /// query's own position (causal prefill). Both bounds are affine in
+    /// loop indices and runtime scalars.
+    MaskCols(Arg, IdxExpr, IdxExpr),
     /// Explicit dtype conversion, the only way to narrow.
     Convert(Arg, DType),
     /// Pack tiles into an array (all consumed).
