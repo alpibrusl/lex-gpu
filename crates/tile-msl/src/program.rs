@@ -54,6 +54,10 @@ pub struct Lowered {
     pub scratch_bytes: usize,
     /// Barrier sites in the source (not dynamic count).
     pub barriers: usize,
+    /// Per buffer binding, in order: does the kernel write it? Parameters
+    /// then (if any) the runtime-scalar buffer, which is read-only. A
+    /// runtime uses this to order dispatches only where they conflict.
+    pub writes: Vec<bool>,
 }
 
 /// Where a value lives in the generated code.
@@ -239,6 +243,12 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
         arena_bytes,
         scratch_bytes,
         barriers: g.barriers,
+        writes: prog
+            .params
+            .iter()
+            .map(|p| p.writable)
+            .chain((!prog.dyn_scalars.is_empty()).then_some(false))
+            .collect(),
     })
 }
 

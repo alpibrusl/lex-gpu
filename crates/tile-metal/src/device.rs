@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use metal::objc::rc::autoreleasepool;
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
+    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLDispatchType,
+    MTLResourceOptions, MTLSize,
 };
 use tile_ir::{Kernel, Launch, Plan, Target};
 use tile_msl::program::Lowered;
@@ -33,6 +34,9 @@ pub struct Gpu {
 pub struct Pipeline {
     pso: ComputePipelineState,
     plan: Plan,
+    /// Which bindings the kernel writes, when known (lowered programs).
+    /// `None` is treated as writing every buffer it is given.
+    writes: Option<Vec<bool>>,
     pub name: String,
     pub source: String,
 }
@@ -102,7 +106,9 @@ impl Gpu {
             simdgroups_per_tg: lowered.threads.div_ceil(self.target.simd_width),
             vec_lanes: 0,
         };
-        self.pipeline(&lowered.entry, lowered.source.clone(), &plan, false)
+        let mut p = self.pipeline(&lowered.entry, lowered.source.clone(), &plan, false)?;
+        p.writes = Some(lowered.writes.clone());
+        Ok(p)
     }
 
     fn pipeline(
@@ -139,6 +145,7 @@ impl Gpu {
         Ok(Pipeline {
             pso,
             plan: *plan,
+            writes: None,
             name: name.to_string(),
             source,
         })
@@ -271,10 +278,14 @@ impl Gpu {
 
     /// Run a sequence of dispatches in one command buffer and wait once.
     ///
-    /// The compute encoder is serial (Metal's default): each dispatch
-    /// finishes, and its writes are visible, before the next starts. So this
-    /// has the same semantics as calling [`Gpu::run`] for each in turn,
-    /// without a CPU round trip between them.
+    /// Same semantics as calling [`Gpu::run`] for each in turn, without a
+    /// CPU round trip between them. The encoder is concurrent: dispatches
+    /// may overlap, and a buffer-scope memory barrier is placed only before
+    /// a dispatch that reads or writes a buffer an unbarriered earlier one
+    /// wrote, or writes one it read (what llama.cpp's Metal backend does).
+    /// Independent kernels (the q, k and v matvecs, gate and up, the small
+    /// ones) then share the GPU instead of each paying a drain.
+    /// `TILE_SERIAL=1` falls back to a serial encoder.
     pub fn run_all(&self, steps: &[(&Pipeline, &[&Buffer])]) {
         self.run_all_timed(steps);
     }
@@ -294,8 +305,39 @@ impl Gpu {
         autoreleasepool(|| {
             let t0 = Instant::now();
             let cb = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
+            let serial = std::env::var_os("TILE_SERIAL").is_some();
+            let enc = if serial {
+                cb.new_compute_command_encoder()
+            } else {
+                cb.compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent)
+            };
+            // Buffers written / read since the last barrier, by GPU address.
+            let (mut written, mut read) = (Vec::<u64>::new(), Vec::<u64>::new());
             for &(pipeline, buffers, groups) in steps {
+                if !serial {
+                    let mut w = vec![];
+                    let mut r = vec![];
+                    for (i, b) in buffers.iter().enumerate() {
+                        let writes = pipeline
+                            .writes
+                            .as_ref()
+                            .is_none_or(|v| v.get(i) != Some(&false));
+                        if writes {
+                            w.push(b.gpu_address())
+                        } else {
+                            r.push(b.gpu_address())
+                        }
+                    }
+                    let hazard = r.iter().chain(&w).any(|a| written.contains(a))
+                        || w.iter().any(|a| read.contains(a));
+                    if hazard {
+                        barrier(enc);
+                        written.clear();
+                        read.clear();
+                    }
+                    written.extend(w);
+                    read.extend(r);
+                }
                 let l = pipeline.plan.launch;
                 let [gx, gy] = groups.unwrap_or([l.threadgroups[0], l.threadgroups[1]]);
                 assert!(
@@ -363,6 +405,15 @@ impl Gpu {
 
 /// A completed command buffer's GPU start and end times, in seconds.
 /// metal-rs does not wrap these properties.
+/// `memoryBarrierWithScope:MTLBarrierScopeBuffers` on a concurrent encoder.
+fn barrier(enc: &metal::ComputeCommandEncoderRef) {
+    use metal::objc::{msg_send, sel, sel_impl};
+    const MTL_BARRIER_SCOPE_BUFFERS: u64 = 1;
+    unsafe {
+        let () = msg_send![enc, memoryBarrierWithScope: MTL_BARRIER_SCOPE_BUFFERS];
+    }
+}
+
 fn gpu_times(cb: &metal::CommandBufferRef) -> (f64, f64) {
     use metal::objc::{msg_send, sel, sel_impl};
     unsafe { (msg_send![cb, GPUStartTime], msg_send![cb, GPUEndTime]) }
