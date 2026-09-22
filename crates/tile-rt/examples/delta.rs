@@ -26,13 +26,7 @@ fn main() -> Result<(), String> {
     );
     for rows in [4usize, 8, 16, 32] {
         for threads in [128usize, 256] {
-            let c = DeltaNet {
-                v_heads: hv,
-                k_heads: 16,
-                k_dim: dk,
-                v_dim: dv,
-                rows,
-            };
+            let c = DeltaNet::packed(hv, 16, dk, dv, rows);
             let prog = c.build_step()?;
             tile_front::check(&prog, gpu.target()).map_err(|e| format!("{e:?}"))?;
             let pipe = gpu.build_lowered(&lower(&prog, gpu.target(), threads)?)?;

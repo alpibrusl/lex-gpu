@@ -1,6 +1,8 @@
 //! Qwen3.5's gated-delta state update, against the rule it implements.
 
-use tile_front::qwen::{DeltaNet, build_conv_silu, build_gates, build_qk_rope, reference};
+use tile_front::qwen::{
+    DeltaNet, build_conv_silu, build_delta_qk, build_gates, build_qk_rope, reference,
+};
 use tile_front::{Tensor, check, run};
 use tile_ir::reference::fill_pattern_f32;
 use tile_ir::{DType, Target};
@@ -16,13 +18,7 @@ fn pattern(n: usize, seed: u32) -> Vec<f32> {
 #[test]
 fn delta_state_matches_the_rule_over_successive_steps() {
     // Qwen3.5-27B's shape, shrunk: the same 3:1 value/key head ratio.
-    let c = DeltaNet {
-        v_heads: 6,
-        k_heads: 2,
-        k_dim: 32,
-        v_dim: 16,
-        rows: 4,
-    };
+    let c = DeltaNet::packed(6, 2, 32, 16, 4);
     let prog = c.build_step().unwrap();
     check(&prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
 
@@ -84,13 +80,7 @@ fn delta_state_matches_the_rule_over_successive_steps() {
 /// a step depends on the new key and value, not on what was there before.
 #[test]
 fn a_small_decay_forgets_the_old_state() {
-    let c = DeltaNet {
-        v_heads: 2,
-        k_heads: 1,
-        k_dim: 16,
-        v_dim: 8,
-        rows: 8,
-    };
+    let c = DeltaNet::packed(2, 1, 16, 8, 8);
     let prog = c.build_step().unwrap();
     let (hv, dk, dv) = (c.v_heads, c.k_dim, c.v_dim);
     let run_once = |state: &[f32], g: f32| {
@@ -270,6 +260,40 @@ fn qk_rope_normalises_rotates_and_gates() {
                     let got = t[5].data[h * hd + i] as f64;
                     assert!((got - want).abs() < 1e-6, "head {h} gate {i}");
                 }
+            }
+        }
+    }
+}
+
+/// The linear layer's queries and keys: normalised without a weight,
+/// scaled, and repeated once per value head so the delta step can find
+/// its key with an affine index.
+#[test]
+fn delta_qk_normalises_scales_and_repeats_per_value_head() {
+    let (hk, per, dk) = (2usize, 3usize, 16usize);
+    let width = 2 * hk * dk + 8; // queries, keys, then values
+    let first = hk * dk; // the keys
+    let scale = (dk as f32).powf(-0.5);
+    let prog = build_delta_qk(hk, per, dk, width, first, scale, 1e-6).unwrap();
+    check(&prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+    let x = pattern(width, 80);
+    let mut t = vec![
+        Tensor::new(DType::F32, &[1, width], &x),
+        Tensor::zeros(DType::F32, &[hk * per, dk]),
+    ];
+    run(&prog, &mut t).expect("interpret");
+    for h in 0..hk {
+        let row = &x[first + h * dk..first + (h + 1) * dk];
+        let ms = row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / dk as f64;
+        let r = 1.0 / (ms + 1e-6).sqrt();
+        for copy in 0..per {
+            let out = &t[1].data[(h * per + copy) * dk..(h * per + copy + 1) * dk];
+            for (i, (&x, &got)) in row.iter().zip(out).enumerate() {
+                let want = x as f64 * r * scale as f64;
+                assert!(
+                    (got as f64 - want).abs() <= 1e-5 * want.abs().max(1e-3),
+                    "head {h} copy {copy} dim {i}: {got} vs {want}"
+                );
             }
         }
     }

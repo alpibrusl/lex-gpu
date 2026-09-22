@@ -514,13 +514,7 @@ fn delta_gates_and_conv_match_the_interpreter() {
 fn delta_state_matches_the_interpreter() {
     use tile_front::qwen::DeltaNet;
     let gpu = Gpu::open().expect("metal device");
-    let c = DeltaNet {
-        v_heads: 48,
-        k_heads: 16,
-        k_dim: 128,
-        v_dim: 128,
-        rows: 8,
-    };
+    let c = DeltaNet::packed(48, 16, 128, 128, 8);
     let prog = c.build_step().unwrap();
     let (hv, dk, dv) = (c.v_heads, c.k_dim, c.v_dim);
     let gates = |seed, lo: f32, hi: f32| -> Vec<f32> {

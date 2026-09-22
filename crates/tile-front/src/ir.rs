@@ -144,6 +144,12 @@ impl IdxExpr {
         self.terms.push((v, coeff as i64));
         self
     }
+
+    /// `self + c`
+    pub fn shift(mut self, c: usize) -> IdxExpr {
+        self.constant += c as i64;
+        self
+    }
 }
 
 /// A rectangular window into a global tensor.

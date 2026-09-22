@@ -40,6 +40,32 @@ pub struct DeltaNet {
     pub v_dim: usize,
     /// State rows per grid instance.
     pub rows: usize,
+    /// Where `v` starts in its buffer, and how wide that buffer is. The
+    /// values come out of the convolution's output row, after the queries
+    /// and the keys, so the step reads them where they lie.
+    pub v_base: usize,
+    pub v_width: usize,
+}
+
+impl DeltaNet {
+    /// A layer whose `v` has a buffer to itself.
+    pub fn packed(
+        v_heads: usize,
+        k_heads: usize,
+        k_dim: usize,
+        v_dim: usize,
+        rows: usize,
+    ) -> DeltaNet {
+        DeltaNet {
+            v_heads,
+            k_heads,
+            k_dim,
+            v_dim,
+            rows,
+            v_base: 0,
+            v_width: v_heads * v_dim,
+        }
+    }
 }
 
 impl DeltaNet {
@@ -71,6 +97,12 @@ impl DeltaNet {
                 c.v_dim, c.rows
             ));
         }
+        if c.v_base + c.v_heads * c.v_dim > c.v_width {
+            return Err(format!(
+                "v at {} of a {}-wide buffer does not hold {} x {}",
+                c.v_base, c.v_width, c.v_heads, c.v_dim
+            ));
+        }
         let (hv, dk, dv, rows) = (c.v_heads, c.k_dim, c.v_dim, c.rows);
         let mut b = Builder::new(&format!(
             "delta_step_h{hv}k{}_d{dk}x{dv}_r{rows}",
@@ -81,7 +113,7 @@ impl DeltaNet {
         let pk = b.param("k", DType::F32, &[hv, dk], false);
         // Flat `[v_heads * v_dim]`: a tile of state rows takes a
         // contiguous slice of each, whatever head it falls in.
-        let pv = b.param("v", DType::F32, &[hv * dv], false);
+        let pv = b.param("v", DType::F32, &[c.v_width], false);
         let pg = b.param("g", DType::F32, &[hv * dv], false);
         let pb = b.param("beta", DType::F32, &[hv * dv], false);
         let py = b.param("y", DType::F32, &[hv * dv], true);
@@ -108,6 +140,12 @@ impl DeltaNet {
             offset: vec![first.clone()],
             shape: vec![rows],
         };
+        // `v` alone may sit at an offset inside a wider buffer.
+        let v_at = View {
+            param: pv,
+            offset: vec![first.clone().shift(c.v_base)],
+            shape: vec![rows],
+        };
 
         let s = b.op("s", Op::Load(state_at.clone(), tile.clone()));
         let g = b.op("g", Op::Load(gate(pg), vecr.clone()));
@@ -120,7 +158,7 @@ impl DeltaNet {
         let sk = b.op("sk", Op::RowReduce(Reduce::Sum, Move(sk)));
 
         // `δ = (v - S k) β`, then the rank-one update `S += k δᵀ`.
-        let v = b.op("v", Op::Load(gate(pv), vecr.clone()));
+        let v = b.op("v", Op::Load(v_at, vecr.clone()));
         let d = b.op("d", Op::Binary(BinOp::Sub, Move(v), Move(sk)));
         let beta = b.op("beta", Op::Load(gate(pb), vecr));
         let d = b.op("d", Op::Binary(BinOp::Mul, Move(d), Move(beta)));
@@ -380,6 +418,76 @@ pub fn build_qk_rope(
         let g = b.op("g", Op::Unary(UnOp::Sigmoid, Move(g)));
         b.effect(Op::Store(Move(g), span(pg, 0, head_dim, heads)));
     }
+    Ok(b.finish())
+}
+
+/// A linear-attention layer's queries or keys, out of the convolution's
+/// output row: normalised (no weight), scaled, and repeated once per value
+/// head.
+///
+/// `q` is scaled by `1 / k_dim` and `k` by `1 / sqrt(k_dim)`, which is
+/// where the attention scale lives in this architecture. The repetition is
+/// what lets [`DeltaNet::build_step`] find its key with an affine index.
+///
+/// Parameters: `x [1, width]` — the convolution's output, with the heads
+/// starting at `first` — and `y [k_heads * per, k_dim]`.
+pub fn build_delta_qk(
+    k_heads: usize,
+    per: usize,
+    k_dim: usize,
+    width: usize,
+    first: usize,
+    scale: f32,
+    eps: f32,
+) -> Result<Program, String> {
+    use Arg::{Borrow, Move};
+    if per == 0 || first + k_heads * k_dim > width {
+        return Err(format!(
+            "{k_heads} heads of {k_dim} at {first} do not fit a {width}-wide row"
+        ));
+    }
+    let mut b = Builder::new(&format!("delta_qk_k{k_heads}x{per}_d{k_dim}_at{first}"));
+    let px = b.param("x", DType::F32, &[1, width], false);
+    let py = b.param("y", DType::F32, &[k_heads * per, k_dim], true);
+    // Instance `(copy, head)`: the head's row read once, written `per`
+    // times. Both indices stay affine this way.
+    let copy = b.grid(per);
+    let head = b.grid2(k_heads);
+
+    let tile = TileTy::new(DType::F32, &[1, k_dim], Space::Reg);
+    let x = b.op(
+        "x",
+        Op::Load(
+            View {
+                param: px,
+                offset: vec![
+                    IdxExpr::lit(0),
+                    IdxExpr::scaled(head, k_dim, 0).shift(first),
+                ],
+                shape: vec![1, k_dim],
+            },
+            tile.clone(),
+        ),
+    );
+    let sq = b.op("sq", Op::Binary(BinOp::Mul, Borrow(x), Borrow(x)));
+    let ss = b.op("ss", Op::RowReduce(Reduce::Sum, Move(sq)));
+    let ms = b.op("ms", Op::Scale(Move(ss), 1.0 / k_dim as f32));
+    let e = b.op(
+        "eps",
+        Op::Fill(TileTy::new(DType::F32, &[1], Space::Reg), eps),
+    );
+    let t = b.op("t", Op::Binary(BinOp::Add, Move(ms), Move(e)));
+    let r = b.op("r", Op::Unary(UnOp::Rsqrt, Move(t)));
+    let y = b.op("y", Op::Binary(BinOp::Mul, Move(x), Move(r)));
+    let y = b.op("y", Op::Scale(Move(y), scale));
+    b.effect(Op::Store(
+        Move(y),
+        View {
+            param: py,
+            offset: vec![IdxExpr::scaled(head, per, 0).plus(copy, 1), IdxExpr::lit(0)],
+            shape: vec![1, k_dim],
+        },
+    ));
     Ok(b.finish())
 }
 
