@@ -420,6 +420,12 @@ pub fn matvec_q_rms(
 
 /// The activations `x[.., chunk c]`, as a lazy `[t, kc]` tile.
 fn x_chunk(b: &mut Builder, px: usize, c: Var, (t, kc): (usize, usize)) -> Var {
+    // A batch re-reads these activations for every block of weight rows a
+    // threadgroup owns, and replacing the loads with a constant shows they
+    // cost about half the kernel's throughput at four tokens. Staging them
+    // in threadgroup memory is not the fix: it needs a chunked reduction,
+    // and 5120 -> 17408 at four tokens measured 92 GB/s with chunks of
+    // 1024 against 141 reading the whole row straight from device memory.
     b.op(
         "x",
         Op::Load(
