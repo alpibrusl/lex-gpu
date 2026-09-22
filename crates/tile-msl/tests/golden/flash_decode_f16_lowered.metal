@@ -173,12 +173,20 @@ kernel void flash_decode_f16_bq4_bk16_s2(
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            {
+                const uint o = tid / 16u, lane = tid % 16u;
+                float s = (-INFINITY);
+                if (o < 4u) for (uint j = lane; j < 16u; j += 16u) s = max(s, float((scratch + 0)[o * 16u + j]));
+                for (uint d = 8u; d > 0; d /= 2) s = max(s, simd_shuffle_down(s, d));
+                if (o < 4u && lane % 32u == 0) scratch[64 + o * 1u + lane / 32u] = s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             float v37[1];
             for (uint k = 0; k < 1u; ++k) {
                 const uint e = k * 128u + tid;
                 if (e < 4u) {
                     float s = (-INFINITY);
-                    for (uint j = 0; j < 16u; ++j) s = max(s, float((scratch + 0)[e * 16u + j]));
+                    for (uint q = 0; q < 1u; ++q) s = max(s, scratch[64 + e * 1u + q]);
                     v37[k] = float(s);
                 }
             }
@@ -233,12 +241,20 @@ kernel void flash_decode_f16_bq4_bk16_s2(
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            {
+                const uint o = tid / 16u, lane = tid % 16u;
+                float s = 0.0f;
+                if (o < 4u) for (uint j = lane; j < 16u; j += 16u) s = s + float((scratch + 0)[o * 16u + j]);
+                for (uint d = 8u; d > 0; d /= 2) s = s + simd_shuffle_down(s, d);
+                if (o < 4u && lane % 32u == 0) scratch[64 + o * 1u + lane / 32u] = s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             float v43[1];
             for (uint k = 0; k < 1u; ++k) {
                 const uint e = k * 128u + tid;
                 if (e < 4u) {
                     float s = 0.0f;
-                    for (uint j = 0; j < 16u; ++j) s += float((scratch + 0)[e * 16u + j]);
+                    for (uint q = 0; q < 1u; ++q) s = s + scratch[64 + e * 1u + q];
                     v43[k] = float(s);
                 }
             }
@@ -364,12 +380,20 @@ kernel void flash_decode_f16_bq4_bk16_s2(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const uint o = tid / 16u, lane = tid % 16u;
+            float s = (-INFINITY);
+            if (o < 4u) for (uint j = lane; j < 16u; j += 16u) s = max(s, float((scratch + 0)[o * 16u + j]));
+            for (uint d = 8u; d > 0; d /= 2) s = max(s, simd_shuffle_down(s, d));
+            if (o < 4u && lane % 32u == 0) scratch[64 + o * 1u + lane / 32u] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float v67[1];
         for (uint k = 0; k < 1u; ++k) {
             const uint e = k * 128u + tid;
             if (e < 4u) {
                 float s = (-INFINITY);
-                for (uint j = 0; j < 16u; ++j) s = max(s, float((scratch + 0)[e * 16u + j]));
+                for (uint q = 0; q < 1u; ++q) s = max(s, scratch[64 + e * 1u + q]);
                 v67[k] = float(s);
             }
         }
@@ -424,12 +448,20 @@ kernel void flash_decode_f16_bq4_bk16_s2(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const uint o = tid / 16u, lane = tid % 16u;
+            float s = 0.0f;
+            if (o < 4u) for (uint j = lane; j < 16u; j += 16u) s = s + float((scratch + 0)[o * 16u + j]);
+            for (uint d = 8u; d > 0; d /= 2) s = s + simd_shuffle_down(s, d);
+            if (o < 4u && lane % 32u == 0) scratch[64 + o * 1u + lane / 32u] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float v73[1];
         for (uint k = 0; k < 1u; ++k) {
             const uint e = k * 128u + tid;
             if (e < 4u) {
                 float s = 0.0f;
-                for (uint j = 0; j < 16u; ++j) s += float((scratch + 0)[e * 16u + j]);
+                for (uint q = 0; q < 1u; ++q) s = s + scratch[64 + e * 1u + q];
                 v73[k] = float(s);
             }
         }

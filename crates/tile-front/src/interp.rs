@@ -27,7 +27,7 @@ use half::f16;
 use tile_ir::DType;
 
 use crate::ir::{
-    Arg, Block, IdxExpr, Op, PipeDecl, Program, Reduce, Role, Stmt, TileTy, Var, View,
+    Arg, Block, IdxExpr, Nibbles, Op, PipeDecl, Program, Reduce, Role, Stmt, TileTy, Var, View,
 };
 
 /// A global tensor. Values are held as f32, already rounded to `dtype`.
@@ -532,22 +532,44 @@ impl Interp<'_> {
                     .collect();
                 Some(Val::Tile(self.fresh(DType::F32, &tq.ty.shape, out)))
             }
-            Op::Dequant4(q, s, m, group, high) => {
+            Op::Dequant4(q, s, m, group, mode) => {
                 let (tq, ts) = (self.arg(*q)?, self.arg(*s)?);
                 let tm = m.map(|m| self.arg(m)).transpose()?;
-                let c = tq.ty.shape[1];
-                let out = tq
-                    .data
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &x)| {
-                        let byte = (x as i32) & 0xFF;
-                        let nib = if *high { byte >> 4 } else { byte & 0xF };
-                        let g = (i / c) * (c / group) + (i % c) / group;
+                let (r, qc) = (tq.ty.shape[0], tq.ty.shape[1]);
+                let pairs = *mode == Nibbles::Pairs;
+                let c = if pairs { 2 * qc } else { qc };
+                let out = (0..r * c)
+                    .map(|i| {
+                        let (row, col) = (i / c, i % c);
+                        let qi = row * qc + if pairs { col / 2 } else { col };
+                        let byte = (tq.data[qi] as i32) & 0xFF;
+                        let high = match mode {
+                            Nibbles::Low => false,
+                            Nibbles::High => true,
+                            Nibbles::Pairs => col % 2 == 1,
+                        };
+                        let nib = if high { byte >> 4 } else { byte & 0xF };
+                        let g = row * (c / group) + col / group;
                         nib as f32 * ts.data[g] - tm.as_ref().map_or(0.0, |m| m.data[g])
                     })
                     .collect();
-                Some(Val::Tile(self.fresh(DType::F32, &tq.ty.shape, out)))
+                Some(Val::Tile(self.fresh(DType::F32, &[r, c], out)))
+            }
+            Op::Dequant6(lo, hi, s, group) => {
+                let (tl, th, ts) = (self.arg(*lo)?, self.arg(*hi)?, self.arg(*s)?);
+                let (r, c) = (tl.ty.shape[0], 2 * tl.ty.shape[1]);
+                let out = (0..r * c)
+                    .map(|i| {
+                        let (row, col) = (i / c, i % c);
+                        let lb = (tl.data[row * c / 2 + col / 2] as i32) & 0xFF;
+                        let hb = (th.data[row * c / 4 + col / 4] as i32) & 0xFF;
+                        let l = if col % 2 == 0 { lb & 0xF } else { lb >> 4 };
+                        let h = (hb >> (2 * (col % 4))) & 3;
+                        let q = (l | (h << 4)) - 32;
+                        q as f32 * ts.data[row * (c / group) + col / group]
+                    })
+                    .collect();
+                Some(Val::Tile(self.fresh(DType::F32, &[r, c], out)))
             }
             Op::Scale(a, s) => {
                 let t = self.arg(*a)?;

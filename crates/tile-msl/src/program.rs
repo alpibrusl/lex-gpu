@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use tile_front::ir::{
-    Arg, BinOp, Block, IdxExpr, Op, Program, Reduce, Stmt, TileTy, UnOp, Var, View,
+    Arg, BinOp, Block, IdxExpr, Nibbles, Op, Program, Reduce, Stmt, TileTy, UnOp, Var, View,
 };
 use tile_ir::{DType, Space, Target};
 
@@ -113,6 +113,20 @@ struct Dq {
     m: Option<String>,
     cols: usize,
     group: usize,
+    /// How values are packed, so a reduction can load each byte once for
+    /// all the values in it instead of once per value.
+    pack: Pack,
+}
+
+#[derive(Clone, Debug)]
+enum Pack {
+    /// One value per element of the value tile.
+    None,
+    /// 4-bit pairs: the byte tile's expression and row length in bytes.
+    Pairs(String, usize),
+    /// 6-bit values in a 4-bit plane and a 2-bit plane: each plane's
+    /// expression and row length in bytes.
+    Six(String, usize, String, usize),
 }
 
 /// Lower `prog` (which must already pass `tile_front::check` for `target`)
@@ -236,13 +250,15 @@ fn v(var: Var) -> String {
 }
 
 /// Consecutive elements per lane per step in a split-K reduction: the
-/// largest of `TILE_VEC` (default 8), 4, 2 that tiles the reduction evenly.
-fn split_k_vec(kd: usize, lanes: usize) -> usize {
+/// largest of `TILE_VEC` (else `default`), 8, 4, 2 that tiles the reduction
+/// evenly. Measured on an M4 Max: 16 for packed weights (a byte holds two or
+/// four values, so a longer run covers the same bytes), 8 otherwise.
+fn split_k_vec(kd: usize, lanes: usize, default: usize) -> usize {
     let want: usize = std::env::var("TILE_VEC")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
-    [want, 4, 2]
+        .unwrap_or(default);
+    [want, 8, 4, 2]
         .into_iter()
         .find(|&v| v <= want && v > 0 && kd.is_multiple_of(lanes * v))
         .unwrap_or(1)
@@ -745,6 +761,25 @@ impl Gen<'_> {
                 }
             }
             Op::Drop(_) => {}
+            Op::Binary(bop, a, b)
+                if self.lazy(*a).is_some()
+                    && self.lazy(*b).is_some()
+                    && self.arg_ty(*a)?.shape == self.arg_ty(*b)?.shape =>
+            {
+                let x = dst.ok_or("op without a result")?;
+                let (ea, t) = self.lazy(*a).expect("checked");
+                let (eb, _) = self.lazy(*b).expect("checked");
+                let (l, r) = (format!("float({ea})"), format!("float({eb})"));
+                let e = match bop {
+                    BinOp::Add => format!("({l} + {r})"),
+                    BinOp::Sub => format!("({l} - {r})"),
+                    BinOp::Mul => format!("({l} * {r})"),
+                    BinOp::Div => format!("({l} / {r})"),
+                    BinOp::Max => format!("max({l}, {r})"),
+                };
+                let e = format!("{}({e})", t.dtype.msl_scalar());
+                self.locs.insert(x, Loc::Lazy(e, reg(t.dtype, &t.shape)));
+            }
             Op::Convert(a, dt) if self.lazy(*a).is_some() => {
                 let x = dst.ok_or("op without a result")?;
                 let (e, t) = self.lazy(*a).expect("checked");
@@ -760,12 +795,21 @@ impl Gen<'_> {
                 let x = dst.ok_or("op without a result")?;
                 let (qe, tq) = self.lazy(*q).expect("checked");
                 let (se, _) = self.lazy(*s).expect("checked");
-                let c = tq.shape[1];
+                let qc = tq.shape[1];
+                let pairs = matches!(op, Op::Dequant4(.., Nibbles::Pairs));
+                let c = if pairs { 2 * qc } else { qc };
                 let gidx = format!("({AT} / {c}u) * {}u + ({AT} % {c}u) / {group}u", c / group);
                 let qv = match op {
-                    Op::Dequant4(.., high) => format!(
+                    Op::Dequant4(.., Nibbles::Pairs) => {
+                        // Output element I lives in byte I/2 of its row,
+                        // low nibble for even columns.
+                        let byte =
+                            at_index(&qe, &format!("({AT} / {c}u) * {qc}u + ({AT} % {c}u) / 2u"));
+                        format!("float(((uint)(uchar)({byte}) >> (({AT} & 1u) * 4u)) & 0xFu)")
+                    }
+                    Op::Dequant4(.., mode) => format!(
                         "float(((uint)(uchar)({qe}) >> {}u) & 0xFu)",
-                        if *high { 4 } else { 0 }
+                        if *mode == Nibbles::High { 4 } else { 0 }
                     ),
                     _ => format!("float({qe})"),
                 };
@@ -785,11 +829,75 @@ impl Gen<'_> {
                         m: m.map(|m| format!("float({})", self.lazy(m).expect("checked").0)),
                         cols: c,
                         group: *group,
+                        pack: if pairs {
+                            Pack::Pairs(qe.clone(), qc)
+                        } else {
+                            Pack::None
+                        },
                     },
                 );
                 let e = format!("({qv} * {sv}{mv})");
                 self.locs
-                    .insert(x, Loc::Lazy(e, reg(DType::F32, &tq.shape)));
+                    .insert(x, Loc::Lazy(e, reg(DType::F32, &[tq.shape[0], c])));
+            }
+            Op::Dequant6(lo, hi, sc, group)
+                if [*lo, *hi, *sc].iter().all(|a| self.lazy(*a).is_some()) =>
+            {
+                let x = dst.ok_or("op without a result")?;
+                let (le, tl) = self.lazy(*lo).expect("checked");
+                let (he, th) = self.lazy(*hi).expect("checked");
+                let (se, _) = self.lazy(*sc).expect("checked");
+                let (lc, hc) = (tl.shape[1], th.shape[1]);
+                let c = 2 * lc;
+                let lb = at_index(&le, &format!("({AT} / {c}u) * {lc}u + ({AT} % {c}u) / 2u"));
+                let hb = at_index(&he, &format!("({AT} / {c}u) * {hc}u + ({AT} % {c}u) / 4u"));
+                let qv = format!(
+                    "float(int((((uint)(uchar)({lb}) >> (({AT} & 1u) * 4u)) & 0xFu) | \
+                     ((((uint)(uchar)({hb}) >> (({AT} & 3u) * 2u)) & 3u) << 4u)) - 32)"
+                );
+                let gidx = format!("({AT} / {c}u) * {}u + ({AT} % {c}u) / {group}u", c / group);
+                let sv = format!("float({})", at_index(&se, &gidx));
+                self.dq.insert(
+                    x,
+                    Dq {
+                        v: qv.clone(),
+                        s: format!("float({se})"),
+                        m: None,
+                        cols: c,
+                        group: *group,
+                        pack: Pack::Six(le.clone(), lc, he.clone(), hc),
+                    },
+                );
+                let e = format!("({qv} * {sv})");
+                self.locs
+                    .insert(x, Loc::Lazy(e, reg(DType::F32, &[tl.shape[0], c])));
+            }
+            Op::Dequant6(lo, hi, sc, group) => {
+                let x = dst.ok_or("op without a result")?;
+                let tl = self.arg_ty(*lo)?;
+                let (r, c) = (tl.shape[0], 2 * tl.shape[1]);
+                let n = r * c;
+                let ops = self.operands(&[*lo, *hi, *sc], &[false, false, false], n)?;
+                let lb = Self::read(
+                    &ops[0].0,
+                    &format!("(e / {c}u) * {}u + (e % {c}u) / 2u", c / 2),
+                );
+                let hb = Self::read(
+                    &ops[1].0,
+                    &format!("(e / {c}u) * {}u + (e % {c}u) / 4u", c / 4),
+                );
+                let sv = Self::read(
+                    &ops[2].0,
+                    &format!("(e / {c}u) * {}u + (e % {c}u) / {group}u", c / group),
+                );
+                let name = self.declare_reg(x, &reg(DType::F32, &[r, c]));
+                self.owned(
+                    n,
+                    &[format!(
+                        "{name}[k] = float(int((((uint)(uchar)({lb}) >> ((e & 1u) * 4u)) & 0xFu) | \
+                         ((((uint)(uchar)({hb}) >> ((e & 3u) * 2u)) & 3u) << 4u)) - 32) * {sv};"
+                    )],
+                );
             }
             Op::Dup(a) | Op::Exp(a) | Op::Scale(a, _) | Op::Convert(a, _) | Op::Unary(_, a) => {
                 let x = dst.ok_or("op without a result")?;
@@ -885,23 +993,35 @@ impl Gen<'_> {
                 let name = self.declare_reg(x, &reg(DType::F32, &tq.shape));
                 self.owned(n, &[format!("{name}[k] = {qv} * {sv}{mv};")]);
             }
-            Op::Dequant4(q, s, m, group, high) => {
+            Op::Dequant4(q, s, m, group, mode) => {
                 let x = dst.ok_or("op without a result")?;
                 let tq = self.arg_ty(*q)?;
-                let (n, c) = (tq.elems(), tq.shape[1]);
+                let qc = tq.shape[1];
+                let pairs = *mode == Nibbles::Pairs;
+                let c = if pairs { 2 * qc } else { qc };
+                let n = tq.shape[0] * c;
                 let mut args = vec![*q, *s];
                 args.extend(*m);
-                let local: Vec<bool> = (0..args.len()).map(|i| i == 0).collect();
+                // In pairs mode element e reads byte e/2: not the thread's
+                // own element, so `q` is read shared (staged if in registers).
+                let local: Vec<bool> = (0..args.len()).map(|i| i == 0 && !pairs).collect();
                 let ops = self.operands(&args, &local, n)?;
                 let at = format!("(e / {c}u) * {}u + (e % {c}u) / {group}u", c / group);
-                let byte = Self::read(&ops[0].0, "e");
-                let shift = if *high { 4 } else { 0 };
-                let qv = format!("float(((uint)(uchar)({byte}) >> {shift}u) & 0xFu)");
+                let (byte, shift) = if pairs {
+                    (
+                        Self::read(&ops[0].0, &format!("(e / {c}u) * {qc}u + (e % {c}u) / 2u")),
+                        "((e & 1u) * 4u)".to_string(),
+                    )
+                } else {
+                    let s = if *mode == Nibbles::High { "4u" } else { "0u" };
+                    (Self::read(&ops[0].0, "e"), s.to_string())
+                };
+                let qv = format!("float(((uint)(uchar)({byte}) >> {shift}) & 0xFu)");
                 let sv = Self::read(&ops[1].0, &at);
                 let mv = ops
                     .get(2)
                     .map_or(String::new(), |o| format!(" - {}", Self::read(&o.0, &at)));
-                let name = self.declare_reg(x, &reg(DType::F32, &tq.shape));
+                let name = self.declare_reg(x, &reg(DType::F32, &[tq.shape[0], c]));
                 self.owned(n, &[format!("{name}[k] = {qv} * {sv}{mv};")]);
             }
             Op::MatMulNT(a, b, acc) | Op::MatMul(a, b, acc) => {
@@ -947,14 +1067,24 @@ impl Gen<'_> {
                     self.line(&format!("const uint i = o / {n}u, j = o % {n}u;"));
                     // Each lane takes runs of `vec` consecutive elements, so
                     // the compiler can merge a run's loads into wide ones.
-                    let vec = split_k_vec(kd, lanes);
                     // B is a lazy dequantisation whose groups each run fits
                     // inside: form the group's scale and min once per run.
                     let dq = match b {
                         Arg::Move(v) | Arg::Borrow(v) if nt => self.dq.get(v).cloned(),
                         _ => None,
-                    }
-                    .filter(|d| vec > 1 && d.cols == kd && d.group.is_multiple_of(vec));
+                    };
+                    let packed = dq.as_ref().is_some_and(|d| !matches!(d.pack, Pack::None));
+                    let vec = split_k_vec(kd, lanes, if packed { 16 } else { 8 });
+                    let dq = dq.filter(|d| {
+                        vec > 1
+                            && d.cols == kd
+                            && d.group.is_multiple_of(vec)
+                            && match d.pack {
+                                Pack::None => true,
+                                Pack::Pairs(..) => vec.is_multiple_of(2),
+                                Pack::Six(..) => vec.is_multiple_of(4),
+                            }
+                    });
                     if let Some(d) = dq {
                         let g = d.group;
                         let vv = at_index(&d.v, &format!("j * {kd}u + p"));
@@ -974,10 +1104,44 @@ impl Gen<'_> {
                             }
                             None => "",
                         };
-                        self.line(&format!(
-                            "    for (uint u = 0; u < {vec}u; ++u) {{ const uint p = p0 + u; \
-                             s += {av} * ({vv} * sg{mg}); }}"
-                        ));
+                        match &d.pack {
+                            Pack::Six(lo, lc, hi, hc) => {
+                                // Four values per step: two low-plane bytes,
+                                // one high-plane byte.
+                                let b0 = at_index(lo, &format!("j * {lc}u + p / 2u"));
+                                let b1 = at_index(lo, &format!("j * {lc}u + p / 2u + 1u"));
+                                let h = at_index(hi, &format!("j * {hc}u + p / 4u"));
+                                let a = |k: usize| {
+                                    Self::read(&ops[0].0, &format!("i * {kd}u + p + {k}u"))
+                                };
+                                let (a0, a1, a2, a3) = (a(0), a(1), a(2), a(3));
+                                self.line(&format!(
+                                    "    for (uint u = 0; u < {vec}u; u += 4u) {{ const uint p = p0 + u; \
+                                     const uint l0 = (uint)(uchar)({b0}), l1 = (uint)(uchar)({b1}), \
+                                     hh = (uint)(uchar)({h}); \
+                                     s += {a0} * (float(int((l0 & 0xFu) | ((hh & 3u) << 4u)) - 32) * sg) \
+                                     + {a1} * (float(int((l0 >> 4u) | (((hh >> 2u) & 3u) << 4u)) - 32) * sg) \
+                                     + {a2} * (float(int((l1 & 0xFu) | (((hh >> 4u) & 3u) << 4u)) - 32) * sg) \
+                                     + {a3} * (float(int((l1 >> 4u) | (((hh >> 6u) & 3u) << 4u)) - 32) * sg); }}"
+                                ));
+                            }
+                            Pack::Pairs(qe, qc) => {
+                                // One byte, two values: low nibble for p,
+                                // high for p + 1.
+                                let byte = at_index(qe, &format!("j * {qc}u + p / 2u"));
+                                let a1 = Self::read(&ops[0].0, &format!("i * {kd}u + p + 1u"));
+                                self.line(&format!(
+                                    "    for (uint u = 0; u < {vec}u; u += 2u) {{ const uint p = p0 + u; \
+                                     const uint bq = (uint)(uchar)({byte}); \
+                                     s += {av} * (float(bq & 0xFu) * sg{mg}) \
+                                     + {a1} * (float(bq >> 4u) * sg{mg}); }}"
+                                ));
+                            }
+                            Pack::None => self.line(&format!(
+                                "    for (uint u = 0; u < {vec}u; ++u) {{ const uint p = p0 + u; \
+                                 s += {av} * ({vv} * sg{mg}); }}"
+                            )),
+                        }
                         self.line("}");
                     } else if vec > 1 {
                         self.line(&format!(
@@ -1031,11 +1195,71 @@ impl Gen<'_> {
                 let ta = self.arg_ty(*a)?;
                 let (m, n) = (ta.shape[0], ta.shape[1]);
                 let ops = self.operands(&[*a], &[false], m)?;
-                let val = Self::read(&ops[0].0, &format!("e * {n}u + j"));
-                let (init, step) = match r {
-                    Reduce::Max => ("(-INFINITY)", format!("s = max(s, {val});")),
-                    Reduce::Sum => ("0.0f", format!("s += {val};")),
+                let (init, comb) = match r {
+                    Reduce::Max => ("(-INFINITY)", "max"),
+                    Reduce::Sum => ("0.0f", "sum"),
                 };
+                let join = |a: &str, b: &str| {
+                    if comb == "max" {
+                        format!("max({a}, {b})")
+                    } else {
+                        format!("{a} + {b}")
+                    }
+                };
+                // Fewer rows than threads: a group of lanes per row, combined
+                // with shuffles within a simdgroup and through scratch across
+                // simdgroups. One thread walking a 4096-wide row serially is
+                // what made RMSNorm slow.
+                let mut lanes = 1;
+                while lanes * 2 <= self.threads / m && lanes * 2 <= n {
+                    lanes *= 2;
+                }
+                if lanes >= 2 {
+                    let dt = ta.dtype;
+                    let sgs = lanes.div_ceil(32);
+                    let res = self.staged;
+                    self.scratch = self.scratch.max(res + m * sgs);
+                    if self.staged == 0 {
+                        self.barrier();
+                    }
+                    let val = Self::read(&ops[0].0, &format!("o * {n}u + j"));
+                    self.line("{");
+                    self.depth += 1;
+                    self.line(&format!(
+                        "const uint o = tid / {lanes}u, lane = tid % {lanes}u;"
+                    ));
+                    self.line(&format!("float s = {init};"));
+                    self.line(&format!(
+                        "if (o < {m}u) for (uint j = lane; j < {n}u; j += {lanes}u) s = {};",
+                        join("s", &val)
+                    ));
+                    self.line(&format!(
+                        "for (uint d = {}u; d > 0; d /= 2) s = {};",
+                        lanes.min(32) / 2,
+                        join("s", "simd_shuffle_down(s, d)")
+                    ));
+                    self.line(&format!(
+                        "if (o < {m}u && lane % 32u == 0) scratch[{res} + o * {sgs}u + lane / 32u] = s;"
+                    ));
+                    self.depth -= 1;
+                    self.line("}");
+                    self.barrier();
+                    let name = self.declare_reg(x, &reg(dt, &[m]));
+                    self.owned(
+                        m,
+                        &[
+                            format!("float s = {init};"),
+                            format!(
+                                "for (uint q = 0; q < {sgs}u; ++q) s = {};",
+                                join("s", &format!("scratch[{res} + e * {sgs}u + q]"))
+                            ),
+                            format!("{name}[k] = {}(s);", dt.msl_scalar()),
+                        ],
+                    );
+                    return Ok(());
+                }
+                let val = Self::read(&ops[0].0, &format!("e * {n}u + j"));
+                let step = format!("s = {};", join("s", &val));
                 let dt = ta.dtype;
                 let name = self.declare_reg(x, &reg(dt, &[m]));
                 self.owned(

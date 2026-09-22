@@ -16,3 +16,8 @@ half = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.31"
+
+# The `objc` macros metal-rs re-exports check `feature = "cargo-clippy"`
+# internally; declare it so `-D warnings` does not trip on their expansion.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

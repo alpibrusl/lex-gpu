@@ -113,12 +113,19 @@ fn op(p: &Program, o: &Op) -> String {
         Op::Binary(bop, a, b) => format!("{} {}, {}", bop.name(), arg(p, *a), arg(p, *b)),
         Op::Exp(a) => format!("exp {}", arg(p, *a)),
         Op::Unary(u, a) => format!("{} {}", u.name(), arg(p, *a)),
+        Op::Dequant6(lo, hi, s, g) => format!(
+            "dequant6 {}, {}, {} group {g}",
+            arg(p, *lo),
+            arg(p, *hi),
+            arg(p, *s)
+        ),
         Op::SwapPairs(a) => format!("swap_pairs {}", arg(p, *a)),
         Op::Dequant(q, s, m, g) | Op::Dequant4(q, s, m, g, _) => {
             let min = m.map_or(String::new(), |m| format!(", min {}", arg(p, m)));
             let name = match o {
-                Op::Dequant4(.., true) => "dequant4.hi",
-                Op::Dequant4(..) => "dequant4.lo",
+                Op::Dequant4(.., crate::ir::Nibbles::High) => "dequant4.hi",
+                Op::Dequant4(.., crate::ir::Nibbles::Low) => "dequant4.lo",
+                Op::Dequant4(..) => "dequant4.pairs",
                 _ => "dequant",
             };
             format!("{name} {}, {}{min} group {g}", arg(p, *q), arg(p, *s))

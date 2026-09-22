@@ -113,8 +113,15 @@ fn matvec_every_layout_matches_the_interpreter() {
             let sp = Split {
                 layout,
                 cols: n_in,
-                pack: if layout.packed4 { n_in } else { 0 },
-                q: if layout.packed4 {
+                qh: if layout.six {
+                    pattern(n_in * n_out / 4, 10)
+                        .iter()
+                        .map(|v| ((v + 1.0) * 127.5) as u8 as i8)
+                        .collect()
+                } else {
+                    vec![]
+                },
+                q: if layout.packed4 || layout.six {
                     pattern(n_in * n_out / 2, 4)
                         .iter()
                         .map(|v| ((v + 1.0) * 127.5) as u8 as i8)

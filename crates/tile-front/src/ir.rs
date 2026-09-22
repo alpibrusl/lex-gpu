@@ -228,6 +228,19 @@ impl UnOp {
     }
 }
 
+/// Which values a packed 4-bit [`Op::Dequant4`] produces from `q: [r, c]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nibbles {
+    /// The low nibble of every byte: output `[r, c]`.
+    Low,
+    /// The high nibble of every byte: output `[r, c]`.
+    High,
+    /// Both, in order — byte `k` holds columns `2k` (low) and `2k + 1`
+    /// (high): output `[r, 2c]`. The layout of the file's own packing, and
+    /// with lazy operands the cheapest to read: one byte feeds two values.
+    Pairs,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reduce {
     Max,
@@ -272,13 +285,15 @@ pub enum Op {
     /// values meet their scales (and, for affine formats such as Q4_K, their
     /// mins). The only way to compute with an `I8` tile.
     Dequant(Arg, Arg, Option<Arg>, usize),
-    /// [`Op::Dequant`] for 4-bit values packed two per byte: the output has
-    /// `q`'s shape and takes, from every byte, the low nibble (`false`) or
-    /// the high one (`true`), unsigned. Which values share a byte is the
-    /// loader's choice; the matvec schedule pairs column `k` of a chunk with
-    /// column `k + chunk/2`, so each nibble half is contiguous and every
-    /// thread unpacks only bytes it owns.
-    Dequant4(Arg, Arg, Option<Arg>, usize, bool),
+    /// [`Op::Dequant`] for unsigned 4-bit values packed two per byte.
+    /// Which nibbles it takes is the [`Nibbles`] mode.
+    Dequant4(Arg, Arg, Option<Arg>, usize, Nibbles),
+    /// Unsigned 6-bit values split into bit planes, as Q6_K stores them: a
+    /// 4-bit plane `lo: [r, c/2]` (column `2k` low nibble of byte `k`,
+    /// `2k + 1` high) and a 2-bit plane `hi: [r, c/4]` (columns `4k..4k+3`
+    /// in bits 0-1, 2-3, 4-5, 6-7 of byte `k`). Value `(lo | hi << 4) - 32`
+    /// times `s[r, c / group]`; output `[r, c]` in f32.
+    Dequant6(Arg, Arg, Arg, usize),
     Scale(Arg, f32),
     /// `[m,n] -> [m]`.
     RowReduce(Reduce, Arg),

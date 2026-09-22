@@ -64,7 +64,7 @@ impl QMat {
         }
         let w = match t.ty {
             GgmlType::Q8_0 => split_q8_0(b),
-            GgmlType::Q4_K => split_q4_k(b, t.dims[0], t.dims[0]),
+            GgmlType::Q4_K => split_q4_k(b, t.dims[0]),
             GgmlType::Q6_K => split_q6_k(b),
             other => {
                 return Err(format!(
@@ -248,6 +248,8 @@ mod gpu {
         cols: usize,
         layout: QLayout,
         q: Buffer,
+        /// Six-bit layouts' 2-bit plane.
+        qh: Option<Buffer>,
         /// Scale parameters in `QLayout::scale_params` order, in the file's
         /// own encoding.
         scales: Vec<Buffer>,
@@ -259,6 +261,7 @@ mod gpu {
             cols: w.cols,
             layout: w.w.layout,
             q: gpu.upload(&w.w.q),
+            qh: (!w.w.qh.is_empty()).then(|| gpu.upload(&w.w.qh)),
             scales: w.w.scale_bytes().iter().map(|b| gpu.upload(b)).collect(),
         }
     }
@@ -325,8 +328,9 @@ mod gpu {
         scalars_pos: Buffer,
         scalars_attn: Buffer,
         pos: usize,
-        /// Dispatch one kernel at a time and time each call site, instead of
-        /// one command buffer per token. For profiling; much slower.
+        /// Dispatch one kernel at a time and record each call site's GPU
+        /// time, instead of one command buffer per token. For profiling; the
+        /// step itself is much slower.
         pub sync: bool,
         /// Dispatches issued so far.
         pub dispatches: usize,
@@ -484,13 +488,31 @@ mod gpu {
             let plan = self.plan();
             let n = plan.len();
             if self.sync {
+                // GPU time per dispatch, from the command buffer's own
+                // timestamps: the CPU round trip is not the kernel's cost.
                 for (label, p, bufs) in &plan {
-                    self.timed(label, || self.gpu.run(p, bufs));
+                    let t = self.gpu.run_gpu_timed(p, bufs);
+                    let mut prof = self.prof.borrow_mut();
+                    let e = prof.entry(label).or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 += t;
                 }
             } else {
                 let steps: Vec<(&Pipeline, &[&Buffer])> =
                     plan.iter().map(|(_, p, b)| (*p, b.as_slice())).collect();
-                self.timed("token (one command buffer)", || self.gpu.run_all(&steps));
+                let t = Instant::now();
+                let (encode, gpu) = self.gpu.run_all_timed(&steps);
+                let wall = t.elapsed().as_secs_f64();
+                let mut prof = self.prof.borrow_mut();
+                for (label, secs) in [
+                    ("token: wall, encode to completion", wall),
+                    ("token: CPU encoding", encode),
+                    ("token: GPU execution", gpu),
+                ] {
+                    let e = prof.entry(label).or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 += secs;
+                }
             }
             drop(plan);
             self.dispatches += n;
@@ -498,16 +520,6 @@ mod gpu {
             let mut logits = vec![0.0f32; c.vocab];
             self.gpu.download(&self.acts.logits, &mut logits);
             Ok(logits)
-        }
-
-        fn timed<T>(&self, label: &'static str, f: impl FnOnce() -> T) -> T {
-            let t = Instant::now();
-            let out = f();
-            let mut p = self.prof.borrow_mut();
-            let e = p.entry(label).or_insert((0, 0.0));
-            e.0 += 1;
-            e.1 += t.elapsed().as_secs_f64();
-            out
         }
 
         /// Per-call-site timings so far, slowest first: (label, calls, seconds).
@@ -542,6 +554,7 @@ mod gpu {
         ) -> Dispatch<'a> {
             let p = &self.k.mv[&(w.cols, w.rows, w.layout, r.is_some())];
             let mut bufs = vec![x, &w.q];
+            bufs.extend(w.qh.as_ref());
             bufs.extend(w.scales.iter());
             bufs.extend(r);
             bufs.push(y);
