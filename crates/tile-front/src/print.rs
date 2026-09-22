@@ -18,6 +18,9 @@ pub fn program(p: &Program) -> String {
     if let Some(pid) = p.pid {
         let _ = writeln!(out, "  grid {} in 0..{}", var(p, pid), p.grid);
     }
+    if let Some(pid2) = p.pid2 {
+        let _ = writeln!(out, "  grid2 {} in 0..{}", var(p, pid2), p.grid2);
+    }
     for &(v, max) in &p.dyn_scalars {
         let _ = writeln!(out, "  scalar {} in 0..={max}", var(p, v));
     }

@@ -17,7 +17,7 @@
 #![cfg(target_os = "macos")]
 
 use tile_rt::gguf::ollama_model;
-use tile_rt::llama::{Runner, Weights, log_softmax};
+use tile_rt::llama::{Attention, Runner, Weights, log_softmax};
 
 /// tile keeps its KV cache in f16 (as llama.cpp does); the reference keeps
 /// K and V in f32. That, not the kernels, is most of the budget.
@@ -74,7 +74,8 @@ fn llama31_8b_q4_k_m_matches_the_reference_that_matches_ollama() {
 /// How the tokens reach the model: the three paths must agree.
 #[derive(Clone, Copy, Debug)]
 enum Feed {
-    /// One token at a time (decode).
+    /// One token at a time (decode), always through split-KV attention with
+    /// 16-position splits, so a step merges up to two splits.
     Steps,
     /// The prompt in batches of `n` (prefill), then one token at a time.
     Prefill(usize),
@@ -132,7 +133,17 @@ fn check_golden_fed(golden: &str, feed: Feed) {
         .max()
         .unwrap_or(0);
     let w = Weights::load(&path, longest + 16).expect("load");
-    let mut rt = Runner::new(&w).expect("runner");
+    let mut rt = match feed {
+        Feed::Steps => Runner::with_attention(
+            &w,
+            Attention {
+                bps: 1,
+                min_splits: 1,
+            },
+        ),
+        _ => Runner::new(&w),
+    }
+    .expect("runner");
 
     let mut worst = 0.0f64;
     let mut steps = 0;

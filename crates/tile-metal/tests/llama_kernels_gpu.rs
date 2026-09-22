@@ -288,6 +288,78 @@ fn dynamic_attention_and_f16_kv_append_match_the_interpreter() {
     );
 }
 
+#[test]
+fn split_kv_attention_matches_the_interpreter() {
+    use tile_front::flash::FlashDecode;
+    use tile_ir::Space;
+    let gpu = Gpu::open().expect("metal device");
+    let (heads, group, hd, cap, bk) = (8, 4, 128, 256, 16);
+    let hg = heads * group;
+    let cfg = FlashDecode {
+        q_rows: group,
+        d: hd,
+        seq: cap,
+        bq: group,
+        bk,
+        stages: 1,
+        dtype: DType::F16,
+        kv_space: Space::Threadgroup,
+        consumers: 0,
+        heads,
+        kv_cap: cap,
+    };
+    for bps in [1usize, 2] {
+        let splits = cap / (bk * bps);
+        let split = cfg.build_split(bps).unwrap();
+        let combine = cfg.build_combine(bps).unwrap();
+        for len in [1usize, 17, 40, 129, 256] {
+            let tensors = || {
+                vec![
+                    Tensor::new(DType::F16, &[hg, hd], &pattern(hg * hd, 1)),
+                    Tensor::new(
+                        DType::F16,
+                        &[heads * cap, hd],
+                        &pattern(heads * cap * hd, 2),
+                    ),
+                    Tensor::new(
+                        DType::F16,
+                        &[heads * cap, hd],
+                        &pattern(heads * cap * hd, 3),
+                    ),
+                    Tensor::zeros(DType::F32, &[hg, splits]),
+                    Tensor::zeros(DType::F32, &[hg, splits]),
+                    Tensor::zeros(DType::F32, &[hg, splits * hd]),
+                ]
+            };
+            for out in [3, 4, 5] {
+                same(&gpu, &split, tensors(), &[len as u32], out, 128);
+            }
+        }
+        // Partial states with a spread of maxima, positive sums.
+        let m: Vec<f32> = pattern(splits * hg, 4).iter().map(|x| 4.0 * x).collect();
+        let l: Vec<f32> = pattern(splits * hg, 5).iter().map(|x| 1.5 + x).collect();
+        for nsplit in [1usize, 3, 9, splits].into_iter().filter(|&n| n <= splits) {
+            same(
+                &gpu,
+                &combine,
+                vec![
+                    Tensor::new(DType::F32, &[hg, splits], &m),
+                    Tensor::new(DType::F32, &[hg, splits], &l),
+                    Tensor::new(
+                        DType::F32,
+                        &[splits * hg, hd],
+                        &pattern(splits * hg * hd, 6),
+                    ),
+                    Tensor::zeros(DType::F32, &[hg, hd]),
+                ],
+                &[nsplit as u32, nsplit.div_ceil(8) as u32],
+                3,
+                128,
+            );
+        }
+    }
+}
+
 /// The batched forward pass's kernels (prefill, speculative verify).
 #[test]
 fn batched_kernels_match_the_interpreter() {

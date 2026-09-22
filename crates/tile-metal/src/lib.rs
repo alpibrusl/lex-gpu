@@ -10,7 +10,7 @@
 mod device;
 
 #[cfg(target_os = "macos")]
-pub use device::{DeviceInfo, Gpu, Pipeline};
+pub use device::{DeviceInfo, Gpu, Pipeline, Step};
 
 /// Re-exported so callers do not need a direct `metal` dependency. A later
 /// runtime hands out typed tile handles instead of raw buffers.

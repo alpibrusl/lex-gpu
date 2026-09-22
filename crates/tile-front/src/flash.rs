@@ -39,6 +39,10 @@ use crate::ir::{
 };
 
 /// Problem shape plus schedule.
+/// Splits the split-KV combine merges per step of its loop; a capacity
+/// holds a whole number of these chunks of splits.
+pub const COMBINE_CHUNK: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlashDecode {
     /// Query rows sharing one KV head.
@@ -351,7 +355,7 @@ impl FlashDecode {
                 Arg::Borrow(k),
                 Arg::Borrow(v),
                 [p[0], p[1], p[2]],
-                Some((i, &|_| IdxExpr::scaled(len, 1, 0))),
+                Some((IdxExpr::scaled(i, c.bk, 0), &|_| IdxExpr::scaled(len, 1, 0))),
             );
             b.drop(k);
             b.drop(v);
@@ -429,7 +433,7 @@ impl FlashDecode {
                 Arg::Borrow(k),
                 Arg::Borrow(v),
                 [p[0], p[1], p[2]],
-                Some((i, &limit)),
+                Some((IdxExpr::scaled(i, c.bk, 0), &limit)),
             );
             b.drop(k);
             b.drop(v);
@@ -445,6 +449,187 @@ impl FlashDecode {
             [out[0], out[1], out[2]],
             strides,
         );
+        Ok(b.finish())
+    }
+
+    /// Split-KV decode attention, first half: instance `(head, split)`
+    /// attends over the `bps` blocks of the cache that split covers and
+    /// writes its partial softmax state — running max `m`, sum `l` and
+    /// unnormalised `acc` — for [`FlashDecode::build_combine`] to merge.
+    ///
+    /// The splits' grid dimension is the capacity's; a runtime launches only
+    /// `ceil(nkb / bps)` of them. Positions past the live length (scalar
+    /// `len`) are masked, so the last split's tail costs nothing but loads.
+    /// One query block per head: `bq == q_rows` (the GQA group).
+    ///
+    /// Partials are laid out by query row, split-minor: `part_m[row, split]`
+    /// and `part_acc[row, split * d ..]`, so the combine reads one row's
+    /// splits contiguously.
+    pub fn build_split(&self, bps: usize) -> Result<Program, String> {
+        let c = *self;
+        let cap = c.kv_rows();
+        if c.bq != c.q_rows || c.consumers != 0 || c.heads == 0 || bps == 0 {
+            return Err("split attention takes one query block per head".into());
+        }
+        if !cap.is_multiple_of(c.bk * bps * COMBINE_CHUNK) {
+            return Err(format!(
+                "capacity {cap} is not whole chunks of {COMBINE_CHUNK} splits of {bps} x {}",
+                c.bk
+            ));
+        }
+        let splits = cap / (c.bk * bps);
+        let (group, hg) = (c.q_rows, c.heads * c.q_rows);
+        let mut b = Builder::new(&format!(
+            "flash_split_{}_g{group}_bk{}_bps{bps}_cap{cap}",
+            c.dtype.suffix(),
+            c.bk
+        ));
+        let pq = b.param("q", c.dtype, &[hg, c.d], false);
+        let pk = b.param("k", c.dtype, &[c.heads * cap, c.d], false);
+        let pv = b.param("v", c.dtype, &[c.heads * cap, c.d], false);
+        let pm = b.param("part_m", DType::F32, &[hg, splits], true);
+        let pl = b.param("part_l", DType::F32, &[hg, splits], true);
+        let pa = b.param("part_acc", DType::F32, &[hg, splits * c.d], true);
+        let pid = b.grid(c.heads);
+        let split = b.grid2(splits);
+        let len = b.dyn_index("len", cap);
+
+        let (qs, [ms, ls, accs]) = setup_from(&mut b, &c, pid, pq, 0, 1, (c.bq, group), -1e30);
+        let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
+        let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
+        let carry = vec![
+            Ty::Array(m_ty.clone(), 1),
+            Ty::Array(m_ty.clone(), 1),
+            Ty::Array(acc_ty.clone(), 1),
+        ];
+        let kv = TileTy::new(c.dtype, &[c.bk, c.d], Space::Threadgroup);
+        let out = b.for_range(0, bps, vec![ms, ls, accs], carry, |b, i, p| {
+            // Block `split * bps + i` of this head.
+            let first = IdxExpr::scaled(i, c.bk, 0).plus(split, bps * c.bk);
+            let at = first.clone().plus(pid, cap);
+            let k = b.op("k", Op::Load(rows(pk, at.clone(), c.bk, c.d), kv.clone()));
+            let v = b.op("v", Op::Load(rows(pv, at, c.bk, c.d), kv.clone()));
+            let out = attend(
+                b,
+                &c,
+                qs,
+                Arg::Borrow(k),
+                Arg::Borrow(v),
+                [p[0], p[1], p[2]],
+                Some((first, &|_| IdxExpr::scaled(len, 1, 0))),
+            );
+            b.drop(k);
+            b.drop(v);
+            out.to_vec()
+        });
+        // This head's rows, this split's column.
+        let row = IdxExpr::scaled(pid, group, 0);
+        b.map_each(
+            vec![out[0], out[1], out[2]],
+            vec![Ty::Tile(m_ty.clone()), Ty::Tile(m_ty), Ty::Tile(acc_ty)],
+            0,
+            |b, _, p| {
+                let column = |param| View {
+                    param,
+                    offset: vec![row.clone(), IdxExpr::scaled(split, 1, 0)],
+                    shape: vec![group, 1],
+                };
+                b.effect(Op::Store(Arg::Move(p[0]), column(pm)));
+                b.effect(Op::Store(Arg::Move(p[1]), column(pl)));
+                b.effect(Op::Store(
+                    Arg::Move(p[2]),
+                    View {
+                        param: pa,
+                        offset: vec![row.clone(), IdxExpr::scaled(split, c.d, 0)],
+                        shape: vec![group, c.d],
+                    },
+                ));
+                vec![]
+            },
+        );
+        b.drop(qs);
+        Ok(b.finish())
+    }
+
+    /// Split-KV decode attention, second half: one instance per query row
+    /// merges that row's first `nsplit` partial states (a runtime scalar;
+    /// `nchunk = ceil(nsplit / COMBINE_CHUNK)`) and writes `o = acc / l`.
+    ///
+    /// Every split at once, as llama.cpp's reduce does: the global max `M`
+    /// over the row's split maxima, weights `w = exp(m - M)`, `l = Σ w·l_s`,
+    /// and `acc = w · acc_s` as a `[1, splits] x [splits, d]` matmul, taken
+    /// `COMBINE_CHUNK` splits at a time so only live splits are read.
+    pub fn build_combine(&self, bps: usize) -> Result<Program, String> {
+        use Arg::{Borrow, Move};
+        let c = *self;
+        let cap = c.kv_rows();
+        let splits = cap / (c.bk * bps);
+        if !splits.is_multiple_of(COMBINE_CHUNK) {
+            return Err(format!(
+                "{splits} splits are not whole chunks of {COMBINE_CHUNK}"
+            ));
+        }
+        let ch = COMBINE_CHUNK;
+        let hg = c.heads * c.q_rows;
+        let mut b = Builder::new(&format!("flash_combine_splits{splits}_d{}", c.d));
+        let pm = b.param("part_m", DType::F32, &[hg, splits], false);
+        let pl = b.param("part_l", DType::F32, &[hg, splits], false);
+        let pa = b.param("part_acc", DType::F32, &[hg * splits, c.d], false);
+        let po = b.param("o", DType::F32, &[hg, c.d], true);
+        let pid = b.grid(hg);
+        let nsplit = b.dyn_index("nsplit", splits);
+        let nchunk = b.dyn_index("nchunk", splits / ch);
+        let live = IdxExpr::scaled(nsplit, 1, 0);
+        let row_of = |param, first: IdxExpr, n| View {
+            param,
+            offset: vec![IdxExpr::scaled(pid, 1, 0), first],
+            shape: vec![1, n],
+        };
+        let reg = |shape: &[usize]| TileTy::new(DType::F32, shape, Space::Reg);
+
+        let m = b.op(
+            "m",
+            Op::Load(row_of(pm, IdxExpr::lit(0), splits), reg(&[1, splits])),
+        );
+        let m = b.op("m", Op::MaskCols(Move(m), IdxExpr::lit(0), live.clone()));
+        let mx = b.op("mx", Op::RowReduce(Reduce::Max, Borrow(m)));
+        let d = b.op("dm", Op::Binary(BinOp::Sub, Move(m), Borrow(mx)));
+        let w = b.op("w", Op::Exp(Move(d)));
+        let ls = b.op(
+            "ls",
+            Op::Load(row_of(pl, IdxExpr::lit(0), splits), reg(&[1, splits])),
+        );
+        let wl = b.op("wl", Op::Binary(BinOp::Mul, Move(w), Move(ls)));
+        let l = b.op("l", Op::RowReduce(Reduce::Sum, Move(wl)));
+
+        let acc0 = b.op("acc", Op::Fill(reg(&[1, c.d]), 0.0));
+        let chunk = TileTy::new(DType::F32, &[ch, c.d], Space::Threadgroup);
+        let out = b.for_range_dyn(
+            0,
+            splits / ch,
+            nchunk,
+            vec![acc0],
+            vec![Ty::Tile(reg(&[1, c.d]))],
+            |b, k, p| {
+                let first = IdxExpr::scaled(k, ch, 0);
+                let mc = b.op("mc", Op::Load(row_of(pm, first.clone(), ch), reg(&[1, ch])));
+                let mc = b.op("mc", Op::MaskCols(Move(mc), first.clone(), live.clone()));
+                let d = b.op("dc", Op::Binary(BinOp::Sub, Move(mc), Borrow(mx)));
+                let wc = b.op("wc", Op::Exp(Move(d)));
+                let at = IdxExpr::scaled(pid, splits, 0).plus(k, ch);
+                let ac = b.op("ac", Op::Load(rows(pa, at, ch, c.d), chunk.clone()));
+                let pv = b.op("pv", Op::MatMul(Move(wc), Borrow(ac), DType::F32));
+                b.drop(ac);
+                let acc = b.op("acc", Op::Binary(BinOp::Add, Move(p[0]), Move(pv)));
+                vec![acc]
+            },
+        );
+        b.drop(mx);
+        let o = b.op("o", Op::Binary(BinOp::Div, Move(out[0]), Move(l)));
+        b.effect(Op::Store(
+            Move(o),
+            rows(po, IdxExpr::scaled(pid, 1, 0), 1, c.d),
+        ));
         Ok(b.finish())
     }
 
@@ -554,6 +739,23 @@ fn setup(
     n: usize,
     strides: (usize, usize),
 ) -> (Var, [Var; 3]) {
+    setup_from(b, c, pid, pq, q0, n, strides, f32::NEG_INFINITY)
+}
+
+/// [`setup`] with the running max starting at `m0`. Split-KV attention
+/// starts at a large finite negative so a split that sees no position (all
+/// masked) produces a zero-weight partial instead of NaN.
+#[allow(clippy::too_many_arguments)]
+fn setup_from(
+    b: &mut Builder,
+    c: &FlashDecode,
+    pid: Var,
+    pq: usize,
+    q0: usize,
+    n: usize,
+    strides: (usize, usize),
+    m0: f32,
+) -> (Var, [Var; 3]) {
     let reg = |dt, shape: &[usize]| TileTy::new(dt, shape, Space::Reg);
     let q_blocks: Vec<Var> = (0..n)
         .map(|qb| {
@@ -573,7 +775,7 @@ fn setup(
             .collect();
         b.op(name, Op::MakeArray(v))
     };
-    let ms = state("m", reg(DType::F32, &[c.bq]), f32::NEG_INFINITY);
+    let ms = state("m", reg(DType::F32, &[c.bq]), m0);
     let ls = state("l", reg(DType::F32, &[c.bq]), 0.0);
     let accs = state("acc", reg(DType::F32, &[c.bq, c.d]), 0.0);
     (qs, [ms, ls, accs])
@@ -640,7 +842,7 @@ fn attend(
     k: Arg,
     v: Arg,
     state: [Var; 3],
-    mask: Option<(Var, &dyn Fn(Var) -> IdxExpr)>,
+    mask: Option<(IdxExpr, &dyn Fn(Var) -> IdxExpr)>,
 ) -> [Var; 3] {
     use Arg::{Borrow, Move};
     let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
@@ -651,11 +853,8 @@ fn attend(
         let (m, l, acc) = (p[0], p[1], p[2]);
         let s = b.op("s", Op::MatMulNT(Arg::BorrowElem(qs, qb), k, DType::F32));
         let mut s = b.op("s", Op::Scale(Move(s), scale));
-        if let Some((blk, limit)) = mask {
-            s = b.op(
-                "s",
-                Op::MaskCols(Move(s), IdxExpr::scaled(blk, c.bk, 0), limit(qb)),
-            );
+        if let Some((first, limit)) = &mask {
+            s = b.op("s", Op::MaskCols(Move(s), first.clone(), limit(qb)));
         }
         let mb = b.op("mb", Op::RowReduce(Reduce::Max, Borrow(s)));
         let m_new = b.op("m", Op::Binary(BinOp::Max, Borrow(m), Move(mb)));

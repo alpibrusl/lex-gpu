@@ -14,6 +14,10 @@ pub struct DeviceInfo {
     pub recommended_working_set_bytes: u64,
 }
 
+/// One dispatch of a batch: pipeline, buffers, and optionally fewer
+/// threadgroups (x, y) than the pipeline's plan.
+pub type Step<'a> = (&'a Pipeline, &'a [&'a Buffer], Option<[usize; 2]>);
+
 /// An open Metal device plus its command queue.
 pub struct Gpu {
     device: Device,
@@ -89,7 +93,7 @@ impl Gpu {
     pub fn build_lowered(&self, lowered: &Lowered) -> Result<Pipeline, String> {
         let plan = Plan {
             launch: Launch {
-                threadgroups: [lowered.grid, 1, 1],
+                threadgroups: [lowered.grid, lowered.grid2, 1],
                 threads_per_threadgroup: [lowered.threads, 1, 1],
             },
             threadgroup_bytes: lowered.threadgroup_bytes,
@@ -278,22 +282,34 @@ impl Gpu {
     /// [`Gpu::run_all`], returning (CPU seconds spent encoding, GPU seconds
     /// executing).
     pub fn run_all_timed(&self, steps: &[(&Pipeline, &[&Buffer])]) -> (f64, f64) {
+        let with: Vec<Step<'_>> = steps.iter().map(|&(p, b)| (p, b, None)).collect();
+        self.run_launches(&with)
+    }
+
+    /// [`Gpu::run_all_timed`] where a step may launch fewer threadgroups
+    /// than its plan along x and y: a kernel whose instances are
+    /// independent (splits of a KV cache, say) run only as many as the
+    /// sequence needs. Launching more than planned is refused.
+    pub fn run_launches(&self, steps: &[Step<'_>]) -> (f64, f64) {
         autoreleasepool(|| {
             let t0 = Instant::now();
             let cb = self.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
-            for (pipeline, buffers) in steps {
+            for &(pipeline, buffers, groups) in steps {
                 let l = pipeline.plan.launch;
+                let [gx, gy] = groups.unwrap_or([l.threadgroups[0], l.threadgroups[1]]);
+                assert!(
+                    gx <= l.threadgroups[0] && gy <= l.threadgroups[1],
+                    "launch of {gx}x{gy} threadgroups exceeds `{}`'s planned {:?}",
+                    pipeline.name,
+                    l.threadgroups
+                );
                 enc.set_compute_pipeline_state(&pipeline.pso);
                 for (i, &b) in buffers.iter().enumerate() {
                     enc.set_buffer(i as u64, Some(b), 0);
                 }
                 enc.dispatch_thread_groups(
-                    MTLSize::new(
-                        l.threadgroups[0] as u64,
-                        l.threadgroups[1] as u64,
-                        l.threadgroups[2] as u64,
-                    ),
+                    MTLSize::new(gx as u64, gy as u64, l.threadgroups[2] as u64),
                     MTLSize::new(
                         l.threads_per_threadgroup[0] as u64,
                         l.threads_per_threadgroup[1] as u64,

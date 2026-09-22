@@ -43,8 +43,10 @@ use tile_ir::{DType, Space, Target};
 pub struct Lowered {
     pub entry: String,
     pub source: String,
-    /// Threadgroups to launch: one per grid instance.
+    /// Threadgroups to launch: one per grid instance, along x…
     pub grid: usize,
+    /// …and along y (1 unless the program has a second grid dimension).
+    pub grid2: usize,
     pub threads: usize,
     /// Arena (threadgroup tiles) plus staging scratch.
     pub threadgroup_bytes: usize,
@@ -156,6 +158,9 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
     if let Some(pid) = prog.pid {
         g.locs.insert(pid, Loc::Index("gid".into()));
     }
+    if let Some(pid2) = prog.pid2 {
+        g.locs.insert(pid2, Loc::Index("gid2".into()));
+    }
     for (i, &(x, _)) in prog.dyn_scalars.iter().enumerate() {
         g.locs.insert(x, Loc::Index(format!("scalars[{i}]")));
     }
@@ -209,7 +214,8 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
         );
     }
     s.push_str("    uint tid [[thread_index_in_threadgroup]],\n");
-    s.push_str("    uint gid [[threadgroup_position_in_grid]])\n{\n");
+    s.push_str("    uint3 tgpos [[threadgroup_position_in_grid]])\n{\n");
+    s.push_str("    const uint gid = tgpos.x, gid2 = tgpos.y;\n");
     if arena_bytes > 0 {
         let _ = writeln!(
             s,
@@ -227,6 +233,7 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
         entry,
         source: s,
         grid: prog.grid,
+        grid2: prog.grid2,
         threads,
         threadgroup_bytes,
         arena_bytes,

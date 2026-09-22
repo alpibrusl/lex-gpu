@@ -225,3 +225,67 @@ fn causal_attention_sees_exactly_its_own_prefix() {
         }
     }
 }
+
+/// Split-KV decode attention: partial softmaxes per cache split, merged by
+/// the combine kernel, equal the whole-sequence attention at every length.
+#[test]
+fn split_kv_attention_matches_the_reference_at_every_length() {
+    use tile_front::run_dyn;
+    let (heads, group, cap, bk) = (2usize, 4usize, 256usize, 16usize);
+    let hg = heads * group;
+    for bps in [1usize, 2] {
+        let splits = cap / (bk * bps);
+        let cfg = FlashDecode {
+            q_rows: group,
+            d: D,
+            seq: cap,
+            bq: group,
+            bk,
+            stages: 1,
+            dtype: DType::F16,
+            kv_space: Space::Threadgroup,
+            consumers: 0,
+            heads,
+            kv_cap: cap,
+        };
+        let split = cfg.build_split(bps).unwrap();
+        let combine = cfg.build_combine(bps).unwrap();
+        check(&split, &Target::apple_m_series()).expect("split");
+        check(&combine, &Target::apple_m_series()).expect("combine");
+        let mk = |rows: usize, seed: u32| {
+            let mut x = vec![0.0; rows * D];
+            fill_pattern_f32(&mut x, seed);
+            Tensor::new(DType::F16, &[rows, D], &x)
+        };
+        for len in [1usize, 17, 32, 33, 100, 129, cap] {
+            let (q, k, v) = (mk(hg, 1), mk(heads * cap, 2), mk(heads * cap, 3));
+            let mut part = vec![
+                q.clone(),
+                k.clone(),
+                v.clone(),
+                Tensor::zeros(DType::F32, &[hg, splits]),
+                Tensor::zeros(DType::F32, &[hg, splits]),
+                Tensor::zeros(DType::F32, &[hg, splits * D]),
+            ];
+            run_dyn(&split, &mut part, &[len as u32]).expect("split");
+            let nsplit = len.div_ceil(bk * bps);
+            let nchunk = nsplit.div_ceil(flash::COMBINE_CHUNK);
+            let mut comb = vec![
+                part[3].clone(),
+                part[4].clone(),
+                Tensor::new(DType::F32, &[hg * splits, D], &part[5].data),
+                Tensor::zeros(DType::F32, &[hg, D]),
+            ];
+            run_dyn(&combine, &mut comb, &[nsplit as u32, nchunk as u32]).expect("combine");
+            for h in 0..heads {
+                let qh = &q.data[h * group * D..(h + 1) * group * D];
+                let kh = &k.data[h * cap * D..(h * cap + len) * D];
+                let vh = &v.data[h * cap * D..(h * cap + len) * D];
+                let want = flash::reference(qh, kh, vh, group, len, D);
+                let got = &comb[3].data[h * group * D..(h + 1) * group * D];
+                let err = max_rel_err(got, &want);
+                assert!(err < TOL, "len {len} head {h}: {err:e}");
+            }
+        }
+    }
+}
