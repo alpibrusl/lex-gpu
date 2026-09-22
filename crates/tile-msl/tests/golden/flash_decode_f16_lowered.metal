@@ -23,14 +23,14 @@ kernel void flash_decode_f16_bq4_bk16_s2(
     for (uint k = 0; k < 2u; ++k) {
         const uint e = k * 128u + tid;
         if (e < 256u) {
-            v1_m[k] = half(half(p0_q[((uint)(0 + 8 * gid) + (((e)) / 64u % 4u)) * 64u + ((uint)(0) + (((e)) / 1u % 64u)) * 1u]));
+            v1_m[k] = half(half(p0_q[(uint)(0 + 8 * gid) * 64u + (uint)(0) * 1u + ((e))]));
         }
     }
     half v2_m[2];
     for (uint k = 0; k < 2u; ++k) {
         const uint e = k * 128u + tid;
         if (e < 256u) {
-            v2_m[k] = half(half(p0_q[((uint)(4 + 8 * gid) + (((e)) / 64u % 4u)) * 64u + ((uint)(0) + (((e)) / 1u % 64u)) * 1u]));
+            v2_m[k] = half(half(p0_q[(uint)(4 + 8 * gid) * 64u + (uint)(0) * 1u + ((e))]));
         }
     }
     half v3[2][2];
@@ -90,13 +90,13 @@ kernel void flash_decode_f16_bq4_bk16_s2(
     threadgroup half* v13 = (threadgroup half*)(arena + 0);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < 1024u; e += 128u) {
-        v13[e] = p1_k[((uint)(0 + 64 * gid) + ((e) / 64u % 16u)) * 64u + ((uint)(0) + ((e) / 1u % 64u)) * 1u];
+        v13[e] = p1_k[(uint)(0 + 64 * gid) * 64u + (uint)(0) * 1u + (e)];
     }
     threadgroup half* v15 = (threadgroup half*)(arena + 2048);
     threadgroup half* v16 = (threadgroup half*)(arena + 4096);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < 1024u; e += 128u) {
-        v16[e] = p2_v[((uint)(0 + 64 * gid) + ((e) / 64u % 16u)) * 64u + ((uint)(0) + ((e) / 1u % 64u)) * 1u];
+        v16[e] = p2_v[(uint)(0 + 64 * gid) * 64u + (uint)(0) * 1u + (e)];
     }
     threadgroup half* v18 = (threadgroup half*)(arena + 6144);
     float v20[2][1];
@@ -116,11 +116,11 @@ kernel void flash_decode_f16_bq4_bk16_s2(
     for (uint v19 = 0u; v19 < 3u; ++v19) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint e = tid; e < 1024u; e += 128u) {
-            v24[e] = p1_k[((uint)(16 + 16 * v19 + 64 * gid) + ((e) / 64u % 16u)) * 64u + ((uint)(0) + ((e) / 1u % 64u)) * 1u];
+            v24[e] = p1_k[(uint)(16 + 16 * v19 + 64 * gid) * 64u + (uint)(0) * 1u + (e)];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint e = tid; e < 1024u; e += 128u) {
-            v26[e] = p2_v[((uint)(16 + 16 * v19 + 64 * gid) + ((e) / 64u % 16u)) * 64u + ((uint)(0) + ((e) / 1u % 64u)) * 1u];
+            v26[e] = p2_v[(uint)(16 + 16 * v19 + 64 * gid) * 64u + (uint)(0) * 1u + (e)];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -546,7 +546,7 @@ kernel void flash_decode_f16_bq4_bk16_s2(
         for (uint k = 0; k < 2u; ++k) {
             const uint e = k * 128u + tid;
             if (e < 256u) {
-                p3_o[((uint)(0 + 4 * v82 + 8 * gid) + ((e) / 64u % 4u)) * 64u + ((uint)(0) + ((e) / 1u % 64u)) * 1u] = float(float(v86[k]));
+                p3_o[(uint)(0 + 4 * v82 + 8 * gid) * 64u + (uint)(0) * 1u + (e)] = float(float(v86[k]));
             }
         }
     }

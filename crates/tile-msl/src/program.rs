@@ -329,6 +329,24 @@ impl Gen<'_> {
     fn addr(&self, view: &View, e: &str) -> Result<String, String> {
         let dims = &self.prog.params[view.param].shape;
         let r = dims.len();
+        // A view spanning every inner dimension is one contiguous run of
+        // memory: element `e` sits at `base + e`. Written that way, the
+        // compiler can see that consecutive elements are adjacent and merge
+        // their loads; the per-dimension `/` and `%` form hides it. Byte
+        // offsets inside a packed run are written run-relative
+        // (`p0 / 2 + u / 2`, `p0` a multiple of the run) for the same reason.
+        if (1..r).all(|d| view.shape[d] == dims[d]) {
+            let mut base = vec![];
+            for d in 0..r {
+                let stride: usize = dims[d + 1..].iter().product();
+                base.push(format!("{} * {stride}u", self.idx(&view.offset[d])?));
+            }
+            return Ok(format!(
+                "{}[{} + ({e})]",
+                param_ident(view.param, &self.prog.params[view.param].name),
+                base.join(" + ")
+            ));
+        }
         let mut terms = vec![];
         for d in 0..r {
             let inner: usize = view.shape[d + 1..].iter().product();
@@ -1125,9 +1143,10 @@ impl Gen<'_> {
                             Pack::Six(lo, lc, hi, hc) => {
                                 // Four values per step: two low-plane bytes,
                                 // one high-plane byte.
-                                let b0 = at_index(lo, &format!("j * {lc}u + p / 2u"));
-                                let b1 = at_index(lo, &format!("j * {lc}u + p / 2u + 1u"));
-                                let h = at_index(hi, &format!("j * {hc}u + p / 4u"));
+                                let b0 = at_index(lo, &format!("j * {lc}u + p0 / 2u + u / 2u"));
+                                let b1 =
+                                    at_index(lo, &format!("j * {lc}u + p0 / 2u + u / 2u + 1u"));
+                                let h = at_index(hi, &format!("j * {hc}u + p0 / 4u + u / 4u"));
                                 let a = |k: usize| {
                                     Self::read(&ops[0].0, &format!("i * {kd}u + p + {k}u"))
                                 };
@@ -1145,7 +1164,7 @@ impl Gen<'_> {
                             Pack::Pairs(qe, qc) => {
                                 // One byte, two values: low nibble for p,
                                 // high for p + 1.
-                                let byte = at_index(qe, &format!("j * {qc}u + p / 2u"));
+                                let byte = at_index(qe, &format!("j * {qc}u + p0 / 2u + u / 2u"));
                                 let a1 = Self::read(&ops[0].0, &format!("i * {kd}u + p + 1u"));
                                 self.line(&format!(
                                     "    for (uint u = 0; u < {vec}u; u += 2u) {{ const uint p = p0 + u; \
@@ -1371,7 +1390,7 @@ impl Gen<'_> {
                 let mg = if d.m.is_some() { " - mgr[rr]" } else { "" };
                 match &d.pack {
                     Pack::Pairs(qe, qc) => {
-                        let byte = at_index(qe, &format!("j * {qc}u + p / 2u"));
+                        let byte = at_index(qe, &format!("j * {qc}u + p0 / 2u + u / 2u"));
                         (
                             2,
                             format!("const uint bq = (uint)(uchar)({byte}); "),
@@ -1382,9 +1401,9 @@ impl Gen<'_> {
                         )
                     }
                     Pack::Six(lo, lc, hi, hc) => {
-                        let b0 = at_index(lo, &format!("j * {lc}u + p / 2u"));
-                        let b1 = at_index(lo, &format!("j * {lc}u + p / 2u + 1u"));
-                        let h = at_index(hi, &format!("j * {hc}u + p / 4u"));
+                        let b0 = at_index(lo, &format!("j * {lc}u + p0 / 2u + u / 2u"));
+                        let b1 = at_index(lo, &format!("j * {lc}u + p0 / 2u + u / 2u + 1u"));
+                        let h = at_index(hi, &format!("j * {hc}u + p0 / 4u + u / 4u"));
                         let q = |l: &str, sh: u32, hs: u32| {
                             format!(
                                 "(float(int((({l} >> {sh}u) & 0xFu) | (((hh >> {hs}u) & 3u) << 4u)) - 32) * sgr[rr])"
