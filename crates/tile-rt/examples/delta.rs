@@ -24,7 +24,7 @@ fn main() -> Result<(), String> {
         "  {:>5} {:>8} {:>10} {:>9} {:>9}",
         "rows", "threads", "us/layer", "GB/s", "ms/token"
     );
-    for rows in [4usize, 8, 16, 32] {
+    for rows in [8usize] {
         for threads in [128usize, 256] {
             let c = DeltaNet::packed(hv, 16, dk, dv, rows);
             let prog = c.build_step()?;
@@ -58,6 +58,37 @@ fn main() -> Result<(), String> {
                 bytes / per / 1e9,
                 best * 1e3
             );
+
+            // The same work as a batch: the state is read and written once
+            // for the whole batch, which is what a speculative verify pays.
+            for tokens in [2usize, 4] {
+                let batch = c.build_steps(tokens)?;
+                let pipe = gpu.build_lowered(&lower(&batch, gpu.target(), threads)?)?;
+                let q = gpu.zeroed::<f32>(tokens * hv * dk);
+                let k = gpu.zeroed::<f32>(tokens * hv * dk);
+                let v = gpu.zeroed::<f32>(tokens * hv * dv);
+                let g = gpu.zeroed::<f32>(tokens * hv * dv);
+                let b = gpu.zeroed::<f32>(tokens * hv * dv);
+                let y = gpu.zeroed::<f32>(tokens * hv * dv);
+                let binds: Vec<Vec<&Buffer>> = states
+                    .iter()
+                    .map(|s| vec![s, &q, &k, &v, &g, &b, &y])
+                    .collect();
+                let steps: Vec<Step<'_>> =
+                    binds.iter().map(|b| (&pipe, b.as_slice(), None)).collect();
+                gpu.run_launches(&steps);
+                let best = (0..3)
+                    .map(|_| gpu.run_launches(&steps).1)
+                    .fold(f64::INFINITY, f64::min);
+                println!(
+                    "  {:>5} {threads:>8} {:>10.1} {:>9.0} {:>9.2}   ({tokens} tokens: {:.2} ms/token)",
+                    rows,
+                    best / layers as f64 * 1e6,
+                    bytes / (best / layers as f64) / 1e9,
+                    best * 1e3,
+                    best * 1e3 / tokens as f64
+                );
+            }
         }
     }
     Ok(())

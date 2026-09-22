@@ -21,7 +21,7 @@
 
 use tile_ir::{DType, Space};
 
-use crate::ir::{Arg, BinOp, Builder, IdxExpr, Op, Program, Reduce, TileTy, UnOp, View};
+use crate::ir::{Arg, BinOp, Builder, IdxExpr, Op, Program, Reduce, TileTy, Ty, UnOp, View};
 
 fn reg(shape: &[usize]) -> TileTy {
     TileTy::new(DType::F32, shape, Space::Reg)
@@ -70,22 +70,25 @@ impl DeltaNet {
 
 impl DeltaNet {
     /// One decode step: `S` is read and written once, `y` is `S q`.
+    pub fn build_step(&self) -> Result<Program, String> {
+        self.build_steps(1)
+    }
+
+    /// `tokens` steps of the delta rule in one pass over the state.
+    ///
+    /// The recurrence is sequential — token `t + 1` sees the state token
+    /// `t` left — so a batch cannot be parallel over tokens. What it can do
+    /// is pay for the state once: a tile of rows is loaded, carried through
+    /// the whole batch in registers, and stored at the end. At 3 MB a layer
+    /// that is the difference between verifying a speculative batch and
+    /// running it token by token.
     ///
     /// Parameters: `state [v_heads * v_dim, k_dim]`, `q` and `k`
-    /// `[v_heads, k_dim]`, `v`, `g`, `beta` and `y`, each flat
-    /// `[v_heads * v_dim]`.
-    ///
-    /// `q` and `k` arrive with one row per *value* head, the key head's row
-    /// repeated `v_heads / k_heads` times, and the two gates with one value
-    /// per state row. Both are the producer's job. Index expressions are
-    /// affine, so a kernel cannot divide `pid` by the group size to find its
-    /// key head, and repeating 6 KB of keys costs nothing next to the 3 MB
-    /// of state this pass moves.
-    ///
-    /// Instance `(chunk, head)` covers `rows` state rows: the head's `q` and
-    /// `k` are one row each, broadcast along the tile's columns, while `v`,
-    /// `g` and `beta` vary down its rows.
-    pub fn build_step(&self) -> Result<Program, String> {
+    /// `[tokens * v_heads, k_dim]` (one row per value head, the key head's
+    /// row repeated), `v [tokens * v_width]` (the convolution's output
+    /// rows, values at `v_base`), `g`, `beta` and `y`, each
+    /// `[tokens * v_heads * v_dim]`.
+    pub fn build_steps(&self, tokens: usize) -> Result<Program, String> {
         use Arg::{Borrow, Move};
         let c = *self;
         if c.v_heads == 0 || c.k_heads == 0 || !c.v_heads.is_multiple_of(c.k_heads) {
@@ -103,83 +106,88 @@ impl DeltaNet {
                 c.v_base, c.v_width, c.v_heads, c.v_dim
             ));
         }
+        if tokens == 0 {
+            return Err("a batch is at least one token".into());
+        }
         let (hv, dk, dv, rows) = (c.v_heads, c.k_dim, c.v_dim, c.rows);
+        let gates = hv * dv;
         let mut b = Builder::new(&format!(
-            "delta_step_h{hv}k{}_d{dk}x{dv}_r{rows}",
+            "delta_step{tokens}_h{hv}k{}_d{dk}x{dv}_r{rows}",
             c.k_heads
         ));
         let ps = b.param("state", DType::F32, &[hv * dv, dk], true);
-        let pq = b.param("q", DType::F32, &[hv, dk], false);
-        let pk = b.param("k", DType::F32, &[hv, dk], false);
-        // Flat `[v_heads * v_dim]`: a tile of state rows takes a
-        // contiguous slice of each, whatever head it falls in.
-        let pv = b.param("v", DType::F32, &[c.v_width], false);
-        let pg = b.param("g", DType::F32, &[hv * dv], false);
-        let pb = b.param("beta", DType::F32, &[hv * dv], false);
-        let py = b.param("y", DType::F32, &[hv * dv], true);
+        let pq = b.param("q", DType::F32, &[tokens * hv, dk], false);
+        let pk = b.param("k", DType::F32, &[tokens * hv, dk], false);
+        let pv = b.param("v", DType::F32, &[tokens * c.v_width], false);
+        let pg = b.param("g", DType::F32, &[tokens * gates], false);
+        let pb = b.param("beta", DType::F32, &[tokens * gates], false);
+        let py = b.param("y", DType::F32, &[tokens * gates], true);
         let chunk = b.grid(dv / rows);
         let head = b.grid2(hv);
 
         let tile = reg(&[rows, dk]);
         let vecr = reg(&[rows]);
         let vecc = reg(&[1, dk]);
-        // Row `head * dv + chunk * rows` of the state, and of the gates.
+        // This instance's rows, within one token's worth of gates.
         let first = IdxExpr::scaled(head, dv, 0).plus(chunk, rows);
         let state_at = View {
             param: ps,
             offset: vec![first.clone(), IdxExpr::lit(0)],
             shape: vec![rows, dk],
         };
-        let kv_row = |param| View {
-            param,
-            offset: vec![IdxExpr::scaled(head, 1, 0), IdxExpr::lit(0)],
-            shape: vec![1, dk],
-        };
-        let gate = |param| View {
-            param,
-            offset: vec![first.clone()],
-            shape: vec![rows],
-        };
-        // `v` alone may sit at an offset inside a wider buffer.
-        let v_at = View {
-            param: pv,
-            offset: vec![first.clone().shift(c.v_base)],
-            shape: vec![rows],
-        };
+        let s0 = b.op("s", Op::Load(state_at.clone(), tile.clone()));
+        let out = b.for_range(
+            0,
+            tokens,
+            vec![s0],
+            vec![Ty::Tile(tile.clone())],
+            |b, tok, p| {
+                // Token `tok`'s slice of every per-token parameter.
+                let kv_row = |param| View {
+                    param,
+                    offset: vec![IdxExpr::scaled(tok, hv, 0).plus(head, 1), IdxExpr::lit(0)],
+                    shape: vec![1, dk],
+                };
+                let gate = |param| View {
+                    param,
+                    offset: vec![first.clone().plus(tok, gates)],
+                    shape: vec![rows],
+                };
+                let s = p[0];
+                let g = b.op("g", Op::Load(gate(pg), vecr.clone()));
+                let s = b.op("s", Op::Binary(BinOp::Mul, Move(s), Move(g)));
 
-        let s = b.op("s", Op::Load(state_at.clone(), tile.clone()));
-        let g = b.op("g", Op::Load(gate(pg), vecr.clone()));
-        let s = b.op("s", Op::Binary(BinOp::Mul, Move(s), Move(g)));
+                let k = b.op("k", Op::Load(kv_row(pk), vecc.clone()));
+                let sk = b.op("sk", Op::Binary(BinOp::Mul, Borrow(s), Borrow(k)));
+                let sk = b.op("sk", Op::RowReduce(Reduce::Sum, Move(sk)));
 
-        // `S k`: the key broadcast along the rows, summed over the state's
-        // columns.
-        let k = b.op("k", Op::Load(kv_row(pk), vecc.clone()));
-        let sk = b.op("sk", Op::Binary(BinOp::Mul, Borrow(s), Borrow(k)));
-        let sk = b.op("sk", Op::RowReduce(Reduce::Sum, Move(sk)));
+                let v = b.op(
+                    "v",
+                    Op::Load(
+                        View {
+                            param: pv,
+                            offset: vec![first.clone().shift(c.v_base).plus(tok, c.v_width)],
+                            shape: vec![rows],
+                        },
+                        vecr.clone(),
+                    ),
+                );
+                let d = b.op("d", Op::Binary(BinOp::Sub, Move(v), Move(sk)));
+                let beta = b.op("beta", Op::Load(gate(pb), vecr.clone()));
+                let d = b.op("d", Op::Binary(BinOp::Mul, Move(d), Move(beta)));
+                let ones = b.op("ones", Op::Fill(tile.clone(), 1.0));
+                let kb = b.op("kb", Op::Binary(BinOp::Mul, Move(ones), Move(k)));
+                let upd = b.op("upd", Op::Binary(BinOp::Mul, Move(kb), Move(d)));
+                let s = b.op("s", Op::Binary(BinOp::Add, Move(s), Move(upd)));
 
-        // `δ = (v - S k) β`, then the rank-one update `S += k δᵀ`.
-        let v = b.op("v", Op::Load(v_at, vecr.clone()));
-        let d = b.op("d", Op::Binary(BinOp::Sub, Move(v), Move(sk)));
-        let beta = b.op("beta", Op::Load(gate(pb), vecr));
-        let d = b.op("d", Op::Binary(BinOp::Mul, Move(d), Move(beta)));
-        let ones = b.op("ones", Op::Fill(tile.clone(), 1.0));
-        let kb = b.op("kb", Op::Binary(BinOp::Mul, Move(ones), Move(k)));
-        let upd = b.op("upd", Op::Binary(BinOp::Mul, Move(kb), Move(d)));
-        let s = b.op("s", Op::Binary(BinOp::Add, Move(s), Move(upd)));
-
-        // `y = S q` with the updated state, which is what is stored.
-        let q = b.op("q", Op::Load(kv_row(pq), vecc));
-        let y = b.op("y", Op::Binary(BinOp::Mul, Borrow(s), Move(q)));
-        let y = b.op("y", Op::RowReduce(Reduce::Sum, Move(y)));
-        b.effect(Op::Store(
-            Move(y),
-            View {
-                param: py,
-                offset: vec![first],
-                shape: vec![rows],
+                let q = b.op("q", Op::Load(kv_row(pq), vecc.clone()));
+                let y = b.op("y", Op::Binary(BinOp::Mul, Borrow(s), Move(q)));
+                let y = b.op("y", Op::RowReduce(Reduce::Sum, Move(y)));
+                b.effect(Op::Store(Move(y), gate(py)));
+                vec![s]
             },
-        ));
-        b.effect(Op::Store(Move(s), state_at));
+        );
+        b.effect(Op::Store(Move(out[0]), state_at));
         Ok(b.finish())
     }
 }

@@ -353,3 +353,74 @@ fn gated_norm_and_dense_matvec_match_their_formulas() {
         );
     }
 }
+
+/// A batch of tokens through the delta rule must land exactly where the
+/// same tokens land one at a time: the recurrence is sequential, and the
+/// batch only saves reading the state once.
+#[test]
+fn a_batch_of_delta_steps_equals_the_same_steps_one_by_one() {
+    let tokens = 3usize;
+    let c = DeltaNet::packed(6, 2, 32, 16, 4);
+    let (hv, dk, dv) = (c.v_heads, c.k_dim, c.v_dim);
+    let gates = hv * dv;
+    let one = c.build_step().unwrap();
+    let many = c.build_steps(tokens).unwrap();
+    check(&many, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+
+    let q = pattern(tokens * hv * dk, 100);
+    let k = pattern(tokens * hv * dk, 101);
+    let v = pattern(tokens * gates, 102);
+    let g: Vec<f32> = pattern(tokens * gates, 103)
+        .iter()
+        .map(|x| 0.5 + 0.5 * x.abs().min(1.0))
+        .collect();
+    let beta: Vec<f32> = pattern(tokens * gates, 104)
+        .iter()
+        .map(|x| 0.5 * (1.0 + x.abs().min(1.0)))
+        .collect();
+    let start = pattern(hv * dv * dk, 105);
+
+    // The batch.
+    let mut batch = vec![
+        Tensor::new(DType::F32, &[hv * dv, dk], &start),
+        Tensor::new(DType::F32, &[tokens * hv, dk], &q),
+        Tensor::new(DType::F32, &[tokens * hv, dk], &k),
+        Tensor::new(DType::F32, &[tokens * gates], &v),
+        Tensor::new(DType::F32, &[tokens * gates], &g),
+        Tensor::new(DType::F32, &[tokens * gates], &beta),
+        Tensor::zeros(DType::F32, &[tokens * gates]),
+    ];
+    run(&many, &mut batch).expect("batch");
+
+    // The same tokens, one at a time.
+    let mut state = start.clone();
+    for t in 0..tokens {
+        let slice = |v: &[f32], n: usize| v[t * n..(t + 1) * n].to_vec();
+        let mut step = vec![
+            Tensor::new(DType::F32, &[hv * dv, dk], &state),
+            Tensor::new(DType::F32, &[hv, dk], &slice(&q, hv * dk)),
+            Tensor::new(DType::F32, &[hv, dk], &slice(&k, hv * dk)),
+            Tensor::new(DType::F32, &[gates], &slice(&v, gates)),
+            Tensor::new(DType::F32, &[gates], &slice(&g, gates)),
+            Tensor::new(DType::F32, &[gates], &slice(&beta, gates)),
+            Tensor::zeros(DType::F32, &[gates]),
+        ];
+        run(&one, &mut step).expect("step");
+        state = step[0].data.clone();
+        let want = &step[6].data;
+        let got = &batch[6].data[t * gates..(t + 1) * gates];
+        let d = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(d == 0.0, "token {t}: batch output differs by {d:e}");
+    }
+    let d = batch[0]
+        .data
+        .iter()
+        .zip(&state)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(d == 0.0, "the state after the batch differs by {d:e}");
+}

@@ -536,6 +536,43 @@ fn delta_state_matches_the_interpreter() {
     for out in [6, 0] {
         same(&gpu, &prog, t.clone(), &[], out, 128);
     }
+
+    // A batch of four, which carries the state in registers across the
+    // tokens instead of re-reading it.
+    let tokens = 4;
+    let batch = c.build_steps(tokens).unwrap();
+    let bt = vec![
+        Tensor::new(DType::F32, &[hv * dv, dk], &pattern(hv * dv * dk, 30)),
+        Tensor::new(
+            DType::F32,
+            &[tokens * hv, dk],
+            &pattern(tokens * hv * dk, 36),
+        ),
+        Tensor::new(
+            DType::F32,
+            &[tokens * hv, dk],
+            &pattern(tokens * hv * dk, 37),
+        ),
+        Tensor::new(
+            DType::F32,
+            &[tokens * hv * dv],
+            &pattern(tokens * hv * dv, 38),
+        ),
+        Tensor::new(
+            DType::F32,
+            &[tokens * hv * dv],
+            &gates(39, 0.5, 1.0).repeat(tokens),
+        ),
+        Tensor::new(
+            DType::F32,
+            &[tokens * hv * dv],
+            &gates(40, 0.1, 0.9).repeat(tokens),
+        ),
+        Tensor::zeros(DType::F32, &[tokens * hv * dv]),
+    ];
+    for out in [6, 0] {
+        same(&gpu, &batch, bt.clone(), &[], out, 128);
+    }
 }
 
 /// NVFP4 (Qwen3.5's MLX weights): E2M1 codes two per byte, an FP8 E4M3
