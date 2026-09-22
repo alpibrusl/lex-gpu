@@ -343,7 +343,7 @@ impl FlashDecode {
             Ty::Array(m_ty, c.n_qb()),
             Ty::Array(acc_ty, c.n_qb()),
         ];
-        let kv = TileTy::new(c.dtype, &[c.bk, c.d], Space::Threadgroup);
+        let kv = TileTy::new(c.dtype, &[c.bk, c.d], c.kv_space);
         let out = b.for_range_dyn(0, cap / c.bk, nkb, vec![ms, ls, accs], carry, |b, i, p| {
             let at = IdxExpr::scaled(i, c.bk, 0).plus(pid, cap);
             let k = b.op("k", Op::Load(rows(pk, at.clone(), c.bk, c.d), kv.clone()));
@@ -420,7 +420,7 @@ impl FlashDecode {
             Ty::Array(m_ty, tokens),
             Ty::Array(acc_ty, tokens),
         ];
-        let kv = TileTy::new(c.dtype, &[c.bk, c.d], Space::Threadgroup);
+        let kv = TileTy::new(c.dtype, &[c.bk, c.d], c.kv_space);
         let limit = move |qb: Var| IdxExpr::lit(1).plus(pos0, 1).plus(qb, 1);
         let out = b.for_range_dyn(0, cap / c.bk, nkb, vec![ms, ls, accs], carry, |b, i, p| {
             let at = IdxExpr::scaled(i, c.bk, 0).plus(pid, cap);
@@ -502,7 +502,7 @@ impl FlashDecode {
             Ty::Array(m_ty.clone(), 1),
             Ty::Array(acc_ty.clone(), 1),
         ];
-        let kv = TileTy::new(c.dtype, &[c.bk, c.d], Space::Threadgroup);
+        let kv = TileTy::new(c.dtype, &[c.bk, c.d], c.kv_space);
         let out = b.for_range(0, bps, vec![ms, ls, accs], carry, |b, i, p| {
             // Block `split * bps + i` of this head.
             let first = IdxExpr::scaled(i, c.bk, 0).plus(split, bps * c.bk);
