@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  # Trunk only. Branch pushes are covered by the pull_request trigger, so
+  # listing "**" here would run every PR commit twice -- including a macOS
+  # runner, which is the expensive half.
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes whatever was still running for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Everything above the device boundary: IR, planner, MSL emitter, reference
+  # interpreter. No Metal toolchain involved, so it runs anywhere.
+  frontend:
+    name: frontend (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets
+      - run: cargo test --workspace
+      - name: emitter produces MSL
+        run: cargo run -q -p tile-bench -- --emit
+
+  # The only job that compiles tile-metal. It catches metal-rs API drift
+  # without anyone having to be sitting at a Mac.
+  metal:
+    name: metal backend (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      # Hosted runners expose a paravirtualised Metal device, which is enough to
+      # compile the MSL, dispatch it and check the result against the reference
+      # -- so this really does validate the emitted kernel on a GPU, every
+      # commit. Its *bandwidth* numbers are meaningless (a VM adapter reaches a
+      # fraction of the silicon's), and the harness says so itself rather than
+      # letting a green run pass for P0's exit test.
+      #
+      # continue-on-error because a runner without any Metal device must not be
+      # reported as a red build.
+      - name: kernel smoke test on a GPU (perf numbers not meaningful here)
+        continue-on-error: true
+        run: cargo run --release -p tile-bench -- --mib 64 --rows 2048 --iters 20

@@ -1,0 +1,10 @@
+[package]
+name = "tile-msl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Metal Shading Language emitter for the tile IR."
+
+[dependencies]
+tile-ir = { workspace = true }
