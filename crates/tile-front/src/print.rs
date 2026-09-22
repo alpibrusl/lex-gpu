@@ -15,6 +15,9 @@ pub fn program(p: &Program) -> String {
         })
         .collect();
     let _ = writeln!(out, "kernel {}({}) {{", p.name, params.join(", "));
+    if let Some(pid) = p.pid {
+        let _ = writeln!(out, "  grid {} in 0..{}", var(p, pid), p.grid);
+    }
     block(p, &p.body, 1, &mut out);
     out.push_str("}\n");
     out

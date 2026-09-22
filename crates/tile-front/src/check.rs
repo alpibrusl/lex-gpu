@@ -137,6 +137,14 @@ pub fn check(prog: &Program, target: &Target) -> Result<Report, Vec<Diag>> {
         report: Report::default(),
         diags: vec![],
     };
+    let mut top = vec![];
+    if let Some(pid) = prog.pid {
+        if prog.grid == 0 {
+            c.err(Kind::Shape, "a grid needs at least one instance".into());
+        }
+        c.define(pid, Ty::Index, &mut top);
+        c.ranges.insert(pid, Some((0, prog.grid as i64 - 1)));
+    }
     c.block(&prog.body);
     let peak = c.report.peak_threadgroup_bytes;
     if peak > target.max_threadgroup_bytes {

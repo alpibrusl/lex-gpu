@@ -10,6 +10,8 @@
 //! is what lets the golden tests run on any host — including a Linux CI box
 //! with no Metal toolchain anywhere near it.
 
+pub mod program;
+
 use std::fmt::Write as _;
 
 use tile_ir::{DType, Kernel, Op, Plan, Target};

@@ -13,12 +13,15 @@ there is in [`docs/roadmap.md`](docs/roadmap.md).
 | --- | --- | --- |
 | **P0** Spine | closed | RMSNorm at 98.1% of the copy ceiling (463.6 GB/s) on an M4 Max, matching the reference. [`docs/P0.md`](docs/P0.md) |
 | **P1** Types | exit test met in the interpreter | Linear tiles, effect-typed copies and barrier-synchronised pipes check a flash-attention decode loop: plain, double-buffered, and warp-specialised for Hopper. All variants match PyTorch. [`docs/P1.md`](docs/P1.md) |
-| P2 Metal, correct | next | Full op set, int4, paged KV, Llama-3-8B tokens. |
+| **P2** Metal, correct | in progress | Typed kernels now lower to MSL and run on the GPU: flash decode matches PyTorch on the M4 Max. Next: the rest of the Llama op set, int4, paged KV. [`docs/P2.md`](docs/P2.md) |
 
-Two things are true at once, and it is worth being precise about which is
-which. The **Metal kernels** (copy, RMSNorm) run on the GPU and are benchmarked
-below. The **typed kernels** (flash-attention decode) are checked and run in
-the reference interpreter; nothing lowers them to a GPU yet — that is P2.
+What runs where:
+- **Copy and RMSNorm** are hand-planned P0 kernels. They run on the GPU at
+  parity with PyTorch.
+- **Flash-attention decode** is a typed `tile-front` program. It is checked,
+  runs in the interpreter, and is lowered to MSL to run on the GPU. It is
+  correct there, but not fast yet: 6–21% of PyTorch's SDPA. P2 lowers for
+  correctness, and speed is P3's job. The numbers are below, not hidden.
 
 ## Examples
 
@@ -65,15 +68,27 @@ copy_f32                      433.8       437.2         0.99x
 rmsnorm_f32                   422.7       433.3         0.98x
 rmsnorm_f32 (eager)           422.7        67.3         6.28x
 
-copy_f16                      444.9       439.4         1.01x
-rmsnorm_f16                   446.2       438.5         1.02x
-rmsnorm_f16 (eager)           446.2        27.3        16.34x
+copy_f16                      453.9       445.2         1.02x
+rmsnorm_f16                   444.5       452.4         0.98x
+rmsnorm_f16 (eager)           444.5        27.4        16.24x
+flash_decode_f16               23.4       379.5         0.06x
+flash_decode_f16 (gqa)         23.4        12.5         1.88x
 ```
 
-`rmsnorm` is PyTorch's fused `F.rms_norm`: parity is the expected result for a
-bandwidth-bound op, and it is the one that matters. `(eager)` is the textbook
-expression most model code runs (upcast, square, mean, rsqrt, multiply, one
-kernel each). Expect a few percent of run-to-run noise either way.
+How to read the rows:
+- **`rmsnorm`** is PyTorch's fused `F.rms_norm`. Parity is the expected result
+  for a bandwidth-bound op, and it is the comparison that matters.
+- **`(eager)`** is the textbook expression most model code runs: upcast,
+  square, mean, rsqrt and multiply, one kernel each.
+- **`flash_decode_f16`** uses Llama-3-8B's decode shape (batch 4, seq 4096; set
+  with `--batch` / `--seq`) and compares against SDPA on the same grouped
+  layout. That is the fair comparison, and tile loses it by about 16× for now:
+  one threadgroup per KV head, serial K/V streaming, conservative barriers.
+  [`docs/P2.md`](docs/P2.md) says what P3 changes.
+- **`flash_decode_f16 (gqa)`** is SDPA with `enable_gqa=True`. It is slower on
+  MPS, so it would flatter tile. It is shown so nobody quotes it by mistake.
+
+Expect a few percent of run-to-run noise either way.
 
 ### 3. Flash-attention decode vs PyTorch (any host)
 
@@ -121,18 +136,47 @@ the same xorshift pattern the Rust side uses, and writes only SDPA's output:
 python3 scripts/flash_decode_golden.py
 ```
 
-### 4. Tests (any host, including Linux CI)
+### 4. Flash decode on the GPU (Mac only)
+
+```sh
+cargo run --release -p tile-bench -- --flash    # --batch, --seq, --emit
+```
+
+```text
+flash decode: 32 threadgroups x 128 threads, 18432 B threadgroup, 67.2 MB per step
+
+device : Apple M4 Max
+shape  : batch 4 x 8 kv heads x 4 q heads, head dim 128, seq 4096, f16
+kernel : 32 threadgroups x 128 threads, 18432 B threadgroup (16384 tiles + 2048 scratch), 34 barrier sites
+
+kernel              ideal bytes         time       GB/s    % of copy
+copy_f16               268.4 MB     0.574 ms      467.6       100.0%
+flash_decode_f16        67.2 MB     2.864 ms       23.5         5.0%
+
+correct : max rel err 8.21e-6 vs f64 reference (tolerance 1e-4)  PASS
+```
+
+The kernel is the same `tile-front` flash-decode program as example 3, with a
+grid of one instance per (sequence, KV head), lowered by
+`tile_msl::program::lower`. `--emit` prints the MSL, and
+`cargo test -p tile-metal --test flash_gpu` checks it against PyTorch on the
+GPU.
+
+### 5. Tests (any host, including Linux CI)
 
 ```sh
 cargo test --workspace
 ```
 
-This covers the IR, planner, emitter goldens and reference, plus the tile-front
-suites:
-- `flash`: schedules × targets, against PyTorch;
-- `roles`: warp specialisation, run under many thread interleavings;
-- `linearity`: every checker rule rejecting the bug it exists for, one
-  diagnostic each.
+This covers the IR, planner, emitter goldens (the lowered flash kernel
+included) and reference, plus these suites:
+- tile-front `flash`: schedules × targets, against PyTorch;
+- tile-front `roles`: warp specialisation, run under many thread
+  interleavings;
+- tile-front `linearity`: every checker rule rejecting the bug it exists for,
+  one diagnostic each;
+- tile-metal `flash_gpu`: the lowered kernel on the GPU, against PyTorch.
+  This one needs macOS; CI's paravirtualised device is enough.
 
 ## Layering
 
@@ -152,9 +196,9 @@ in its smallest possible form.
 | --- | --- | --- |
 | `tile-ir` | Tile IR, target table (Apple, Hopper, CDNA3), planner, CPU reference | yes |
 | `tile-front` | Typed tile programs: linearity, effect and pipe-protocol checker; concurrent reference interpreter | yes |
-| `tile-msl` | MSL text emission + golden files | yes |
+| `tile-msl` | MSL emission for P0 kernels; lowering of `tile-front` programs; golden files | yes |
 | `tile-metal` | Compile, allocate, dispatch, time | **no** |
-| `tile-bench` | P0 harness: emit, verify, measure | yes (device path gated) |
+| `tile-bench` | Harness: emit, verify, measure (`--flash` for decode attention) | yes (device path gated) |
 
 That boundary is load-bearing. Everything except device dispatch is ordinary
 Rust with tests, so the compiler can be developed anywhere and only the numbers
@@ -177,7 +221,9 @@ Read the diff before committing it.
 
 - **Layouts in the type:** no swizzle or MMA-fragment layouts are checked yet.
 - **Schedule language:** schedules are Rust builder parameters for now.
-- **Lowering typed kernels to a GPU:** the P2 work.
+- **Fast lowering:** simdgroup matrices, split-K decode and minimal barriers
+  are P3.
+- **The rest of the Llama op set:** int4, paged KV and sampling (P2).
 - **Other parts of the design:** quantised formats, a graph compiler, MLIR.
 
 [`docs/P1.md`](docs/P1.md) lists exactly what the type system does and does not

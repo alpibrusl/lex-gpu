@@ -14,6 +14,7 @@ use tile_ir::DType;
 use tile_ir::{Kernel, Target, plan, reference};
 
 mod args;
+mod flash;
 use args::Args;
 
 #[cfg(target_os = "macos")]
@@ -32,6 +33,11 @@ fn main() -> ExitCode {
     };
 
     let target = Target::apple_m_series();
+
+    if args.flash {
+        return run_flash(&args, &target);
+    }
+
     let copy = Kernel::copy(args.dtype, args.copy_elems());
     let norm = Kernel::rmsnorm(args.dtype, args.rows, args.cols, args.eps);
 
@@ -62,6 +68,36 @@ fn main() -> ExitCode {
     }
 
     run_device(&args, &target)
+}
+
+fn run_flash(args: &Args, target: &Target) -> ExitCode {
+    let (cfg, low) = match flash::lowered(args, target) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if args.emit {
+        print!("{}", low.source);
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "flash decode: {} threadgroups x {} threads, {} B threadgroup, {:.1} MB per step",
+        low.grid,
+        low.threads,
+        low.threadgroup_bytes,
+        flash::ideal_bytes(&cfg) as f64 / 1e6
+    );
+    #[cfg(target_os = "macos")]
+    {
+        flash::run(args, target)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("checked and lowered; this host has no Metal device to run it on.");
+        ExitCode::SUCCESS
+    }
 }
 
 /// Sanity-check the reference against a case with a known closed form, so that

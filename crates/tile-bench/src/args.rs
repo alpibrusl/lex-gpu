@@ -14,6 +14,10 @@ pub struct Args {
     pub iters: usize,
     pub repeats: usize,
     pub emit: bool,
+    /// Benchmark flash-attention decode instead of copy/rmsnorm.
+    pub flash: bool,
+    pub batch: usize,
+    pub seq: usize,
 }
 
 impl Default for Args {
@@ -29,6 +33,9 @@ impl Default for Args {
             iters: 50,
             repeats: 5,
             emit: false,
+            flash: false,
+            batch: 4,
+            seq: 4096,
         }
     }
 }
@@ -53,6 +60,9 @@ usage: tile-bench [options]
   --iters <n>         dispatches per timed batch       [{}]
   --repeats <n>       timed batches, best is kept      [{}]
   --emit              print the generated MSL and exit
+  --flash             flash-attention decode instead (Llama-3-8B shape)
+  --batch <n>         flash: sequences                  [{}]
+  --seq <n>           flash: cached positions per seq   [{}]
   -h, --help          this text
 ",
             d.dtype.suffix(),
@@ -62,6 +72,8 @@ usage: tile-bench [options]
             d.eps,
             d.iters,
             d.repeats,
+            d.batch,
+            d.seq,
         )
     }
 
@@ -75,6 +87,9 @@ usage: tile-bench [options]
                     return Ok(None);
                 }
                 "--emit" => a.emit = true,
+                "--flash" => a.flash = true,
+                "--batch" => a.batch = num(&mut it, "--batch")?,
+                "--seq" => a.seq = num(&mut it, "--seq")?,
                 "--dtype" => {
                     a.dtype = match value(&mut it, "--dtype")?.as_str() {
                         "f32" => DType::F32,
@@ -106,6 +121,9 @@ usage: tile-bench [options]
         }
         if a.rows == 0 || a.cols == 0 {
             return Err("--rows and --cols must be at least 1".into());
+        }
+        if a.batch == 0 || a.seq == 0 || !a.seq.is_multiple_of(16) {
+            return Err("--batch must be at least 1 and --seq a positive multiple of 16".into());
         }
         if a.iters == 0 || a.repeats == 0 {
             return Err("--iters and --repeats must be at least 1".into());

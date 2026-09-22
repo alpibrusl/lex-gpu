@@ -40,6 +40,7 @@ fn hopper_ws() -> FlashDecode {
         dtype: DType::F16,
         kv_space: Space::Threadgroup,
         consumers: 2,
+        heads: 1,
     }
 }
 

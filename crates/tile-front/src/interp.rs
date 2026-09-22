@@ -178,7 +178,14 @@ pub fn run_with(prog: &Program, globals: &mut [Tensor], opts: RunOptions) -> Res
         shared: &shared,
         env: HashMap::new(),
     };
-    it.block(&prog.body)?;
+    // Instances are independent by construction (disjoint writes are the
+    // program's contract), so running them one after another is faithful.
+    for g in 0..prog.grid {
+        if let Some(pid) = prog.pid {
+            it.env.insert(pid, Val::Index(g as i64));
+        }
+        it.block(&prog.body)?;
+    }
     globals.clone_from_slice(&shared.globals.into_inner().expect("globals lock"));
     Ok(())
 }
