@@ -207,6 +207,28 @@ impl BinOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Rsqrt,
+    Sigmoid,
+}
+
+impl UnOp {
+    pub fn apply(self, x: f32) -> f32 {
+        match self {
+            UnOp::Rsqrt => 1.0 / x.sqrt(),
+            UnOp::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            UnOp::Rsqrt => "rsqrt",
+            UnOp::Sigmoid => "sigmoid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reduce {
     Max,
     Sum,
@@ -238,9 +260,17 @@ pub enum Op {
     MatMulNT(Arg, Arg, DType),
     /// `[m,k] x [k,n] -> [m,n]`, accumulating in `acc`.
     MatMul(Arg, Arg, DType),
-    /// Elementwise; `b` may be a row vector `[m]` broadcast over `[m,n]`.
+    /// Elementwise. `b` may also be `[m]`, one value per row of an `[m,n]`
+    /// `a`, or `[1,n]`, one row repeated for every row of `a`.
     Binary(BinOp, Arg, Arg),
     Exp(Arg),
+    Unary(UnOp, Arg),
+    /// Swap adjacent elements: `out[2i] = a[2i+1]`, `out[2i+1] = a[2i]`.
+    /// With a sign-folded sine table this is RoPE's rotation of pairs.
+    SwapPairs(Arg),
+    /// `q[r,c] * s[r, c / group]` in f32: quantised values meet their
+    /// scales. The only way to compute with an `I8` tile.
+    Dequant(Arg, Arg, usize),
     Scale(Arg, f32),
     /// `[m,n] -> [m]`.
     RowReduce(Reduce, Arg),

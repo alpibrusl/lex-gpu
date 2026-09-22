@@ -57,6 +57,7 @@ pub fn round(dt: DType, x: f32) -> f32 {
     match dt {
         DType::F32 => x,
         DType::F16 => f16::from_f32(x).to_f32(),
+        DType::I8 => x.round().clamp(-128.0, 127.0),
     }
 }
 
@@ -446,14 +447,22 @@ impl Interp<'_> {
             }
             Op::Binary(bop, a, b) => {
                 let (ta, tb) = (self.arg(*a)?, self.arg(*b)?);
-                let row = ta.ty.shape.len() == 2 && tb.ty.shape == [ta.ty.shape[0]];
-                let cols = if row { ta.ty.shape[1] } else { 1 };
+                let two = ta.ty.shape.len() == 2;
+                let row = two && tb.ty.shape == [ta.ty.shape[0]];
+                let col = two && !row && tb.ty.shape == [1, ta.ty.shape[1]];
+                let cols = if two { ta.ty.shape[1] } else { 1 };
                 let out = ta
                     .data
                     .iter()
                     .enumerate()
                     .map(|(i, &x)| {
-                        let y = if row { tb.data[i / cols] } else { tb.data[i] };
+                        let y = if row {
+                            tb.data[i / cols]
+                        } else if col {
+                            tb.data[i % cols]
+                        } else {
+                            tb.data[i]
+                        };
                         bop.apply(x, y)
                     })
                     .collect();
@@ -463,6 +472,27 @@ impl Interp<'_> {
                 let t = self.arg(*a)?;
                 let out = t.data.iter().map(|x| x.exp()).collect();
                 Some(Val::Tile(self.fresh(t.ty.dtype, &t.ty.shape, out)))
+            }
+            Op::Unary(u, a) => {
+                let t = self.arg(*a)?;
+                let out = t.data.iter().map(|&x| u.apply(x)).collect();
+                Some(Val::Tile(self.fresh(t.ty.dtype, &t.ty.shape, out)))
+            }
+            Op::SwapPairs(a) => {
+                let t = self.arg(*a)?;
+                let out = (0..t.data.len()).map(|i| t.data[i ^ 1]).collect();
+                Some(Val::Tile(self.fresh(t.ty.dtype, &t.ty.shape, out)))
+            }
+            Op::Dequant(q, s, group) => {
+                let (tq, ts) = (self.arg(*q)?, self.arg(*s)?);
+                let c = tq.ty.shape[1];
+                let out = tq
+                    .data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| x * ts.data[(i / c) * (c / group) + (i % c) / group])
+                    .collect();
+                Some(Val::Tile(self.fresh(DType::F32, &tq.ty.shape, out)))
             }
             Op::Scale(a, s) => {
                 let t = self.arg(*a)?;

@@ -41,6 +41,7 @@ fn schedule(bq: usize, bk: usize, stages: usize) -> FlashDecode {
         kv_space: Space::Threadgroup,
         consumers: 0,
         heads: 1,
+        kv_cap: 0,
     }
 }
 

@@ -167,6 +167,7 @@ fn run_device(args: &Args, target: &Target) -> ExitCode {
     let correct = match args.dtype {
         DType::F32 => verify_f32(&gpu, args, target),
         DType::F16 => verify_f16(&gpu, args, target),
+        DType::I8 => unreachable!("--dtype only parses f32 and f16"),
     };
     let correct = match correct {
         Ok(c) => c,
@@ -383,6 +384,7 @@ fn measure(
             gpu.zeroed::<half::f16>(n),
             gpu.zeroed::<half::f16>(args.rows * args.cols),
         ),
+        DType::I8 => unreachable!("--dtype only parses f32 and f16"),
     };
 
     let copy_s = gpu.time(&copy_pipe, &[&cx, &cy], args.iters, args.repeats);
@@ -436,5 +438,6 @@ fn filled(gpu: &tile_metal::Gpu, dtype: DType, len: usize, seed: u32) -> tile_me
             reference::fill_pattern_f16(&mut host, seed);
             gpu.upload(&host)
         }
+        DType::I8 => unreachable!("--dtype only parses f32 and f16"),
     }
 }

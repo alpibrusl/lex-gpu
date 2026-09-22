@@ -487,6 +487,19 @@ impl Checker<'_> {
         Some((lo, hi))
     }
 
+    /// Arithmetic needs real numbers: an `I8` tile holds quantised values
+    /// that mean nothing without their scales.
+    fn numeric(&mut self, t: &TileTy, what: &str) -> bool {
+        if t.dtype == DType::I8 {
+            self.err(
+                Kind::Type,
+                format!("{what} is quantised (I8); `dequant` it with its scales first"),
+            );
+            return false;
+        }
+        true
+    }
+
     fn not_narrower(&mut self, from: DType, to: DType, what: &str) -> bool {
         if to.size_bytes() < from.size_bytes() {
             self.err(
@@ -612,6 +625,9 @@ impl Checker<'_> {
                 let tys = self.args(&[*a, *b])?;
                 let ta = self.tile(tys[0].clone(), "matmul lhs")?;
                 let tb = self.tile(tys[1].clone(), "matmul rhs")?;
+                if !self.numeric(&ta, "matmul lhs") || !self.numeric(&tb, "matmul rhs") {
+                    return None;
+                }
                 if ta.shape.len() != 2 || tb.shape.len() != 2 {
                     self.err(Kind::Shape, "matmul operands must be 2-d".into());
                     return None;
@@ -644,8 +660,12 @@ impl Checker<'_> {
                 let tys = self.args(&[*a, *b])?;
                 let ta = self.tile(tys[0].clone(), "lhs")?;
                 let tb = self.tile(tys[1].clone(), "rhs")?;
+                if !self.numeric(&ta, "lhs") || !self.numeric(&tb, "rhs") {
+                    return None;
+                }
                 let row_bcast = ta.shape.len() == 2 && tb.shape == [ta.shape[0]];
-                if ta.shape != tb.shape && !row_bcast {
+                let col_bcast = ta.shape.len() == 2 && tb.shape == [1, ta.shape[1]];
+                if ta.shape != tb.shape && !row_bcast && !col_bcast {
                     self.err(
                         Kind::Shape,
                         format!("{} of {:?} and {:?}", bop.name(), ta.shape, tb.shape),
@@ -661,14 +681,62 @@ impl Checker<'_> {
                 }
                 Some(reg(ta.dtype, &ta.shape))
             }
-            Op::Exp(a) | Op::Scale(a, _) => {
+            Op::Exp(a) | Op::Scale(a, _) | Op::Unary(_, a) => {
                 let ty = self.args(&[*a])?.remove(0);
                 let t = self.tile(ty, "operand")?;
+                if !self.numeric(&t, "operand") {
+                    return None;
+                }
                 Some(reg(t.dtype, &t.shape))
+            }
+            Op::SwapPairs(a) => {
+                let ty = self.args(&[*a])?.remove(0);
+                let t = self.tile(ty, "swap_pairs operand")?;
+                if t.shape.last().is_none_or(|n| n % 2 != 0) {
+                    self.err(
+                        Kind::Shape,
+                        "swap_pairs needs an even last dimension".into(),
+                    );
+                    return None;
+                }
+                Some(reg(t.dtype, &t.shape))
+            }
+            Op::Dequant(q, s, group) => {
+                let tys = self.args(&[*q, *s])?;
+                let tq = self.tile(tys[0].clone(), "dequant values")?;
+                let ts = self.tile(tys[1].clone(), "dequant scales")?;
+                if tq.dtype != DType::I8 {
+                    self.err(
+                        Kind::Type,
+                        format!("dequant of {:?} values, not I8", tq.dtype),
+                    );
+                    return None;
+                }
+                if !self.numeric(&ts, "dequant scales") {
+                    return None;
+                }
+                let ok = tq.shape.len() == 2
+                    && *group > 0
+                    && tq.shape[1] % group == 0
+                    && ts.shape == [tq.shape[0], tq.shape[1] / group];
+                if !ok {
+                    self.err(
+                        Kind::Shape,
+                        format!(
+                            "dequant of {:?} with scales {:?} in groups of {group}",
+                            tq.shape, ts.shape
+                        ),
+                    );
+                    return None;
+                }
+                Some(reg(DType::F32, &tq.shape))
             }
             Op::RowReduce(_, a) => {
                 let ty = self.args(&[*a])?.remove(0);
                 let t = self.tile(ty, "reduce operand")?;
+                if !self.numeric(&t, "reduce operand") {
+                    return None;
+                }
                 if t.shape.len() != 2 {
                     self.err(Kind::Shape, "row reduce needs a 2-d tile".into());
                     return None;
@@ -678,6 +746,9 @@ impl Checker<'_> {
             Op::Convert(a, dt) => {
                 let ty = self.args(&[*a])?.remove(0);
                 let t = self.tile(ty, "convert operand")?;
+                if !self.numeric(&t, "convert operand") {
+                    return None;
+                }
                 Some(reg(*dt, &t.shape))
             }
             Op::Acquire(h) => {

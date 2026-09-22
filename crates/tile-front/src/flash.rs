@@ -63,6 +63,9 @@ pub struct FlashDecode {
     /// Independent KV heads (or sequences), one grid instance each. Every
     /// tensor gets a leading `heads` factor on its row dimension.
     pub heads: usize,
+    /// Rows per head in the K/V tensors: the cache capacity when attention
+    /// reads the first `seq` rows of a longer cache. 0 means `seq`.
+    pub kv_cap: usize,
 }
 
 impl FlashDecode {
@@ -72,6 +75,14 @@ impl FlashDecode {
 
     pub fn n_kb(&self) -> usize {
         self.seq / self.bk
+    }
+
+    pub fn kv_rows(&self) -> usize {
+        if self.kv_cap == 0 {
+            self.seq
+        } else {
+            self.kv_cap
+        }
     }
 
     pub fn kv_tile(&self) -> TileTy {
@@ -114,8 +125,11 @@ impl FlashDecode {
             return Err("heads must be nonzero".into());
         }
         let pq = b.param("q", c.dtype, &[c.heads * c.q_rows, c.d], false);
-        let pk = b.param("k", c.dtype, &[c.heads * c.seq, c.d], false);
-        let pv = b.param("v", c.dtype, &[c.heads * c.seq, c.d], false);
+        if c.kv_rows() < c.seq {
+            return Err(format!("kv_cap {} is shorter than seq {}", c.kv_cap, c.seq));
+        }
+        let pk = b.param("k", c.dtype, &[c.heads * c.kv_rows(), c.d], false);
+        let pv = b.param("v", c.dtype, &[c.heads * c.kv_rows(), c.d], false);
         let po = b.param("o", DType::F32, &[c.heads * c.q_rows, c.d], true);
         let pid = b.grid(c.heads);
 
@@ -140,13 +154,13 @@ impl FlashDecode {
                 let k = b.op(
                     "k",
                     Op::Load(
-                        rows(pk, (at.clone()).plus(pid, c.seq), c.bk, c.d),
+                        rows(pk, (at.clone()).plus(pid, c.kv_rows()), c.bk, c.d),
                         kv.clone(),
                     ),
                 );
                 let v = b.op(
                     "v",
-                    Op::Load(rows(pv, (at).plus(pid, c.seq), c.bk, c.d), kv.clone()),
+                    Op::Load(rows(pv, (at).plus(pid, c.kv_rows()), c.bk, c.d), kv.clone()),
                 );
                 let out = attend(
                     b,
@@ -170,7 +184,12 @@ impl FlashDecode {
             let mut inflight = vec![];
             for blk in 0..c.stages - 1 {
                 let buf = b.op(name, Op::Alloc(kv.clone()));
-                let view = rows(p, (IdxExpr::lit(blk * c.bk)).plus(pid, c.seq), c.bk, c.d);
+                let view = rows(
+                    p,
+                    (IdxExpr::lit(blk * c.bk)).plus(pid, c.kv_rows()),
+                    c.bk,
+                    c.d,
+                );
                 inflight.push(b.op(name, Op::CopyAsync(view, buf)));
             }
             let free = b.op(name, Op::Alloc(kv.clone()));
@@ -209,11 +228,14 @@ impl FlashDecode {
             let ahead = IdxExpr::scaled(i, c.bk, (s - 1) * c.bk);
             let knew = b.op(
                 "kf",
-                Op::CopyAsync(rows(pk, (ahead.clone()).plus(pid, c.seq), c.bk, c.d), kfree),
+                Op::CopyAsync(
+                    rows(pk, (ahead.clone()).plus(pid, c.kv_rows()), c.bk, c.d),
+                    kfree,
+                ),
             );
             let vnew = b.op(
                 "vf",
-                Op::CopyAsync(rows(pv, (ahead).plus(pid, c.seq), c.bk, c.d), vfree),
+                Op::CopyAsync(rows(pv, (ahead).plus(pid, c.kv_rows()), c.bk, c.d), vfree),
             );
             let mut kq: Vec<Var> = kq.iter().copied().chain([knew]).collect();
             let mut vq: Vec<Var> = vq.iter().copied().chain([vnew]).collect();
@@ -295,8 +317,8 @@ impl FlashDecode {
                     let at = IdxExpr::scaled(i, c.bk, 0);
                     let slot = b.op("slot", Op::Acquire(h));
                     let views = vec![
-                        rows(pk, (at.clone()).plus(pid, c.seq), c.bk, c.d),
-                        rows(pv, (at).plus(pid, c.seq), c.bk, c.d),
+                        rows(pk, (at.clone()).plus(pid, c.kv_rows()), c.bk, c.d),
+                        rows(pv, (at).plus(pid, c.kv_rows()), c.bk, c.d),
                     ];
                     b.effect(Op::Commit(h, views, slot));
                     vec![]

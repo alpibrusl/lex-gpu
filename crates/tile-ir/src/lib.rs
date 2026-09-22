@@ -52,6 +52,9 @@ pub type Result<T> = std::result::Result<T, TileError>;
 pub enum DType {
     F16,
     F32,
+    /// Quantised values. Never computed with directly: `dequant` pairs them
+    /// with their scales, and the checker rejects arithmetic on them.
+    I8,
 }
 
 impl DType {
@@ -59,6 +62,7 @@ impl DType {
         match self {
             DType::F16 => 2,
             DType::F32 => 4,
+            DType::I8 => 1,
         }
     }
 
@@ -67,6 +71,7 @@ impl DType {
         match self {
             DType::F16 => "half",
             DType::F32 => "float",
+            DType::I8 => "char",
         }
     }
 
@@ -75,6 +80,7 @@ impl DType {
         match self {
             DType::F16 => "half4",
             DType::F32 => "float4",
+            DType::I8 => "char4",
         }
     }
 
@@ -83,6 +89,7 @@ impl DType {
         match self {
             DType::F16 => "f16",
             DType::F32 => "f32",
+            DType::I8 => "i8",
         }
     }
 }
@@ -377,6 +384,11 @@ pub fn plan(kernel: &Kernel, target: &Target) -> Result<Plan> {
         Op::RmsNorm {
             rows, cols, eps, ..
         } => {
+            if kernel.dtype() == DType::I8 {
+                return Err(TileError::Shape(
+                    "rmsnorm of quantised I8 values is meaningless; dequantise first".into(),
+                ));
+            }
             if rows == 0 {
                 return Err(TileError::Shape("rmsnorm needs at least one row".into()));
             }

@@ -162,6 +162,26 @@ impl Gpu {
         buf
     }
 
+    /// Overwrite elements `offset..offset + data.len()` of a buffer.
+    ///
+    /// Same contract as [`Gpu::download`]: nothing may be running that reads
+    /// or writes the buffer, and `T` must be the element type the kernels use.
+    pub fn write<T: Copy>(&self, buf: &Buffer, offset: usize, data: &[T]) {
+        let end = (offset + data.len()) * std::mem::size_of::<T>();
+        assert!(
+            end as u64 <= buf.length(),
+            "write past the end of a {} B buffer",
+            buf.length()
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                buf.contents().cast::<T>().add(offset),
+                data.len(),
+            )
+        };
+    }
+
     /// Copy a buffer's contents back into host memory.
     ///
     /// # Safety contract

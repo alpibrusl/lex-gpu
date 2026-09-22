@@ -41,6 +41,7 @@ fn hopper_ws() -> FlashDecode {
         kv_space: Space::Threadgroup,
         consumers: 2,
         heads: 1,
+        kv_cap: 0,
     }
 }
 

@@ -13,22 +13,61 @@ there is in [`docs/roadmap.md`](docs/roadmap.md).
 | --- | --- | --- |
 | **P0** Spine | closed | RMSNorm at 98.1% of the copy ceiling (463.6 GB/s) on an M4 Max, matching the reference. [`docs/P0.md`](docs/P0.md) |
 | **P1** Types | exit test met in the interpreter | Linear tiles, effect-typed copies and barrier-synchronised pipes check a flash-attention decode loop: plain, double-buffered, and warp-specialised for Hopper. All variants match PyTorch. [`docs/P1.md`](docs/P1.md) |
-| **P2** Metal, correct | in progress | Typed kernels now lower to MSL and run on the GPU: flash decode matches PyTorch on the M4 Max. Next: the rest of the Llama op set, int4, paged KV. [`docs/P2.md`](docs/P2.md) |
+| **P2** Metal, correct | in progress | **Llama 3.2 1B from Ollama runs on tile kernels and matches Ollama token for token** (96/96 tokens, log-probs within 0.008). Next: Q4_K for Llama-3-8B, the actual exit test. [`docs/P2.md`](docs/P2.md) |
 
 What runs where:
 - **Copy and RMSNorm** are hand-planned P0 kernels. They run on the GPU at
   parity with PyTorch.
-- **Flash-attention decode** is a typed `tile-front` program. It is checked,
-  runs in the interpreter, and is lowered to MSL to run on the GPU. It is
-  correct there, but not fast yet: 6–21% of PyTorch's SDPA. P2 lowers for
-  correctness, and speed is P3's job. The numbers are below, not hidden.
+- **A whole Llama** (RMSNorm, Q8_0 matvec, RoPE, flash-decode attention,
+  SiLU·mul) is typed `tile-front` programs. It is checked, runs in the
+  interpreter, and is lowered to MSL to run on the GPU. It is correct there,
+  but not fast yet: 13 tok/s against Ollama's ~275 on the same model, and
+  6–21% of PyTorch's SDPA for attention alone. P2 lowers for correctness, and
+  speed is P3's job. The numbers are below, not hidden.
 
 ## Examples
 
-Rust ≥ 1.88 for everything. The PyTorch scripts need `torch` and `numpy`
-(`pip install torch numpy`); nothing in `cargo test` does.
+Rust ≥ 1.88 for everything. The Python scripts need `torch`, `numpy` and
+`tokenizers` (`pip install torch numpy tokenizers`); nothing in `cargo test`
+does.
 
-### 1. Bandwidth on the GPU (Mac only)
+### 1. A real model, against Ollama (Mac only)
+
+```sh
+ollama pull llama3.2:1b
+python3 scripts/tile_vs_ollama.py                  # add --prompt "..." --steps N
+```
+
+It tokenises each prompt the way Ollama does and greedy-decodes it with tile
+on the GPU. It asks Ollama for the same continuation, then compares every
+token and every top-5 log-probability:
+
+```text
+'The capital of France is'
+  tile   : ' Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also located in Paris. The famous'
+  24/24 tokens identical to Ollama, worst |dlogprob| 0.0028 (tolerance 0.05)  PASS
+  tile decode 13.0 tok/s on the GPU (P2: correct, not fast)
+
+'def fibonacci(n):'
+  tile   : ' \n    """\n    This function generates the first n numbers in the Fibonacci sequence.\n ...'
+  24/24 tokens identical to Ollama, worst |dlogprob| 0.0076 (tolerance 0.05)  PASS
+  ...
+```
+
+The weights are the GGUF blob in Ollama's own store, found through its
+manifest; there is no conversion step. Log-probabilities differ in the third
+decimal because llama.cpp quantises activations to 8 bits inside its Q8_0
+matmuls and tile does not. Ollama runs this model at about 275 tok/s, 21×
+tile's current speed.
+
+There are two more pieces, and neither needs Ollama running at test time:
+- `scripts/llama_ref.py` checks a float32 PyTorch reference against Ollama.
+  It writes that reference's outputs as a golden file.
+- `cargo test --release -p tile-rt --test llama_ollama` checks tile on the GPU
+  against that golden. It needs the model pulled.
+  [`docs/P2.md`](docs/P2.md) has the full chain.
+
+### 2. Bandwidth on the GPU (Mac only)
 
 ```sh
 cargo run --release -p tile-bench
@@ -50,7 +89,7 @@ exit test : rmsnorm at 96.3% of the copy ceiling (need >= 90.0%)  PASS
 move; `--help` lists them. `--emit` prints the generated MSL instead, and works
 on any host.
 
-### 2. Benchmark against PyTorch (Mac only)
+### 3. Benchmark against PyTorch (Mac only)
 
 ```sh
 python3 scripts/bench_vs_pytorch.py              # f32
@@ -90,7 +129,7 @@ How to read the rows:
 
 Expect a few percent of run-to-run noise either way.
 
-### 3. Flash-attention decode vs PyTorch (any host)
+### 4. Flash-attention decode vs PyTorch (any host)
 
 ```sh
 cargo run -p tile-front --example flash_decode
@@ -136,7 +175,7 @@ the same xorshift pattern the Rust side uses, and writes only SDPA's output:
 python3 scripts/flash_decode_golden.py
 ```
 
-### 4. Flash decode on the GPU (Mac only)
+### 5. Flash decode on the GPU (Mac only)
 
 ```sh
 cargo run --release -p tile-bench -- --flash    # --batch, --seq, --emit
@@ -156,13 +195,13 @@ flash_decode_f16        67.2 MB     2.864 ms       23.5         5.0%
 correct : max rel err 8.21e-6 vs f64 reference (tolerance 1e-4)  PASS
 ```
 
-The kernel is the same `tile-front` flash-decode program as example 3, with a
+The kernel is the same `tile-front` flash-decode program as example 4, with a
 grid of one instance per (sequence, KV head), lowered by
 `tile_msl::program::lower`. `--emit` prints the MSL, and
 `cargo test -p tile-metal --test flash_gpu` checks it against PyTorch on the
 GPU.
 
-### 5. Tests (any host, including Linux CI)
+### 6. Tests (any host, including Linux CI)
 
 ```sh
 cargo test --workspace
@@ -177,6 +216,9 @@ included) and reference, plus these suites:
   one diagnostic each;
 - tile-metal `flash_gpu`: the lowered kernel on the GPU, against PyTorch.
   This one needs macOS; CI's paravirtualised device is enough.
+- tile-rt `llama_ollama`: Llama 3.2 1B on the GPU against the
+  Ollama-checked reference. It needs macOS and the model pulled; without the
+  model it prints `SKIPPED`.
 
 ## Layering
 
@@ -199,6 +241,7 @@ in its smallest possible form.
 | `tile-msl` | MSL emission for P0 kernels; lowering of `tile-front` programs; golden files | yes |
 | `tile-metal` | Compile, allocate, dispatch, time | **no** |
 | `tile-bench` | Harness: emit, verify, measure (`--flash` for decode attention) | yes (device path gated) |
+| `tile-rt` | Runtime: GGUF reader, Q8_0 repacking, Llama decode loop over tile kernels | yes (decode loop gated) |
 
 That boundary is load-bearing. Everything except device dispatch is ordinary
 Rust with tests, so the compiler can be developed anywhere and only the numbers
@@ -223,7 +266,8 @@ Read the diff before committing it.
 - **Schedule language:** schedules are Rust builder parameters for now.
 - **Fast lowering:** simdgroup matrices, split-K decode and minimal barriers
   are P3.
-- **The rest of the Llama op set:** int4, paged KV and sampling (P2).
+- **The rest of P2:** Q4_K/Q6_K for Llama-3-8B, the embedding lookup and KV
+  append as kernels (host glue today), paged KV, and sampling beyond greedy.
 - **Other parts of the design:** quantised formats, a graph compiler, MLIR.
 
 [`docs/P1.md`](docs/P1.md) lists exactly what the type system does and does not

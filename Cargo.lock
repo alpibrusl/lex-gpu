@@ -234,6 +234,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tile-rt"
+version = "0.0.1"
+dependencies = [
+ "half",
+ "tile-front",
+ "tile-ir",
+ "tile-metal",
+ "tile-msl",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
