@@ -44,6 +44,27 @@ impl TileTy {
     }
 }
 
+/// A pipe: a ring of `stages` threadgroup slots, each holding one tile per
+/// entry of `elem`, passed from one producer role to `consumers` consumer
+/// roles. `id` names the pipe (it is the producer handle's variable).
+///
+/// Lowered to Hopper, every slot has a *full* barrier (1 arrival plus the
+/// copy's transaction bytes) and an *empty* barrier (`consumers` arrivals).
+/// Both counts are read off this type; nobody writes them down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipeTy {
+    pub id: Var,
+    pub elem: Vec<TileTy>,
+    pub stages: usize,
+    pub consumers: usize,
+}
+
+impl PipeTy {
+    pub fn slot_bytes(&self) -> usize {
+        self.elem.iter().map(TileTy::bytes).sum()
+    }
+}
+
 /// The type of an SSA value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ty {
@@ -57,6 +78,15 @@ pub enum Ty {
     /// A loop induction variable. Unrestricted; usable only in index
     /// expressions.
     Index,
+    /// The producer end of a pipe. Owned by exactly one role.
+    Producer(PipeTy),
+    /// Consumer end `k` of a pipe. Each is owned by exactly one role, which is
+    /// what makes the empty barrier's arrival count right by construction.
+    Consumer(PipeTy, usize),
+    /// An empty slot the producer has acquired: writable only by `commit`.
+    Slot(PipeTy),
+    /// Consumer `k`'s read-only share of a filled slot. Must be released.
+    Share(PipeTy, usize),
 }
 
 impl Ty {
@@ -70,6 +100,8 @@ impl Ty {
         match self {
             Ty::Tile(t) | Ty::Future(t) if t.space == Space::Threadgroup => t.bytes(),
             Ty::Array(t, n) if t.space == Space::Threadgroup => t.bytes() * n,
+            // Slots and shares live in the pipe's ring, which is budgeted
+            // once, when the pipe is created.
             _ => 0,
         }
     }
@@ -125,12 +157,14 @@ pub enum Arg {
     Borrow(Var),
     /// Read element `index` of an array for the duration of the op.
     BorrowElem(Var, Var),
+    /// Read tile `part` of a pipe share for the duration of the op.
+    BorrowPart(Var, usize),
 }
 
 impl Arg {
     pub fn var(self) -> Var {
         match self {
-            Arg::Move(v) | Arg::Borrow(v) | Arg::BorrowElem(v, _) => v,
+            Arg::Move(v) | Arg::Borrow(v) | Arg::BorrowElem(v, _) | Arg::BorrowPart(v, _) => v,
         }
     }
 }
@@ -208,6 +242,15 @@ pub enum Op {
     Convert(Arg, DType),
     /// Pack tiles into an array (all consumed).
     MakeArray(Vec<Var>),
+    /// Producer: wait until a slot is empty, and take it.
+    Acquire(Var),
+    /// Producer: copy one view per pipe element into the slot (consumed) and
+    /// arrive on its full barrier.
+    Commit(Var, Vec<View>, Var),
+    /// Consumer: wait until the next slot is full, and share it.
+    Receive(Var),
+    /// Consumer: give the share (consumed) back; arrive on the empty barrier.
+    Release(Var, Var),
 }
 
 /// A structured statement.
@@ -244,6 +287,44 @@ pub enum Stmt {
         body: Block,
         results: Vec<Var>,
     },
+    /// Split the threadgroup into concurrently running roles connected by
+    /// pipes. Handles for every pipe are created here and moved into roles
+    /// through `inputs`; each role joins by yielding its `results`.
+    Specialize {
+        pipes: Vec<PipeDecl>,
+        roles: Vec<Role>,
+    },
+}
+
+/// The handles a pipe hands out: one producer, one per consumer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PipeDecl {
+    pub ty: PipeTy,
+    pub consumers: Vec<Var>,
+}
+
+/// One role of a warp-specialised region.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Role {
+    pub name: String,
+    /// Simdgroups / warps this role occupies.
+    pub warps: usize,
+    /// Values moved in (pipe handles included), bound to `params`.
+    pub inputs: Vec<Var>,
+    pub params: Vec<Var>,
+    pub body: Block,
+    pub results: Vec<Var>,
+}
+
+/// A role under construction: see [`Builder::specialize`].
+pub struct RoleDef<'a> {
+    pub name: &'a str,
+    pub warps: usize,
+    /// Values to move in, with their types.
+    pub inputs: Vec<(Var, Ty)>,
+    pub n_results: usize,
+    #[allow(clippy::type_complexity)]
+    pub body: Box<dyn FnOnce(&mut Builder, &[Var]) -> Vec<Var> + 'a>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -390,6 +471,56 @@ impl Builder {
             results: results.clone(),
         });
         results
+    }
+
+    /// Declare a pipe. Its handles are bound by the next
+    /// [`Builder::specialize`], which must move each into exactly one role.
+    pub fn pipe(&mut self, elem: Vec<TileTy>, stages: usize, consumers: usize) -> PipeDecl {
+        let id = self.fresh("prod", None);
+        let ty = PipeTy {
+            id,
+            elem,
+            stages,
+            consumers,
+        };
+        self.declared[id.0 as usize] = Some(Ty::Producer(ty.clone()));
+        let consumers = (0..consumers)
+            .map(|k| self.fresh("cons", Some(Ty::Consumer(ty.clone(), k))))
+            .collect();
+        PipeDecl { ty, consumers }
+    }
+
+    /// Run `roles` concurrently over `pipes`. Returns each role's results.
+    pub fn specialize(&mut self, pipes: Vec<PipeDecl>, roles: Vec<RoleDef<'_>>) -> Vec<Vec<Var>> {
+        let mut built = vec![];
+        let mut outs = vec![];
+        for r in roles {
+            let (inputs, tys): (Vec<Var>, Vec<Ty>) = r.inputs.into_iter().unzip();
+            let params: Vec<Var> = tys
+                .into_iter()
+                .map(|t| self.fresh(r.name, Some(t)))
+                .collect();
+            self.stack.push(vec![]);
+            let yields = (r.body)(self, &params);
+            let stmts = self.stack.pop().expect("builder stack");
+            let results: Vec<Var> = (0..r.n_results)
+                .map(|_| self.fresh("joined", None))
+                .collect();
+            outs.push(results.clone());
+            built.push(Role {
+                name: r.name.to_string(),
+                warps: r.warps,
+                inputs,
+                params,
+                body: Block { stmts, yields },
+                results,
+            });
+        }
+        self.push(Stmt::Specialize {
+            pipes,
+            roles: built,
+        });
+        outs
     }
 
     pub fn finish(mut self) -> Program {

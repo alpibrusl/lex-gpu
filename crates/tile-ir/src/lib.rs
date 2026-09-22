@@ -139,6 +139,11 @@ pub struct Target {
     /// later by hardware (TMA / cp.async). Without it an async copy still
     /// type-checks, but lowers to a synchronous one and the checker warns.
     pub async_copy: bool,
+    /// True when one part of a threadgroup can wait on another without the
+    /// whole threadgroup meeting at a barrier (Hopper mbarrier). Producer /
+    /// consumer warp specialisation needs it; without it there is no lowering
+    /// that is not a spin loop, so the checker rejects it outright.
+    pub split_barriers: bool,
 }
 
 impl Target {
@@ -154,6 +159,7 @@ impl Target {
             max_threadgroup_bytes: 32 * 1024,
             unified_memory: true,
             async_copy: false,
+            split_barriers: false,
         }
     }
 
@@ -167,6 +173,7 @@ impl Target {
             max_threadgroup_bytes: 227 * 1024,
             unified_memory: false,
             async_copy: true,
+            split_barriers: true,
         }
     }
 
@@ -179,6 +186,7 @@ impl Target {
             max_threadgroup_bytes: 64 * 1024,
             unified_memory: false,
             async_copy: false,
+            split_barriers: false,
         }
     }
 }

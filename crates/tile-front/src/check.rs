@@ -18,13 +18,21 @@
 //!   every view is proven in bounds for every iteration.
 //! - **Budget.** Peak live threadgroup bytes, futures' in-flight buffers
 //!   included, must fit the target's table.
+//! - **Pipe protocol.** In a warp-specialised region, slots are acquired then
+//!   committed, shares received then released, each exactly once. Every
+//!   consumer receives exactly as many times as the producer commits, and no
+//!   role waits on a pipe while holding `stages` of its tokens — together
+//!   that rules out deadlock on the pipe. Arrival counts are derived from the
+//!   pipe's type, not written by hand.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use tile_ir::{DType, Space, Target};
 
-use crate::ir::{Arg, Block, IdxExpr, Op, Program, Stmt, TileTy, Ty, Var, View};
+use crate::ir::{
+    Arg, Block, IdxExpr, Op, PipeDecl, PipeTy, Program, Role, Stmt, TileTy, Ty, Var, View,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -42,6 +50,10 @@ pub enum Kind {
     Narrowing,
     Bounds,
     Budget,
+    /// A pipe protocol violation: an order or count that would deadlock.
+    Protocol,
+    /// The target lacks a feature the program needs.
+    Target,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,7 +76,24 @@ pub struct Report {
     pub borrows: usize,
     pub dups: usize,
     pub async_copies: usize,
+    pub pipes: Vec<PipeReport>,
     pub warnings: Vec<String>,
+}
+
+/// The barriers one pipe lowers to, derived from its type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipeReport {
+    pub stages: usize,
+    /// Arrivals that complete a slot's *full* barrier: the producer's one.
+    pub full_arrivals: usize,
+    /// Bytes the copy engine must land before the full barrier completes.
+    pub full_tx_bytes: usize,
+    /// Arrivals that complete a slot's *empty* barrier: one per consumer.
+    pub empty_arrivals: usize,
+    /// Slots filled over the whole run (= receives by every consumer).
+    pub transfers: usize,
+    /// Threads across all roles of the region.
+    pub threads: usize,
 }
 
 struct Slot {
@@ -83,6 +112,12 @@ struct Checker<'a> {
     ranges: HashMap<Var, Option<(i64, i64)>>,
     depth: usize,
     live_tg: usize,
+    /// Product of the trip counts of the enclosing loops.
+    mult: usize,
+    /// Pipe traffic: `(pipe, 0)` counts commits, `(pipe, k + 1)` counts
+    /// consumer `k`'s receives.
+    traffic: HashMap<(Var, usize), usize>,
+    in_role: bool,
     report: Report,
     diags: Vec<Diag>,
 }
@@ -96,6 +131,9 @@ pub fn check(prog: &Program, target: &Target) -> Result<Report, Vec<Diag>> {
         ranges: HashMap::new(),
         depth: 0,
         live_tg: 0,
+        mult: 1,
+        traffic: HashMap::new(),
+        in_role: false,
         report: Report::default(),
         diags: vec![],
     };
@@ -280,6 +318,19 @@ impl Checker<'_> {
                     }
                     out[i] = Some(Ty::Tile(t));
                 }
+                Arg::BorrowPart(share, part) => {
+                    let ty = self.borrow(share)?;
+                    let Ty::Share(p, _) = ty else {
+                        let n = self.name(share).to_string();
+                        self.err(Kind::Type, format!("`{n}` is not a pipe share"));
+                        return None;
+                    };
+                    let Some(t) = p.elem.get(part) else {
+                        self.err(Kind::Shape, format!("pipe has no part {part}"));
+                        return None;
+                    };
+                    out[i] = Some(Ty::Tile(t.clone()));
+                }
                 Arg::Move(_) => {}
             }
         }
@@ -301,10 +352,76 @@ impl Checker<'_> {
                 );
                 None
             }
+            Ty::Slot(_) => {
+                self.err(
+                    Kind::Type,
+                    format!("{what} is an empty pipe slot; only `commit` may write it"),
+                );
+                None
+            }
+            Ty::Share(..) => {
+                self.err(
+                    Kind::Type,
+                    format!("{what} is a pipe share; borrow one of its parts"),
+                );
+                None
+            }
             other => {
                 self.err(
                     Kind::Type,
                     format!("{what} must be a tile, found {other:?}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// Tokens of `pipe` held through `endpoint` that are live right now.
+    fn held(&self, pipe: Var, endpoint: Option<usize>) -> usize {
+        self.slots
+            .values()
+            .filter(|s| s.live)
+            .filter(|s| match (&s.ty, endpoint) {
+                (Ty::Slot(p), None) => p.id == pipe,
+                (Ty::Share(p, k), Some(e)) => p.id == pipe && *k == e,
+                _ => false,
+            })
+            .count()
+    }
+
+    /// Waiting on a pipe while holding `stages` of its tokens can never be
+    /// satisfied: the other side needs one of them back first.
+    fn may_wait(&mut self, p: &PipeTy, endpoint: Option<usize>, what: &str) -> bool {
+        let held = self.held(p.id, endpoint);
+        if held >= p.stages {
+            self.err(
+                Kind::Protocol,
+                format!(
+                    "{what} waits on a {}-stage pipe while holding {held} of its tokens; \
+                     it deadlocks",
+                    p.stages
+                ),
+            );
+            return false;
+        }
+        true
+    }
+
+    fn handle(&mut self, h: Var, want_producer: bool) -> Option<(PipeTy, Option<usize>)> {
+        let ty = self.borrow(h)?;
+        match (ty, want_producer) {
+            (Ty::Producer(p), true) => Some((p, None)),
+            (Ty::Consumer(p, k), false) => Some((p, Some(k))),
+            (other, _) => {
+                let n = self.name(h).to_string();
+                let want = if want_producer {
+                    "producer"
+                } else {
+                    "consumer"
+                };
+                self.err(
+                    Kind::Type,
+                    format!("`{n}` must be a {want} handle, found {other:?}"),
                 );
                 None
             }
@@ -454,7 +571,27 @@ impl Checker<'_> {
                 None
             }
             Op::Drop(v) => {
-                self.consume(*v)?;
+                match self.consume(*v)? {
+                    Ty::Slot(_) => {
+                        self.err(
+                            Kind::Protocol,
+                            "an acquired slot must be committed; dropping it stalls every \
+                             consumer"
+                                .into(),
+                        );
+                        return None;
+                    }
+                    Ty::Share(..) => {
+                        self.err(
+                            Kind::Protocol,
+                            "a share must be released; dropping it never arrives on the \
+                             empty barrier and stalls the producer"
+                                .into(),
+                        );
+                        return None;
+                    }
+                    _ => {}
+                }
                 None
             }
             Op::Dup(a) => {
@@ -534,6 +671,81 @@ impl Checker<'_> {
                 let ty = self.args(&[*a])?.remove(0);
                 let t = self.tile(ty, "convert operand")?;
                 Some(reg(*dt, &t.shape))
+            }
+            Op::Acquire(h) => {
+                let (p, _) = self.handle(*h, true)?;
+                if !self.may_wait(&p, None, "acquire") {
+                    return None;
+                }
+                Some(Ty::Slot(p))
+            }
+            Op::Commit(h, views, slot) => {
+                let (p, _) = self.handle(*h, true)?;
+                if views.len() != p.elem.len() {
+                    self.err(
+                        Kind::Shape,
+                        format!(
+                            "commit of {} views into a {}-part pipe",
+                            views.len(),
+                            p.elem.len()
+                        ),
+                    );
+                    return None;
+                }
+                for (v, t) in views.iter().zip(&p.elem) {
+                    let (dt, shape) = self.view(v, false)?;
+                    if shape != t.shape || dt != t.dtype {
+                        self.err(
+                            Kind::Shape,
+                            format!(
+                                "commit of {dt:?}{shape:?} into a {:?}{:?} slot; the copy \
+                                 engine does not convert",
+                                t.dtype, t.shape
+                            ),
+                        );
+                        return None;
+                    }
+                }
+                match self.consume(*slot)? {
+                    Ty::Slot(q) if q.id == p.id => {}
+                    other => {
+                        let n = self.name(*slot).to_string();
+                        self.err(
+                            Kind::Type,
+                            format!("commit of `{n}` ({other:?}), not a slot of this pipe"),
+                        );
+                        return None;
+                    }
+                }
+                *self.traffic.entry((p.id, 0)).or_default() += self.mult;
+                None
+            }
+            Op::Receive(h) => {
+                let (p, k) = self.handle(*h, false)?;
+                if !self.may_wait(&p, k, "receive") {
+                    return None;
+                }
+                let k = k.expect("consumer");
+                *self.traffic.entry((p.id, k + 1)).or_default() += self.mult;
+                Some(Ty::Share(p, k))
+            }
+            Op::Release(h, share) => {
+                let (p, k) = self.handle(*h, false)?;
+                match self.consume(*share)? {
+                    Ty::Share(q, j) if q.id == p.id && Some(j) == k => {}
+                    other => {
+                        let n = self.name(*share).to_string();
+                        self.err(
+                            Kind::Type,
+                            format!(
+                                "release of `{n}` ({other:?}) through a handle that did not \
+                                 receive it"
+                            ),
+                        );
+                        return None;
+                    }
+                }
+                None
             }
             Op::MakeArray(vs) => {
                 if vs.is_empty() {
@@ -662,7 +874,11 @@ impl Checker<'_> {
                     carry.push(want);
                 }
                 let range = (start < end).then(|| (*start as i64, *end as i64 - 1));
-                let yields = self.region(*index, range, params, &carry, body)?;
+                let outer = self.mult;
+                self.mult *= end.saturating_sub(*start);
+                let yields = self.region(Some((*index, range)), params, &carry, body);
+                self.mult = outer;
+                let yields = yields?;
                 if yields != carry {
                     for (k, (y, c)) in yields.iter().zip(&carry).enumerate() {
                         if y != c {
@@ -724,7 +940,10 @@ impl Checker<'_> {
                     .sum();
                 self.bump(rest as isize);
                 let range = (n > 0).then(|| (0, n as i64 - 1));
-                let yields = self.region(*index, range, params, &elems, body);
+                let outer = self.mult;
+                self.mult *= n;
+                let yields = self.region(Some((*index, range)), params, &elems, body);
+                self.mult = outer;
                 self.bump(-(rest as isize));
                 let yields = yields?;
                 if yields.len() != results.len() {
@@ -739,23 +958,172 @@ impl Checker<'_> {
                     self.define(r, Ty::Array(t, n), scope);
                 }
             }
+            Stmt::Specialize { pipes, roles } => self.specialize(pipes, roles, scope)?,
         }
         Some(())
     }
 
-    /// Enter a loop body one level deeper, with its index and parameters.
+    fn specialize(
+        &mut self,
+        pipes: &[PipeDecl],
+        roles: &[Role],
+        scope: &mut Vec<Var>,
+    ) -> Option<()> {
+        if !self.target.split_barriers {
+            self.err(
+                Kind::Target,
+                format!(
+                    "{} has no split barriers: one role cannot wait on another without \
+                     the whole threadgroup meeting, so producer/consumer roles have no lowering",
+                    self.target.name
+                ),
+            );
+            return None;
+        }
+        if self.in_role {
+            self.err(Kind::Target, "roles cannot be nested".into());
+            return None;
+        }
+        // The handles exist from here; each must be moved into one role.
+        let mut ring = 0;
+        for p in pipes {
+            if p.ty.stages == 0 || p.consumers.len() != p.ty.consumers {
+                self.err(
+                    Kind::Shape,
+                    "a pipe needs stages and one handle per consumer".into(),
+                );
+                return None;
+            }
+            self.define(p.ty.id, Ty::Producer(p.ty.clone()), scope);
+            for (k, &c) in p.consumers.iter().enumerate() {
+                self.define(c, Ty::Consumer(p.ty.clone(), k), scope);
+            }
+            ring += p.ty.stages * p.ty.slot_bytes();
+        }
+        let mut role_inputs = vec![];
+        for r in roles {
+            let mut tys = vec![];
+            for (&i, &p) in r.inputs.iter().zip(&r.params) {
+                let got = self.consume(i)?;
+                let want = self.declared(p)?;
+                if got != want {
+                    let n = self.name(i).to_string();
+                    self.err(
+                        Kind::Type,
+                        format!("role `{}` takes `{n}` as {want:?}, got {got:?}", r.name),
+                    );
+                    return None;
+                }
+                tys.push(want);
+            }
+            role_inputs.push(tys);
+        }
+
+        // The ring is live for the whole region. Roles run concurrently, so
+        // their own footprints add up rather than taking a max.
+        self.bump(ring as isize);
+        let base = self.live_tg;
+        let peak_before = self.report.peak_threadgroup_bytes;
+        let mut extra = 0;
+        let mut ok = true;
+        let mut outputs = vec![];
+        for (r, tys) in roles.iter().zip(role_inputs) {
+            self.report.peak_threadgroup_bytes = base;
+            self.in_role = true;
+            let yields = self.region(None, &r.params, &tys, &r.body);
+            self.in_role = false;
+            extra += self.report.peak_threadgroup_bytes - base;
+            self.live_tg = base;
+            match yields {
+                Some(y) => outputs.push(y),
+                None => ok = false,
+            }
+        }
+        self.report.peak_threadgroup_bytes = peak_before.max(base + extra);
+        self.bump(-(ring as isize));
+        if !ok {
+            return None;
+        }
+
+        let threads: usize = roles.iter().map(|r| r.warps * self.target.simd_width).sum();
+        if threads > self.target.max_threads_per_threadgroup {
+            self.err(
+                Kind::Budget,
+                format!(
+                    "roles need {threads} threads; {} allows {} per threadgroup",
+                    self.target.name, self.target.max_threads_per_threadgroup
+                ),
+            );
+            return None;
+        }
+
+        // Every consumer must take exactly what the producer sends. Fewer and
+        // the producer blocks on a slot nobody frees; more and a consumer
+        // waits for a fill that never comes.
+        for p in pipes {
+            let sent = self.traffic.remove(&(p.ty.id, 0)).unwrap_or(0);
+            for k in 0..p.ty.consumers {
+                let got = self.traffic.remove(&(p.ty.id, k + 1)).unwrap_or(0);
+                if got != sent {
+                    self.err(
+                        Kind::Protocol,
+                        format!(
+                            "the producer commits {sent} slots but consumer {k} receives {got}; \
+                             the pipeline deadlocks"
+                        ),
+                    );
+                    return None;
+                }
+            }
+            self.report.pipes.push(PipeReport {
+                stages: p.ty.stages,
+                full_arrivals: 1,
+                full_tx_bytes: p.ty.slot_bytes(),
+                empty_arrivals: p.ty.consumers,
+                transfers: sent,
+                threads,
+            });
+        }
+
+        for (r, tys) in roles.iter().zip(outputs) {
+            if r.results.len() != tys.len() {
+                self.err(
+                    Kind::Carry,
+                    format!("role `{}` yields the wrong number of values", r.name),
+                );
+                return None;
+            }
+            for (&v, t) in r.results.iter().zip(tys) {
+                if matches!(
+                    t,
+                    Ty::Slot(_) | Ty::Share(..) | Ty::Producer(_) | Ty::Consumer(..)
+                ) {
+                    self.err(
+                        Kind::Protocol,
+                        format!("role `{}` leaks a pipe token past the join", r.name),
+                    );
+                    return None;
+                }
+                self.define(v, t, scope);
+            }
+        }
+        Some(())
+    }
+
+    /// Enter a loop or role body one level deeper, with its parameters.
     fn region(
         &mut self,
-        index: Var,
-        range: Option<(i64, i64)>,
+        index: Option<(Var, Option<(i64, i64)>)>,
         params: &[Var],
         tys: &[Ty],
         body: &Block,
     ) -> Option<Vec<Ty>> {
         self.depth += 1;
         let mut scope = vec![];
-        self.define(index, Ty::Index, &mut scope);
-        self.ranges.insert(index, range);
+        if let Some((index, range)) = index {
+            self.define(index, Ty::Index, &mut scope);
+            self.ranges.insert(index, range);
+        }
         for (&p, t) in params.iter().zip(tys) {
             self.define(p, t.clone(), &mut scope);
         }
@@ -773,7 +1141,9 @@ impl Checker<'_> {
         let mut ok = clean;
         for v in &pre {
             if let Some(s) = self.slots.remove(v) {
-                if s.live && s.ty.is_linear() && clean {
+                // Pipe handles close when their role ends.
+                let handle = matches!(s.ty, Ty::Producer(_) | Ty::Consumer(..));
+                if s.live && s.ty.is_linear() && clean && !handle {
                     let n = self.name(*v).to_string();
                     self.err(
                         Kind::Leak,
@@ -796,5 +1166,6 @@ fn defs(s: &Stmt) -> Vec<Var> {
     match s {
         Stmt::Let { dst, .. } => dst.iter().copied().collect(),
         Stmt::For { results, .. } | Stmt::MapEach { results, .. } => results.clone(),
+        Stmt::Specialize { roles, .. } => roles.iter().flat_map(|r| r.results.clone()).collect(),
     }
 }
