@@ -60,6 +60,9 @@ pub struct FlashDecode {
     /// 0: one role does everything. N > 0: a producer warp and N consumer
     /// warpgroups connected by a `stages`-deep pipe.
     pub consumers: usize,
+    /// Independent KV heads (or sequences), one grid instance each. Every
+    /// tensor gets a leading `heads` factor on its row dimension.
+    pub heads: usize,
 }
 
 impl FlashDecode {
@@ -107,10 +110,14 @@ impl FlashDecode {
             c.bk,
             c.stages
         ));
-        let pq = b.param("q", c.dtype, &[c.q_rows, c.d], false);
-        let pk = b.param("k", c.dtype, &[c.seq, c.d], false);
-        let pv = b.param("v", c.dtype, &[c.seq, c.d], false);
-        let po = b.param("o", DType::F32, &[c.q_rows, c.d], true);
+        if c.heads == 0 {
+            return Err("heads must be nonzero".into());
+        }
+        let pq = b.param("q", c.dtype, &[c.heads * c.q_rows, c.d], false);
+        let pk = b.param("k", c.dtype, &[c.heads * c.seq, c.d], false);
+        let pv = b.param("v", c.dtype, &[c.heads * c.seq, c.d], false);
+        let po = b.param("o", DType::F32, &[c.heads * c.q_rows, c.d], true);
+        let pid = b.grid(c.heads);
 
         let reg = |dt, shape: &[usize]| TileTy::new(dt, shape, Space::Reg);
         let m_ty = reg(DType::F32, &[c.bq]);
@@ -118,11 +125,11 @@ impl FlashDecode {
         let kv = c.kv_tile();
 
         if c.consumers > 0 {
-            c.specialized(&mut b, [pq, pk, pv, po])?;
+            c.specialized(&mut b, pid, [pq, pk, pv, po])?;
             return Ok(b.finish());
         }
 
-        let (qs, [ms, ls, accs]) = setup(&mut b, &c, pq, 0, c.n_qb());
+        let (qs, [ms, ls, accs]) = setup(&mut b, &c, pid, pq, 0, c.n_qb());
 
         if c.kv_space != Space::Threadgroup {
             // Synchronous loads straight into registers: nothing to rotate.
@@ -130,8 +137,17 @@ impl FlashDecode {
             let carry = vec![m_arr.clone(), m_arr, Ty::Array(acc_ty.clone(), c.n_qb())];
             let out = b.for_range(0, c.n_kb(), vec![ms, ls, accs], carry, |b, i, p| {
                 let at = IdxExpr::scaled(i, c.bk, 0);
-                let k = b.op("k", Op::Load(rows(pk, at.clone(), c.bk, c.d), kv.clone()));
-                let v = b.op("v", Op::Load(rows(pv, at, c.bk, c.d), kv.clone()));
+                let k = b.op(
+                    "k",
+                    Op::Load(
+                        rows(pk, (at.clone()).plus(pid, c.seq), c.bk, c.d),
+                        kv.clone(),
+                    ),
+                );
+                let v = b.op(
+                    "v",
+                    Op::Load(rows(pv, (at).plus(pid, c.seq), c.bk, c.d), kv.clone()),
+                );
                 let out = attend(
                     b,
                     &c,
@@ -144,7 +160,7 @@ impl FlashDecode {
                 b.drop(v);
                 out.to_vec()
             });
-            finish(&mut b, &c, po, 0, qs, [out[0], out[1], out[2]]);
+            finish(&mut b, &c, pid, po, 0, qs, [out[0], out[1], out[2]]);
             return Ok(b.finish());
         }
 
@@ -154,7 +170,7 @@ impl FlashDecode {
             let mut inflight = vec![];
             for blk in 0..c.stages - 1 {
                 let buf = b.op(name, Op::Alloc(kv.clone()));
-                let view = rows(p, IdxExpr::lit(blk * c.bk), c.bk, c.d);
+                let view = rows(p, (IdxExpr::lit(blk * c.bk)).plus(pid, c.seq), c.bk, c.d);
                 inflight.push(b.op(name, Op::CopyAsync(view, buf)));
             }
             let free = b.op(name, Op::Alloc(kv.clone()));
@@ -193,9 +209,12 @@ impl FlashDecode {
             let ahead = IdxExpr::scaled(i, c.bk, (s - 1) * c.bk);
             let knew = b.op(
                 "kf",
-                Op::CopyAsync(rows(pk, ahead.clone(), c.bk, c.d), kfree),
+                Op::CopyAsync(rows(pk, (ahead.clone()).plus(pid, c.seq), c.bk, c.d), kfree),
             );
-            let vnew = b.op("vf", Op::CopyAsync(rows(pv, ahead, c.bk, c.d), vfree));
+            let vnew = b.op(
+                "vf",
+                Op::CopyAsync(rows(pv, (ahead).plus(pid, c.seq), c.bk, c.d), vfree),
+            );
             let mut kq: Vec<Var> = kq.iter().copied().chain([knew]).collect();
             let mut vq: Vec<Var> = vq.iter().copied().chain([vnew]).collect();
             let kcur = b.op("k", Op::Wait(kq.remove(0)));
@@ -239,12 +258,17 @@ impl FlashDecode {
         }
         b.drop(kfree);
         b.drop(vfree);
-        finish(&mut b, &c, po, 0, qs, [ms, ls, accs]);
+        finish(&mut b, &c, pid, po, 0, qs, [ms, ls, accs]);
         Ok(b.finish())
     }
 
     /// Producer warp + `consumers` consumer warpgroups over one K/V pipe.
-    fn specialized(&self, b: &mut Builder, [pq, pk, pv, po]: [usize; 4]) -> Result<(), String> {
+    fn specialized(
+        &self,
+        b: &mut Builder,
+        pid: Var,
+        [pq, pk, pv, po]: [usize; 4],
+    ) -> Result<(), String> {
         let c = *self;
         if c.kv_space != Space::Threadgroup {
             return Err("a pipe's slots live in threadgroup memory".into());
@@ -270,7 +294,10 @@ impl FlashDecode {
                 b.for_range(0, c.n_kb(), vec![], vec![], |b, i, _| {
                     let at = IdxExpr::scaled(i, c.bk, 0);
                     let slot = b.op("slot", Op::Acquire(h));
-                    let views = vec![rows(pk, at.clone(), c.bk, c.d), rows(pv, at, c.bk, c.d)];
+                    let views = vec![
+                        rows(pk, (at.clone()).plus(pid, c.seq), c.bk, c.d),
+                        rows(pv, (at).plus(pid, c.seq), c.bk, c.d),
+                    ];
                     b.effect(Op::Commit(h, views, slot));
                     vec![]
                 });
@@ -287,7 +314,7 @@ impl FlashDecode {
                 body: Box::new(move |b: &mut Builder, p: &[Var]| {
                     let h = p[0];
                     let q0 = k * per * c.bq;
-                    let (qs, state) = setup(b, &c, pq, q0, per);
+                    let (qs, state) = setup(b, &c, pid, pq, q0, per);
                     let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
                     let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
                     let carry = vec![
@@ -308,7 +335,7 @@ impl FlashDecode {
                         b.effect(Op::Release(h, kv));
                         out.to_vec()
                     });
-                    finish(b, &c, po, q0, qs, [out[0], out[1], out[2]]);
+                    finish(b, &c, pid, po, q0, qs, [out[0], out[1], out[2]]);
                     vec![]
                 }),
             });
@@ -320,11 +347,23 @@ impl FlashDecode {
 
 /// Load `n` query blocks starting at row `q0` (only ever borrowed after
 /// this), and the online-softmax state for each.
-fn setup(b: &mut Builder, c: &FlashDecode, pq: usize, q0: usize, n: usize) -> (Var, [Var; 3]) {
+fn setup(
+    b: &mut Builder,
+    c: &FlashDecode,
+    pid: Var,
+    pq: usize,
+    q0: usize,
+    n: usize,
+) -> (Var, [Var; 3]) {
     let reg = |dt, shape: &[usize]| TileTy::new(dt, shape, Space::Reg);
     let q_blocks: Vec<Var> = (0..n)
         .map(|qb| {
-            let view = rows(pq, IdxExpr::lit(q0 + qb * c.bq), c.bq, c.d);
+            let view = rows(
+                pq,
+                (IdxExpr::lit(q0 + qb * c.bq)).plus(pid, c.q_rows),
+                c.bq,
+                c.d,
+            );
             b.op("q", Op::Load(view, reg(c.dtype, &[c.bq, c.d])))
         })
         .collect();
@@ -345,6 +384,7 @@ fn setup(b: &mut Builder, c: &FlashDecode, pq: usize, q0: usize, n: usize) -> (V
 fn finish(
     b: &mut Builder,
     c: &FlashDecode,
+    pid: Var,
     po: usize,
     q0: usize,
     qs: Var,
@@ -366,7 +406,12 @@ fn finish(
                 Op::Binary(BinOp::Div, Arg::Move(p[2]), Arg::Move(p[1])),
             );
             b.drop(p[0]);
-            let view = rows(po, IdxExpr::scaled(qb, c.bq, q0), c.bq, c.d);
+            let view = rows(
+                po,
+                (IdxExpr::scaled(qb, c.bq, q0)).plus(pid, c.q_rows),
+                c.bq,
+                c.d,
+            );
             b.effect(Op::Store(Arg::Move(o), view));
             vec![]
         },

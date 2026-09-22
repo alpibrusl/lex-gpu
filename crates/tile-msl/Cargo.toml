@@ -8,3 +8,4 @@ description = "Metal Shading Language emitter for the tile IR."
 
 [dependencies]
 tile-ir = { workspace = true }
+tile-front = { workspace = true }

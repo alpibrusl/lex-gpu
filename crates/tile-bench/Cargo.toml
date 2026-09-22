@@ -13,5 +13,6 @@ path = "src/main.rs"
 [dependencies]
 tile-ir = { workspace = true }
 tile-msl = { workspace = true }
+tile-front = { workspace = true }
 tile-metal = { workspace = true }
 half = { workspace = true }

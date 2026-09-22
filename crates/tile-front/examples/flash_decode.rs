@@ -30,6 +30,7 @@ fn main() {
         dtype: DType::F16,
         kv_space: Space::Threadgroup,
         consumers,
+        heads: 1,
     };
     let schedules = [
         ("metal", "bq 8, bk 32, 2 stages", shape(8, 32, 2, 0)),

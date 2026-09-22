@@ -4,7 +4,8 @@ use metal::objc::rc::autoreleasepool;
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
 };
-use tile_ir::{Kernel, Plan, Target};
+use tile_ir::{Kernel, Launch, Plan, Target};
+use tile_msl::program::Lowered;
 
 pub struct DeviceInfo {
     pub name: String,
@@ -77,37 +78,64 @@ impl Gpu {
     /// shipping story, which is a precompiled metallib.
     pub fn build(&self, kernel: &Kernel, plan: &Plan) -> Result<Pipeline, String> {
         let source = tile_msl::emit(kernel, plan, &self.target);
+        self.pipeline(&kernel.name, source, plan, true)
+    }
+
+    /// Compile a lowered `tile-front` program.
+    ///
+    /// Fast math is off: typed kernels rely on IEEE infinities (an online
+    /// softmax starts its running max at -inf), which fast math is allowed to
+    /// assume away.
+    pub fn build_lowered(&self, lowered: &Lowered) -> Result<Pipeline, String> {
+        let plan = Plan {
+            launch: Launch {
+                threadgroups: [lowered.grid, 1, 1],
+                threads_per_threadgroup: [lowered.threads, 1, 1],
+            },
+            threadgroup_bytes: lowered.threadgroup_bytes,
+            vec_width: 1,
+            threads_per_tg: lowered.threads,
+            simdgroups_per_tg: lowered.threads.div_ceil(self.target.simd_width),
+            vec_lanes: 0,
+        };
+        self.pipeline(&lowered.entry, lowered.source.clone(), &plan, false)
+    }
+
+    fn pipeline(
+        &self,
+        name: &str,
+        source: String,
+        plan: &Plan,
+        fast_math: bool,
+    ) -> Result<Pipeline, String> {
         let options = CompileOptions::new();
+        options.set_fast_math_enabled(fast_math);
         let library = self
             .device
             .new_library_with_source(&source, &options)
             .map_err(|e| {
-                format!(
-                    "MSL compile failed for `{}`:\n{e}\n--- source ---\n{source}",
-                    kernel.name
-                )
+                format!("MSL compile failed for `{name}`:\n{e}\n--- source ---\n{source}")
             })?;
         let function = library
-            .get_function(&kernel.name, None)
-            .map_err(|e| format!("no function `{}` in compiled library: {e}", kernel.name))?;
+            .get_function(name, None)
+            .map_err(|e| format!("no function `{name}` in compiled library: {e}"))?;
         let pso = self
             .device
             .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| format!("pipeline creation failed for `{}`: {e}", kernel.name))?;
+            .map_err(|e| format!("pipeline creation failed for `{name}`: {e}"))?;
 
         let want = plan.threads_per_tg;
         let allowed = pso.max_total_threads_per_threadgroup() as usize;
         if want > allowed {
             return Err(format!(
-                "plan asks for {want} threads per threadgroup, `{}` allows {allowed}",
-                kernel.name
+                "plan asks for {want} threads per threadgroup, `{name}` allows {allowed}"
             ));
         }
 
         Ok(Pipeline {
             pso,
             plan: *plan,
-            name: kernel.name.clone(),
+            name: name.to_string(),
             source,
         })
     }

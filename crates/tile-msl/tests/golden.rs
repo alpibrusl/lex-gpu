@@ -23,7 +23,36 @@ fn golden_dir() -> PathBuf {
 fn check(case: &str, kernel: &Kernel) {
     let target = Target::apple_m_series();
     let plan = plan(kernel, &target).unwrap_or_else(|e| panic!("cannot plan {case}: {e}"));
-    let got = tile_msl::emit(kernel, &plan, &target);
+    compare(case, &tile_msl::emit(kernel, &plan, &target));
+}
+
+/// Flash-attention decode, a typed tile-front program, lowered to MSL. The
+/// lowering is the part of the backend a Linux box cannot otherwise exercise.
+#[test]
+fn flash_decode_lowered() {
+    use tile_front::flash::FlashDecode;
+    use tile_ir::Space;
+    let cfg = FlashDecode {
+        q_rows: 8,
+        d: 64,
+        seq: 64,
+        bq: 4,
+        bk: 16,
+        stages: 2,
+        dtype: DType::F16,
+        kv_space: Space::Threadgroup,
+        consumers: 0,
+        heads: 2,
+    };
+    let prog = cfg.build().unwrap();
+    let target = Target::apple_m_series();
+    tile_front::check(&prog, &target).expect("check");
+    let low = tile_msl::program::lower(&prog, &target, 128).expect("lower");
+    compare("flash_decode_f16_lowered", &low.source);
+}
+
+fn compare(case: &str, got: &str) {
+    let got = got.to_string();
     let path = golden_dir().join(format!("{case}.metal"));
 
     if std::env::var_os("TILE_BLESS").is_some() {

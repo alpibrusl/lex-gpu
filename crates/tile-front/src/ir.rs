@@ -138,6 +138,12 @@ impl IdxExpr {
             terms: vec![(v, coeff as i64)],
         }
     }
+
+    /// `self + coeff * v`
+    pub fn plus(mut self, v: Var, coeff: usize) -> IdxExpr {
+        self.terms.push((v, coeff as i64));
+        self
+    }
 }
 
 /// A rectangular window into a global tensor.
@@ -344,6 +350,10 @@ pub struct Program {
     /// Declared types of region parameters and loop indices, indexed by
     /// `Var.0`. Values defined by ops have `None`: their types are inferred.
     pub declared: Vec<Option<Ty>>,
+    /// Independent instances of the body, one threadgroup each on a GPU.
+    /// `pid` is the instance index, usable in view offsets like a loop index.
+    pub grid: usize,
+    pub pid: Option<Var>,
 }
 
 impl Program {
@@ -361,6 +371,8 @@ pub struct Builder {
     names: Vec<String>,
     declared: Vec<Option<Ty>>,
     stack: Vec<Vec<Stmt>>,
+    grid: usize,
+    pid: Option<Var>,
 }
 
 impl Builder {
@@ -371,7 +383,19 @@ impl Builder {
             names: vec![],
             declared: vec![],
             stack: vec![vec![]],
+            grid: 1,
+            pid: None,
         }
+    }
+
+    /// Run the program as `n` independent instances. Returns the instance
+    /// index, which views may use like a loop index over `0..n`.
+    pub fn grid(&mut self, n: usize) -> Var {
+        assert!(self.pid.is_none(), "grid declared twice");
+        let pid = self.fresh("pid", Some(Ty::Index));
+        self.grid = n;
+        self.pid = Some(pid);
+        pid
     }
 
     pub fn param(&mut self, name: &str, dtype: DType, shape: &[usize], writable: bool) -> usize {
@@ -535,6 +559,8 @@ impl Builder {
             },
             names: self.names,
             declared: self.declared,
+            grid: self.grid,
+            pid: self.pid,
         }
     }
 }

@@ -5,6 +5,18 @@ shapes, times both the same way, and prints one table:
 
     python3 scripts/bench_vs_pytorch.py
     python3 scripts/bench_vs_pytorch.py --dtype f16 --rows 8192
+    python3 scripts/bench_vs_pytorch.py --batch 8 --seq 8192   # flash shape
+
+Two groups of kernels:
+
+- copy / rmsnorm: P0's hand-planned kernels.
+- flash_decode_f16: a typed tile-front kernel, checked, lowered to MSL. It
+  uses Llama-3-8B's decode shape (8 KV heads x 4 query heads, head dim 128,
+  f16). The main row compares it with SDPA called on the same grouped layout,
+  where each KV head's 4 query heads are 4 query rows. The `(gqa)` row calls
+  `enable_gqa=True` on the 32-head layout instead.
+  P2 lowers it for correctness, not speed. Expect PyTorch to win by a wide
+  margin until P3.
 
 Method, matching `tile_metal::Gpu::time`: warm up, then `iters` back-to-back
 calls per timed batch, synchronise, keep the fastest of `repeats` batches.
@@ -77,17 +89,45 @@ def torch_numbers(a):
     return out, err
 
 
-def tile_numbers(a):
+def torch_flash(a):
+    """SDPA on the flash-decode shape, in tile's memory layout."""
+    kvh, group, d = 8, 4, 128
+    dev = torch.device("mps")
+    g = torch.Generator(device="cpu").manual_seed(0)
+    q = torch.rand(a.batch, kvh * group, 1, d, generator=g).sub_(0.5).to(dev, torch.float16)
+    k = torch.rand(a.batch, kvh, a.seq, d, generator=g).sub_(0.5).to(dev, torch.float16)
+    v = torch.rand(a.batch, kvh, a.seq, d, generator=g).sub_(0.5).to(dev, torch.float16)
+    h = a.batch * kvh
+    # Same accounting as tile: q and k/v in f16, o in f32.
+    nbytes = h * group * d * 2 + 2 * h * a.seq * d * 2 + h * group * d * 4
+    # The same query heads as 4 query rows per KV head: no GQA expansion.
+    # This is the layout tile's kernel uses.
+    qg = q.view(a.batch, kvh, group, d)
+    gqa = timed(lambda: F.scaled_dot_product_attention(q, k, v, enable_gqa=True), a.iters, a.repeats)
+    grouped = timed(lambda: F.scaled_dot_product_attention(qg, k, v), a.iters, a.repeats)
+    # Both layouts must compute the same attention before either timing counts.
+    a1 = F.scaled_dot_product_attention(q, k, v, enable_gqa=True).view(a.batch, kvh, group, d)
+    a2 = F.scaled_dot_product_attention(qg, k, v)
+    assert torch.allclose(a1.float(), a2.float(), atol=2e-3), "SDPA layouts disagree"
+    return {
+        "flash_decode_f16": nbytes / grouped / 1e9,
+        "flash_decode_f16 (gqa)": nbytes / gqa / 1e9,
+    }
+
+
+def tile_numbers(a, flash=False):
     cmd = [
         "cargo", "run", "-q", "--release", "-p", "tile-bench", "--",
         "--dtype", a.dtype, "--mib", str(a.mib), "--rows", str(a.rows),
         "--cols", str(a.cols), "--iters", str(a.iters), "--repeats", str(a.repeats),
     ]
+    if flash:
+        cmd += ["--flash", "--batch", str(a.batch), "--seq", str(a.seq)]
     p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     out = {}
     for line in p.stdout.splitlines():
         tok = line.split()
-        if tok and (tok[0].startswith("copy_") or tok[0].startswith("rmsnorm_")):
+        if tok and tok[0].startswith(("copy_", "rmsnorm_", "flash_")):
             out[tok[0]] = float(tok[-2])
     if not out:
         sys.exit(f"tile-bench produced no numbers:\n{p.stdout}{p.stderr}")
@@ -103,15 +143,22 @@ def main():
     ap.add_argument("--eps", type=float, default=1e-5)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--repeats", type=int, default=5)
+    ap.add_argument("--batch", type=int, default=4, help="flash: sequences")
+    ap.add_argument("--seq", type=int, default=4096, help="flash: cached positions")
     a = ap.parse_args()
 
     if not torch.backends.mps.is_available():
         sys.exit("PyTorch has no MPS device here; this comparison needs Apple silicon.")
 
     tile, raw = tile_numbers(a)
+    tile.update(tile_numbers(a, flash=True)[0])
     ours, err = torch_numbers(a)
+    ours.update(torch_flash(a))
     print(raw.split("\n\n")[0])  # tile-bench's device/target header
-    print(f"\npytorch {torch.__version__}, mps; rows={a.rows} cols={a.cols} copy={a.mib} MiB\n")
+    print(
+        f"\npytorch {torch.__version__}, mps; rows={a.rows} cols={a.cols} copy={a.mib} MiB; "
+        f"flash batch={a.batch} seq={a.seq}\n"
+    )
     print(f"{'kernel':<24} {'tile GB/s':>10} {'torch GB/s':>11} {'tile / torch':>13}")
     for name, gbs in ours.items():
         base = name.split()[0]

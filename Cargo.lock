@@ -193,6 +193,7 @@ name = "tile-bench"
 version = "0.0.1"
 dependencies = [
  "half",
+ "tile-front",
  "tile-ir",
  "tile-metal",
  "tile-msl",
@@ -217,7 +218,9 @@ dependencies = [
 name = "tile-metal"
 version = "0.0.1"
 dependencies = [
+ "half",
  "metal",
+ "tile-front",
  "tile-ir",
  "tile-msl",
 ]
@@ -226,6 +229,7 @@ dependencies = [
 name = "tile-msl"
 version = "0.0.1"
 dependencies = [
+ "tile-front",
  "tile-ir",
 ]
 
