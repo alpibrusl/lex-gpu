@@ -10,7 +10,7 @@
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), String> {
-    use tile_front::llama::{QLayout, matmul_q, matvec_q};
+    use tile_front::llama::{QLayout, matmul_q, matmul_q_x, matvec_q};
     use tile_ir::DType;
     use tile_metal::{Buffer, Gpu, Step};
     use tile_msl::program::lower;
@@ -127,7 +127,7 @@ fn main() -> Result<(), String> {
     println!();
     println!(
         "  {:<16} {:>6} {:>4} {:>6} {:>9} {:>10} {:>9}",
-        "gate/up, batched", "tokens", "bo", "kc", "us", "GB/s", "ms/token"
+        "gate/up, batched", "tokens", "bo", "x", "us", "GB/s", "ms/token"
     );
     let (n_in, n_out) = (5120usize, 17408usize);
     // One set of weights for every configuration: allocating a gigabyte
@@ -163,13 +163,15 @@ fn main() -> Result<(), String> {
         .collect();
 
     for tokens in [1usize, 2, 4, 8] {
-        let x = gpu.zeroed::<f32>(tokens * n_in);
         let y = gpu.zeroed::<f32>(tokens * n_out);
-        // `bo` is the rows a threadgroup owns, so a simdgroup owns
-        // bo / (threads / 32) of them and re-reads the activations once
-        // per block of those. A larger bo should amortise them.
-        for (bo, kc) in [(16, n_in), (32, n_in), (64, n_in), (128, n_in), (256, n_in)] {
-            let Ok(prog) = matmul_q(tokens, n_in, n_out, bo, kc, QLayout::NVFP4, false) else {
+        // Half activations halve what the batch reads and let the
+        // multiply-add run on the f16 ALU; `bo` is the rows a threadgroup
+        // owns, and past 32 each lane's accumulators start to spill.
+        for (bo, xh) in [(16, false), (32, false), (16, true), (32, true)] {
+            let (kc, xt) = (n_in, if xh { DType::F16 } else { DType::F32 });
+            let x = gpu.zeroed::<u8>(tokens * n_in * if xh { 2 } else { 4 });
+            let Ok(prog) = matmul_q_x(tokens, n_in, n_out, bo, kc, QLayout::NVFP4, false, xt)
+            else {
                 continue;
             };
             if tile_front::check(&prog, gpu.target()).is_err() {
@@ -199,8 +201,9 @@ fn main() -> Result<(), String> {
             runs.sort_by(f64::total_cmp);
             let per = runs[2];
             println!(
-                "  {:<16} {tokens:>6} {bo:>4} {kc:>6} {:>9.1} {:>10.0} {:>9.2}",
+                "  {:<16} {tokens:>6} {bo:>4} {:>6} {:>9.1} {:>10.0} {:>9.2}",
                 "",
+                if xh { "f16" } else { "f32" },
                 per * 1e6,
                 wbytes as f64 / per / 1e9,
                 14.5e9 / (wbytes as f64 / per) * 1e3 / tokens as f64

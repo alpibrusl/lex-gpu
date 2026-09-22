@@ -319,16 +319,35 @@ pub fn matmul_q(
     layout: QLayout,
     residual: bool,
 ) -> Result<Program, String> {
+    matmul_q_x(t, n_in, n_out, bo, kc, layout, residual, DType::F32)
+}
+
+/// [`matmul_q`] with the activations in `x_dtype`. Half activations halve
+/// what a batch reads and let the multiply-add run on the f16 ALU, at the
+/// cost of a few digits: whether that shows in the answers is what the
+/// model's golden test is for.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_q_x(
+    t: usize,
+    n_in: usize,
+    n_out: usize,
+    bo: usize,
+    kc: usize,
+    layout: QLayout,
+    residual: bool,
+    x_dtype: DType,
+) -> Result<Program, String> {
     use Arg::Move;
     check_shape(n_in, n_out, bo, kc, layout)?;
     let name = format!(
-        "{}_{}_{n_out}x{n_in}{}",
+        "{}_{}_{n_out}x{n_in}{}{}",
         matmul_tag(t),
         layout.tag(),
-        if residual { "_res" } else { "" }
+        if residual { "_res" } else { "" },
+        if x_dtype == DType::F16 { "_xh" } else { "" }
     );
     let mut b = Builder::new(&name);
-    let px = b.param("x", DType::F32, &[t, n_in], false);
+    let px = b.param("x", x_dtype, &[t, n_in], false);
     let w = QParams::declare(&mut b, "w", n_in, n_out, layout);
     let pr = residual.then(|| b.param("r", DType::F32, &[t, n_out], false));
     let py = b.param("y", DType::F32, &[t, n_out], true);
@@ -343,7 +362,7 @@ pub fn matmul_q(
         vec![Ty::Tile(acc_ty)],
         |b, c, p| {
             let rows = IdxExpr::scaled(pid, bo, 0);
-            let x = x_chunk(b, px, c, (t, kc));
+            let x = x_chunk_dt(b, px, c, (t, kc), x_dtype);
             let wt = w.tile(b, layout, &rows, c, (bo, kc));
             let part = b.op("part", Op::MatMulNT(Move(x), Move(wt), DType::F32));
             vec![b.op("acc", Op::Binary(BinOp::Add, Move(p[0]), Move(part)))]
@@ -419,7 +438,11 @@ pub fn matvec_q_rms(
 }
 
 /// The activations `x[.., chunk c]`, as a lazy `[t, kc]` tile.
-fn x_chunk(b: &mut Builder, px: usize, c: Var, (t, kc): (usize, usize)) -> Var {
+fn x_chunk(b: &mut Builder, px: usize, c: Var, tkc: (usize, usize)) -> Var {
+    x_chunk_dt(b, px, c, tkc, DType::F32)
+}
+
+fn x_chunk_dt(b: &mut Builder, px: usize, c: Var, (t, kc): (usize, usize), dt: DType) -> Var {
     // A batch re-reads these activations for every block of weight rows a
     // threadgroup owns, and replacing the loads with a constant shows they
     // cost about half the kernel's throughput at four tokens. Staging them
@@ -430,7 +453,7 @@ fn x_chunk(b: &mut Builder, px: usize, c: Var, (t, kc): (usize, usize)) -> Var {
         "x",
         Op::Load(
             at(px, [IdxExpr::lit(0), IdxExpr::scaled(c, kc, 0)], [t, kc]),
-            reg(DType::F32, &[t, kc]),
+            reg(dt, &[t, kc]),
         ),
     )
 }
