@@ -207,11 +207,11 @@ pub fn silu_mul(n: usize, chunk: usize) -> Result<Program, String> {
 /// Split Q8_0 blocks (34 bytes: f16 scale, 32 × i8) into the value and scale
 /// tensors the kernels take. Lossless: both halves are stored as they are.
 pub fn split_q8_0(blocks: &[u8]) -> (Vec<i8>, Vec<half::f16>) {
-    assert_eq!(blocks.len() % 34, 0, "not whole Q8_0 blocks");
-    let n = blocks.len() / 34;
-    let mut q = Vec::with_capacity(n * 32);
-    let mut s = Vec::with_capacity(n);
-    for blk in blocks.chunks_exact(34) {
+    let (blocks, rest) = blocks.as_chunks::<34>();
+    assert!(rest.is_empty(), "not whole Q8_0 blocks");
+    let mut q = Vec::with_capacity(blocks.len() * 32);
+    let mut s = Vec::with_capacity(blocks.len());
+    for blk in blocks {
         s.push(half::f16::from_le_bytes([blk[0], blk[1]]));
         q.extend(blk[2..].iter().map(|&b| b as i8));
     }
