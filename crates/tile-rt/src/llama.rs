@@ -215,8 +215,8 @@ mod gpu {
     use half::f16;
     use tile_front::flash::{COMBINE_CHUNK, FlashDecode};
     use tile_front::llama::{
-        QLayout, kv_append, kv_append_rows, matmul_q, matvec_q, rmsnorm, rmsnorm_rows, rope,
-        rope_rows, rope_tables, silu_mul,
+        QLayout, kv_append, kv_append_rows, matmul_q, matmul_q_glu, matvec_q, matvec_q_rms,
+        rmsnorm, rmsnorm_rows, rope, rope_rows, rope_tables, silu_mul,
     };
     use tile_front::{Program, check};
     use tile_ir::{DType, Space, Target};
@@ -299,6 +299,93 @@ mod gpu {
 
     /// Which matvec pipeline a matrix needs: (cols, rows, layout, residual).
     type MvKey = (usize, usize, QLayout, bool);
+    /// Which fused gate/up pipeline a layer needs: (cols, rows, layout).
+    type GluKey = (usize, usize, QLayout);
+
+    /// Fused gate/up/SiLU·mul pipelines for `t` rows, one per shape and
+    /// layout among layers whose gate and up share a layout.
+    fn glu_pipelines(
+        gpu: &Gpu,
+        w: &Weights,
+        t: usize,
+        bo: usize,
+        norm: Option<f32>,
+    ) -> Result<HashMap<GluKey, Pipeline>, String> {
+        let mut glu = HashMap::new();
+        for l in &w.layers {
+            let k = (l.gate.cols, l.gate.rows, l.gate.w.layout);
+            if l.up.w.layout == k.2 && !glu.contains_key(&k) {
+                let p = matmul_q_glu(t, k.0, k.1, bo, k.2, norm)?;
+                glu.insert(k, compile(gpu, &p, THREADS)?);
+            }
+        }
+        Ok(glu)
+    }
+
+    /// One matvec-with-folded-norm pipeline per (shape, layout) a decode
+    /// step needs: q, k and v read the residual through the attention norm,
+    /// the output head through the final norm.
+    fn rms_mv_pipelines(
+        gpu: &Gpu,
+        w: &Weights,
+        bo: usize,
+        threads: usize,
+    ) -> Result<HashMap<GluKey, Pipeline>, String> {
+        let mut m: HashMap<GluKey, Pipeline> = HashMap::new();
+        let mut want: Vec<&QMat> = vec![w.out.as_ref().unwrap_or(&w.emb)];
+        for l in &w.layers {
+            want.extend([&l.wq, &l.wk, &l.wv]);
+        }
+        for q in want {
+            let k = (q.cols, q.rows, q.w.layout);
+            if let Entry::Vacant(slot) = m.entry(k) {
+                let p = matvec_q_rms(k.0, k.1, bo, k.2, w.cfg.eps)?;
+                slot.insert(compile(gpu, &p, threads)?);
+            }
+        }
+        Ok(m)
+    }
+
+    /// `y = W rmsnorm(x, g)` for a matrix with a folded-norm pipeline.
+    fn rms_dispatch<'a>(
+        m: &'a HashMap<GluKey, Pipeline>,
+        w: &'a QBuf,
+        x: &'a Buffer,
+        g: &'a Buffer,
+        y: &'a Buffer,
+    ) -> Option<(&'a Pipeline, Vec<&'a Buffer>)> {
+        let p = m.get(&(w.cols, w.rows, w.layout))?;
+        let mut bufs = vec![x, g, &w.q];
+        bufs.extend(w.qh.as_ref());
+        bufs.extend(w.scales.iter());
+        bufs.push(y);
+        Some((p, bufs))
+    }
+
+    /// The fused gate/up dispatch for a layer, if it has one:
+    /// `x, <gate>, <up>, a`.
+    fn glu_dispatch<'a>(
+        glu: &'a HashMap<GluKey, Pipeline>,
+        gate: &'a QBuf,
+        up: &'a QBuf,
+        x: &'a Buffer,
+        norm: Option<&'a Buffer>,
+        a: &'a Buffer,
+    ) -> Option<(&'a Pipeline, Vec<&'a Buffer>)> {
+        if gate.layout != up.layout {
+            return None;
+        }
+        let p = glu.get(&(gate.cols, gate.rows, gate.layout))?;
+        let mut bufs = vec![x];
+        bufs.extend(norm);
+        for w in [gate, up] {
+            bufs.push(&w.q);
+            bufs.extend(w.qh.as_ref());
+            bufs.extend(w.scales.iter());
+        }
+        bufs.push(a);
+        Some((p, bufs))
+    }
 
     struct QBuf {
         rows: usize,
@@ -342,6 +429,14 @@ mod gpu {
         /// One matvec pipeline per (shape, layout, residual) the model uses:
         /// Q4_K_M files mix Q4_K and Q6_K within a layer.
         mv: HashMap<MvKey, Pipeline>,
+        /// Gate + up + SiLU·mul in one kernel, per (n_in, n_out, layout),
+        /// for layers whose gate and up share a layout. Decode's also folds
+        /// in the FFN's RMSNorm.
+        glu: HashMap<GluKey, Pipeline>,
+        /// Matvecs with the preceding RMSNorm folded in (decode).
+        rms_mv: HashMap<GluKey, Pipeline>,
+        /// Which call sites fold their norm: (q/k/v, gate/up, lm head).
+        fold: (bool, bool, bool),
         rope_q: Pipeline,
         rope_k: Pipeline,
         silu: Pipeline,
@@ -405,6 +500,7 @@ mod gpu {
         rms: Pipeline,
         rms_last: Pipeline,
         mv: HashMap<MvKey, Pipeline>,
+        glu: HashMap<GluKey, Pipeline>,
         rope_q: Pipeline,
         rope_k: Pipeline,
         kv_k: Pipeline,
@@ -460,6 +556,10 @@ mod gpu {
         pub sync: bool,
         /// Dispatches issued so far.
         pub dispatches: usize,
+        /// Call-site labels to leave out of decode steps (ablation: how much
+        /// a kind of kernel costs on the real, overlapped critical path).
+        /// The logits are then wrong; for profiling only.
+        pub skip: Vec<String>,
         /// Wall time per call site: (calls, seconds). Every dispatch waits
         /// for completion, so this is GPU time plus submit/wait overhead.
         prof: RefCell<BTreeMap<&'static str, (usize, f64)>>,
@@ -488,14 +588,34 @@ mod gpu {
                     key(&l.down, true),
                 ]);
             }
+            let tune = |k: &str, d: usize| {
+                std::env::var(k)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(d)
+            };
+            let (mv_bo, mv_threads) = (tune("TILE_MV_BO", BO), tune("TILE_MV_THREADS", THREADS));
+            // Folding a norm into a matvec saves a dispatch the whole GPU
+            // waits on, but costs every threadgroup a read of x and a
+            // reduction. Measured on the M4 Max at 512 positions: the 8B
+            // loses (80 tok/s unfolded, 66 folded -- 1,792 threadgroups
+            // re-reading x cost more than the dispatches save) and the 1B
+            // is a wash (264 / 266). Off by default; the kernels stay,
+            // with these switches, because the trade-off moves with the
+            // GPU and the model shape.
+            let fold = (
+                tune("TILE_FOLD_QKV", 0) != 0,
+                tune("TILE_FOLD_GLU", 0) != 0,
+                tune("TILE_FOLD_HEAD", 0) != 0,
+            );
             let mut mv = HashMap::new();
             for kk in keys {
                 if let Entry::Vacant(slot) = mv.entry(kk) {
                     let (n_in, n_out, layout, res) = kk;
                     // One chunk per row: lazy operands need no registers,
                     // so each output reduces across its whole row once.
-                    let p = matvec_q(n_in, n_out, BO, n_in, layout, res)?;
-                    slot.insert(compile(&gpu, &p, THREADS)?);
+                    let p = matvec_q(n_in, n_out, mv_bo, n_in, layout, res)?;
+                    slot.insert(compile(&gpu, &p, mv_threads)?);
                 }
             }
             let bk = attention.bk;
@@ -527,6 +647,9 @@ mod gpu {
                 rope_q: compile(&gpu, &rope(c.n_head, c.head_dim, DType::F16), THREADS)?,
                 rope_k: compile(&gpu, &rope(c.n_kv, c.head_dim, DType::F16), THREADS)?,
                 silu: compile(&gpu, &silu_mul(c.ffn, THREADS)?, THREADS)?,
+                glu: glu_pipelines(&gpu, w, 1, BO, fold.1.then_some(c.eps))?,
+                rms_mv: rms_mv_pipelines(&gpu, w, mv_bo, mv_threads)?,
+                fold,
             };
             let layers = w
                 .layers
@@ -608,6 +731,7 @@ mod gpu {
                 pos: 0,
                 sync: std::env::var_os("TILE_SYNC").is_some(),
                 dispatches: 0,
+                skip: vec![],
                 prof: RefCell::new(BTreeMap::new()),
             })
         }
@@ -699,6 +823,7 @@ mod gpu {
                 )?,
                 attn: compile(gpu, &attn.build_causal(t)?, 128)?,
                 silu: compile(gpu, &silu_mul(t * c.ffn, THREADS)?, THREADS)?,
+                glu: glu_pipelines(gpu, self.w, t, bo, None)?,
             };
             self.batches.insert(t, b);
             Ok(())
@@ -752,9 +877,14 @@ mod gpu {
                     ));
                     d.push(mv(&l.wo, &a.o, Some(&a.x), &a.x2));
                     d.push((&bk.rms, vec![&a.x2, &l.ffn_norm, &a.h]));
-                    d.push(mv(&l.gate, &a.h, None, &a.g));
-                    d.push(mv(&l.up, &a.h, None, &a.u));
-                    d.push((&bk.silu, vec![&a.g, &a.u, &a.a]));
+                    match glu_dispatch(&bk.glu, &l.gate, &l.up, &a.h, None, &a.a) {
+                        Some(g) => d.push(g),
+                        None => {
+                            d.push(mv(&l.gate, &a.h, None, &a.g));
+                            d.push(mv(&l.up, &a.h, None, &a.u));
+                            d.push((&bk.silu, vec![&a.g, &a.u, &a.a]));
+                        }
+                    }
                     d.push(mv(&l.down, &a.a, Some(&a.x2), &a.x));
                 }
                 let out = self.out.as_ref().unwrap_or(&self.emb);
@@ -837,7 +967,10 @@ mod gpu {
                 &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
             );
 
-            let plan = self.plan();
+            let mut plan = self.plan();
+            if !self.skip.is_empty() {
+                plan.retain(|d| !self.skip.iter().any(|s| d.0.starts_with(s.as_str())));
+            }
             let n = plan.len();
             if self.sync {
                 // GPU time per dispatch, from the command buffer's own
@@ -925,10 +1058,35 @@ mod gpu {
             let (a, k) = (&self.acts, &self.k);
             let mut d: Vec<Dispatch<'_>> = vec![];
             for l in &self.layers {
-                d.push(("rmsnorm", &k.rms, vec![&a.x, &l.attn_norm, &a.h], None));
-                d.push(self.mv("matvec q", &l.wq, &a.h, None, &a.q32));
-                d.push(self.mv("matvec k/v", &l.wk, &a.h, None, &a.k32));
-                d.push(self.mv("matvec k/v", &l.wv, &a.h, None, &a.v32));
+                // q, k and v read the residual with the attention RMSNorm
+                // folded in: no separate norm dispatch, and no barrier the
+                // whole GPU waits on before the three of them.
+                let normed = k
+                    .fold
+                    .0
+                    .then(|| {
+                        [
+                            ("matvec q", &l.wq, &a.q32),
+                            ("matvec k/v", &l.wk, &a.k32),
+                            ("matvec k/v", &l.wv, &a.v32),
+                        ]
+                        .into_iter()
+                        .map(|(label, w, y)| {
+                            rms_dispatch(&k.rms_mv, w, &a.x, &l.attn_norm, y)
+                                .map(|(p, bufs)| (label, p, bufs, None))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    })
+                    .flatten();
+                match normed {
+                    Some(steps) => d.extend(steps),
+                    None => {
+                        d.push(("rmsnorm", &k.rms, vec![&a.x, &l.attn_norm, &a.h], None));
+                        d.push(self.mv("matvec q", &l.wq, &a.h, None, &a.q32));
+                        d.push(self.mv("matvec k/v", &l.wk, &a.h, None, &a.k32));
+                        d.push(self.mv("matvec k/v", &l.wv, &a.h, None, &a.v32));
+                    }
+                }
                 d.push((
                     "rope",
                     &k.rope_q,
@@ -991,15 +1149,47 @@ mod gpu {
                     ));
                 }
                 d.push(self.mv("matvec o", &l.wo, &a.o, Some(&a.x), &a.x2));
-                d.push(("rmsnorm", &k.rms, vec![&a.x2, &l.ffn_norm, &a.h], None));
-                d.push(self.mv("matvec gate/up", &l.gate, &a.h, None, &a.g));
-                d.push(self.mv("matvec gate/up", &l.up, &a.h, None, &a.u));
-                d.push(("silu_mul", &k.silu, vec![&a.g, &a.u, &a.a], None));
+                // With the FFN norm folded in, gate/up read the residual
+                // and the norm weight; otherwise a norm dispatch first.
+                let (gx, gn) = if k.fold.1 {
+                    (&a.x2, Some(&l.ffn_norm))
+                } else {
+                    (&a.h, None)
+                };
+                let fused = glu_dispatch(&k.glu, &l.gate, &l.up, gx, gn, &a.a);
+                if !k.fold.1 {
+                    d.push(("rmsnorm", &k.rms, vec![&a.x2, &l.ffn_norm, &a.h], None));
+                }
+                match fused {
+                    Some((p, bufs)) => {
+                        let label = if k.fold.1 {
+                            "matvec gate/up + silu + rms"
+                        } else {
+                            "matvec gate/up + silu"
+                        };
+                        d.push((label, p, bufs, None));
+                    }
+                    None => {
+                        d.push(self.mv("matvec gate/up", &l.gate, &a.h, None, &a.g));
+                        d.push(self.mv("matvec gate/up", &l.up, &a.h, None, &a.u));
+                        d.push(("silu_mul", &k.silu, vec![&a.g, &a.u, &a.a], None));
+                    }
+                }
                 d.push(self.mv("matvec down", &l.down, &a.a, Some(&a.x2), &a.x));
             }
-            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
             let out = self.out.as_ref().unwrap_or(&self.emb);
-            d.push(self.mv("matvec lm head", out, &a.h, None, &a.logits));
+            match k
+                .fold
+                .2
+                .then(|| rms_dispatch(&k.rms_mv, out, &a.x, &self.out_norm, &a.logits))
+                .flatten()
+            {
+                Some((p, bufs)) => d.push(("matvec lm head", p, bufs, None)),
+                None => {
+                    d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
+                    d.push(self.mv("matvec lm head", out, &a.h, None, &a.logits));
+                }
+            }
             d
         }
     }

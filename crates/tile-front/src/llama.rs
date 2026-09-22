@@ -147,6 +147,120 @@ pub fn matvec_q(
     matmul_q(1, n_in, n_out, bo, kc, layout, residual)
 }
 
+/// A quantised matrix's parameters: values, the 6-bit layouts' high plane,
+/// and the scale parameters in [`QLayout::scale_params`] order.
+struct QParams {
+    q: usize,
+    qh: Option<usize>,
+    scales: Vec<(usize, DType, usize)>,
+}
+
+impl QParams {
+    /// Declare `[n_out, n_in]` in `layout`, parameter names prefixed.
+    fn declare(b: &mut Builder, pre: &str, n_in: usize, n_out: usize, layout: QLayout) -> QParams {
+        let qcols = if layout.packed4 || layout.six {
+            n_in / 2
+        } else {
+            n_in
+        };
+        let q = b.param(&format!("{pre}q"), DType::I8, &[n_out, qcols], false);
+        let qh = layout
+            .six
+            .then(|| b.param(&format!("{pre}qh"), DType::I8, &[n_out, n_in / 4], false));
+        let scales = layout
+            .scale_params()
+            .into_iter()
+            .map(|(name, dt, per)| {
+                // `scale_params` names start with `w`: keep the rest.
+                let name = format!("{pre}{}", name.strip_prefix('w').unwrap_or(name));
+                (b.param(&name, dt, &[n_out, n_in / per], false), dt, per)
+            })
+            .collect();
+        QParams { q, qh, scales }
+    }
+
+    /// The dequantised `[bo, kc]` tile of rows `rows..rows+bo`, chunk `c`.
+    fn tile(
+        &self,
+        b: &mut Builder,
+        layout: QLayout,
+        rows: &IdxExpr,
+        c: Var,
+        (bo, kc): (usize, usize),
+    ) -> Var {
+        use Arg::Move;
+        let g = layout.group;
+        let load = |b: &mut Builder, (p, dt, per): (usize, DType, usize)| {
+            b.op(
+                "w",
+                Op::Load(
+                    at(
+                        p,
+                        [rows.clone(), IdxExpr::scaled(c, kc / per, 0)],
+                        [bo, kc / per],
+                    ),
+                    reg(dt, &[bo, kc / per]),
+                ),
+            )
+        };
+        // Per-group scales (and mins): f16 directly, or `sc * d` through
+        // `dequant` for the two-level K-quants.
+        let (s, m) = match layout.super_groups {
+            None => (load(b, self.scales[0]), None),
+            Some(sub) => {
+                let sc = load(b, self.scales[0]);
+                let d = load(b, self.scales[1]);
+                let s = b.op("s", Op::Dequant(Move(sc), Move(d), None, sub));
+                let m = layout.min.then(|| {
+                    let mn = load(b, self.scales[2]);
+                    let dmin = load(b, self.scales[3]);
+                    Move(b.op("m", Op::Dequant(Move(mn), Move(dmin), None, sub)))
+                });
+                (s, m)
+            }
+        };
+        if let Some(qh) = self.qh {
+            // Two bit planes: 4 low bits two per byte, 2 high bits four per
+            // byte.
+            let lo = load(b, (self.q, DType::I8, 2));
+            let hi = load(b, (qh, DType::I8, 4));
+            b.op("w", Op::Dequant6(Move(lo), Move(hi), Move(s), g))
+        } else if layout.packed4 {
+            // Two values per byte: one load feeds both.
+            let q = load(b, (self.q, DType::I8, 2));
+            b.op("w", Op::Dequant4(Move(q), Move(s), m, g, Nibbles::Pairs))
+        } else {
+            let q = load(b, (self.q, DType::I8, 1));
+            b.op("w", Op::Dequant(Move(q), Move(s), m, g))
+        }
+    }
+}
+
+fn check_shape(
+    n_in: usize,
+    n_out: usize,
+    bo: usize,
+    kc: usize,
+    layout: QLayout,
+) -> Result<(), String> {
+    let sup = layout.group * layout.super_groups.unwrap_or(1);
+    if !n_out.is_multiple_of(bo) || !n_in.is_multiple_of(kc) || !kc.is_multiple_of(sup) {
+        return Err(format!(
+            "matvec {n_out}x{n_in}: bo {bo} must divide the rows, kc {kc} the columns, and \
+             each chunk must be whole super-blocks of {sup}"
+        ));
+    }
+    Ok(())
+}
+
+fn matmul_tag(t: usize) -> String {
+    if t == 1 {
+        "matvec".to_string()
+    } else {
+        format!("matmul{t}")
+    }
+}
+
 /// [`matvec_q`] for `t` rows of activations at once (`x: [t, n_in]`,
 /// `y: [t, n_out]`): prefill's shape, where each weight is read once for
 /// every token of the batch.
@@ -160,40 +274,16 @@ pub fn matmul_q(
     residual: bool,
 ) -> Result<Program, String> {
     use Arg::Move;
-    let g = layout.group;
-    let sup = g * layout.super_groups.unwrap_or(1);
-    if !n_out.is_multiple_of(bo) || !n_in.is_multiple_of(kc) || !kc.is_multiple_of(sup) {
-        return Err(format!(
-            "matvec {n_out}x{n_in}: bo {bo} must divide the rows, kc {kc} the columns, and \
-             each chunk must be whole super-blocks of {sup}"
-        ));
-    }
+    check_shape(n_in, n_out, bo, kc, layout)?;
     let name = format!(
         "{}_{}_{n_out}x{n_in}{}",
-        if t == 1 {
-            "matvec".to_string()
-        } else {
-            format!("matmul{t}")
-        },
+        matmul_tag(t),
         layout.tag(),
         if residual { "_res" } else { "" }
     );
     let mut b = Builder::new(&name);
     let px = b.param("x", DType::F32, &[t, n_in], false);
-    let qcols = if layout.packed4 || layout.six {
-        n_in / 2
-    } else {
-        n_in
-    };
-    let pq = b.param("wq", DType::I8, &[n_out, qcols], false);
-    let pqh = layout
-        .six
-        .then(|| b.param("wqh", DType::I8, &[n_out, n_in / 4], false));
-    let pscales: Vec<(usize, DType, usize)> = layout
-        .scale_params()
-        .into_iter()
-        .map(|(name, dt, per)| (b.param(name, dt, &[n_out, n_in / per], false), dt, per))
-        .collect();
+    let w = QParams::declare(&mut b, "w", n_in, n_out, layout);
     let pr = residual.then(|| b.param("r", DType::F32, &[t, n_out], false));
     let py = b.param("y", DType::F32, &[t, n_out], true);
     let pid = b.grid(n_out / bo);
@@ -207,99 +297,9 @@ pub fn matmul_q(
         vec![Ty::Tile(acc_ty)],
         |b, c, p| {
             let rows = IdxExpr::scaled(pid, bo, 0);
-            let x_at = |b: &mut Builder, col0: usize, cols: usize| {
-                b.op(
-                    "x",
-                    Op::Load(
-                        at(
-                            px,
-                            [IdxExpr::lit(0), IdxExpr::scaled(c, kc, col0)],
-                            [t, cols],
-                        ),
-                        reg(DType::F32, &[t, cols]),
-                    ),
-                )
-            };
-            // One weight-parameter tile for columns `col0..col0+cols` of
-            // this chunk, at `per` values per element.
-            let load =
-                |b: &mut Builder, (p, dt, per): (usize, DType, usize), col0: usize, cols: usize| {
-                    b.op(
-                        "w",
-                        Op::Load(
-                            at(
-                                p,
-                                [rows.clone(), IdxExpr::scaled(c, kc / per, col0 / per)],
-                                [bo, cols / per],
-                            ),
-                            reg(dt, &[bo, cols / per]),
-                        ),
-                    )
-                };
-            // Per-group scales (and mins) for a column range: f16 directly,
-            // or `sc * d` through `dequant` for the two-level K-quants.
-            let scales = |b: &mut Builder, col0: usize, cols: usize| -> (Var, Option<Arg>) {
-                match layout.super_groups {
-                    None => (load(b, pscales[0], col0, cols), None),
-                    Some(sub) => {
-                        let sc = load(b, pscales[0], col0, cols);
-                        let d = load(b, pscales[1], col0, cols);
-                        let s = b.op("s", Op::Dequant(Move(sc), Move(d), None, sub));
-                        let m = layout.min.then(|| {
-                            let mn = load(b, pscales[2], col0, cols);
-                            let dmin = load(b, pscales[3], col0, cols);
-                            Move(b.op("m", Op::Dequant(Move(mn), Move(dmin), None, sub)))
-                        });
-                        (s, m)
-                    }
-                }
-            };
-            let x = x_at(b, 0, kc);
-            let (s, m) = scales(b, 0, kc);
-            let w = if let Some(pqh) = pqh {
-                // Two bit planes: 4 low bits two per byte, 2 high bits four
-                // per byte.
-                let plane = |b: &mut Builder, p, per: usize| {
-                    b.op(
-                        "q",
-                        Op::Load(
-                            at(
-                                p,
-                                [rows.clone(), IdxExpr::scaled(c, kc / per, 0)],
-                                [bo, kc / per],
-                            ),
-                            reg(DType::I8, &[bo, kc / per]),
-                        ),
-                    )
-                };
-                let lo = plane(b, pq, 2);
-                let hi = plane(b, pqh, 4);
-                b.op("w", Op::Dequant6(Move(lo), Move(hi), Move(s), g))
-            } else if layout.packed4 {
-                // Two values per byte: one load feeds both.
-                let q = b.op(
-                    "q",
-                    Op::Load(
-                        at(
-                            pq,
-                            [rows.clone(), IdxExpr::scaled(c, kc / 2, 0)],
-                            [bo, kc / 2],
-                        ),
-                        reg(DType::I8, &[bo, kc / 2]),
-                    ),
-                );
-                b.op("w", Op::Dequant4(Move(q), Move(s), m, g, Nibbles::Pairs))
-            } else {
-                let q = b.op(
-                    "q",
-                    Op::Load(
-                        at(pq, [rows.clone(), IdxExpr::scaled(c, kc, 0)], [bo, kc]),
-                        reg(DType::I8, &[bo, kc]),
-                    ),
-                );
-                b.op("w", Op::Dequant(Move(q), Move(s), m, g))
-            };
-            let part = b.op("part", Op::MatMulNT(Move(x), Move(w), DType::F32));
+            let x = x_chunk(b, px, c, (t, kc));
+            let wt = w.tile(b, layout, &rows, c, (bo, kc));
+            let part = b.op("part", Op::MatMulNT(Move(x), Move(wt), DType::F32));
             vec![b.op("acc", Op::Binary(BinOp::Add, Move(p[0]), Move(part)))]
         },
     );
@@ -316,6 +316,135 @@ pub fn matmul_q(
         y = b.op("y", Op::Binary(BinOp::Add, Move(y), Move(r)));
     }
     b.effect(Op::Store(Move(y), dst));
+    Ok(b.finish())
+}
+
+/// RMSNorm folded into a matvec: `W (g ⊙ x) · rsqrt(mean(x²) + eps)` is
+/// `W · rmsnorm(x, g)` with the scalar applied to the `bo` outputs instead
+/// of the `n_in` inputs. Every threadgroup forms the scalar itself from x
+/// (16 KB, cache-resident), so no separate norm dispatch, and no barrier
+/// the whole GPU waits on, sits between the residual and the matvec.
+/// Returns the `g ⊙ x` tile to multiply and the `[1]` scale. Decode only
+/// (one row): `g` is `[1, n]` and multiplies `x` elementwise.
+fn normed_x(b: &mut Builder, px: usize, pg: usize, c: Var, n: usize, eps: f32) -> (Var, Var) {
+    use Arg::{Borrow, Move};
+    let x = x_chunk(b, px, c, (1, n));
+    let sq = b.op("sq", Op::Binary(BinOp::Mul, Borrow(x), Borrow(x)));
+    let ss = b.op("ss", Op::RowReduce(Reduce::Sum, Move(sq)));
+    let ms = b.op("ms", Op::Scale(Move(ss), 1.0 / n as f32));
+    let e = b.op("eps", Op::Fill(reg(DType::F32, &[1]), eps));
+    let t = b.op("t", Op::Binary(BinOp::Add, Move(ms), Move(e)));
+    let r = b.op("r", Op::Unary(UnOp::Rsqrt, Move(t)));
+    let g = b.op("g", Op::Load(row(pg, n), reg(DType::F32, &[1, n])));
+    let xg = b.op("xg", Op::Binary(BinOp::Mul, Move(x), Move(g)));
+    (xg, r)
+}
+
+/// [`matvec_q`] of `rmsnorm(x, g)` with the norm folded in (see
+/// [`normed_x`]). Parameters: `x, g, <weights>, y`.
+pub fn matvec_q_rms(
+    n_in: usize,
+    n_out: usize,
+    bo: usize,
+    layout: QLayout,
+    eps: f32,
+) -> Result<Program, String> {
+    use Arg::Move;
+    check_shape(n_in, n_out, bo, n_in, layout)?;
+    let mut b = Builder::new(&format!("matvec_rms_{}_{n_out}x{n_in}", layout.tag()));
+    let px = b.param("x", DType::F32, &[1, n_in], false);
+    let pg = b.param("gn", DType::F32, &[1, n_in], false);
+    let w = QParams::declare(&mut b, "w", n_in, n_out, layout);
+    let py = b.param("y", DType::F32, &[1, n_out], true);
+    let pid = b.grid(n_out / bo);
+    let rows = IdxExpr::scaled(pid, bo, 0);
+    b.for_range(0, 1, vec![], vec![], |b, c, _| {
+        let (xg, r) = normed_x(b, px, pg, c, n_in, eps);
+        let wt = w.tile(b, layout, &rows, c, (bo, n_in));
+        let y = b.op("y", Op::MatMulNT(Move(xg), Move(wt), DType::F32));
+        let y = b.op("y", Op::Binary(BinOp::Mul, Move(y), Move(r)));
+        b.effect(Op::Store(
+            Move(y),
+            at(py, [IdxExpr::lit(0), rows.clone()], [1, bo]),
+        ));
+        vec![]
+    });
+    Ok(b.finish())
+}
+
+/// The activations `x[.., chunk c]`, as a lazy `[t, kc]` tile.
+fn x_chunk(b: &mut Builder, px: usize, c: Var, (t, kc): (usize, usize)) -> Var {
+    b.op(
+        "x",
+        Op::Load(
+            at(px, [IdxExpr::lit(0), IdxExpr::scaled(c, kc, 0)], [t, kc]),
+            reg(DType::F32, &[t, kc]),
+        ),
+    )
+}
+
+/// The feed-forward's gated input in one kernel:
+/// `a = silu(W_gate x) * (W_up x)` for `t` rows of `x`, both matrices
+/// `[n_out, n_in]` in `layout`. Replaces two matmuls and `silu_mul`: one
+/// dispatch instead of three, and `g`, `u` never reach memory.
+/// Parameters: `x, <gate weights>, <up weights>, a`.
+///
+/// With `norm = Some(eps)` (decode only, `t == 1`), `x` is the residual
+/// and the FFN's RMSNorm is folded in (see [`normed_x`]); parameters are
+/// then `x, g, <gate>, <up>, a`.
+pub fn matmul_q_glu(
+    t: usize,
+    n_in: usize,
+    n_out: usize,
+    bo: usize,
+    layout: QLayout,
+    norm: Option<f32>,
+) -> Result<Program, String> {
+    use Arg::{Borrow, Move};
+    let kc = n_in;
+    check_shape(n_in, n_out, bo, kc, layout)?;
+    if norm.is_some() && t != 1 {
+        return Err("a folded norm is for one row".into());
+    }
+    let mut b = Builder::new(&format!(
+        "{}_glu{}_{}_{n_out}x{n_in}",
+        matmul_tag(t),
+        if norm.is_some() { "_rms" } else { "" },
+        layout.tag()
+    ));
+    let px = b.param("x", DType::F32, &[t, n_in], false);
+    let pg = norm.map(|_| b.param("gn", DType::F32, &[1, n_in], false));
+    let wg = QParams::declare(&mut b, "g", n_in, n_out, layout);
+    let wu = QParams::declare(&mut b, "u", n_in, n_out, layout);
+    let pa = b.param("a", DType::F32, &[t, n_out], true);
+    let pid = b.grid(n_out / bo);
+    let rows = IdxExpr::scaled(pid, bo, 0);
+    // One chunk, the whole row (`kc == n_in`).
+    b.for_range(0, 1, vec![], vec![], |b, c, _| {
+        let (x, r) = match (norm, pg) {
+            (Some(eps), Some(pg)) => {
+                let (xg, r) = normed_x(b, px, pg, c, n_in, eps);
+                (xg, Some(r))
+            }
+            _ => (x_chunk(b, px, c, (t, kc)), None),
+        };
+        let gt = wg.tile(b, layout, &rows, c, (bo, kc));
+        let mut g = b.op("g", Op::MatMulNT(Borrow(x), Move(gt), DType::F32));
+        let ut = wu.tile(b, layout, &rows, c, (bo, kc));
+        let mut u = b.op("u", Op::MatMulNT(Move(x), Move(ut), DType::F32));
+        if let Some(r) = r {
+            g = b.op("g", Op::Binary(BinOp::Mul, Move(g), Borrow(r)));
+            u = b.op("u", Op::Binary(BinOp::Mul, Move(u), Move(r)));
+        }
+        let sg = b.op("sg", Op::Unary(UnOp::Sigmoid, Borrow(g)));
+        let sl = b.op("silu", Op::Binary(BinOp::Mul, Move(g), Move(sg)));
+        let a = b.op("a", Op::Binary(BinOp::Mul, Move(sl), Move(u)));
+        b.effect(Op::Store(
+            Move(a),
+            at(pa, [IdxExpr::lit(0), rows.clone()], [t, bo]),
+        ));
+        vec![]
+    });
     Ok(b.finish())
 }
 

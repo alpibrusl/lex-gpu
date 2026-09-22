@@ -10,6 +10,10 @@
 //!
 //! cargo run --release -p tile-rt --example profile -- --model llama3.1:8b --tokens 32
 //! cargo run --release -p tile-rt --example profile -- --model llama3.1:8b --context 512
+//!
+//! `--skip rmsnorm,rope` leaves those call sites out of every step (wrong
+//! logits, real timing): the drop in ms/token is what they cost on the
+//! overlapped critical path, which the per-dispatch pass overstates.
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), String> {
@@ -21,6 +25,7 @@ fn main() -> Result<(), String> {
     let mut model = "llama3.2:1b".to_string();
     let mut tokens = 32usize;
     let mut context = 0usize;
+    let mut skip = vec![];
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -28,12 +33,14 @@ fn main() -> Result<(), String> {
             "--model" => model = val()?,
             "--tokens" => tokens = val()?.parse().map_err(|_| "bad --tokens")?,
             "--context" => context = val()?.parse().map_err(|_| "bad --context")?,
+            "--skip" => skip = val()?.split(',').map(String::from).collect(),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
     let t = Instant::now();
     let w = Weights::load(&ollama_model(&model)?, context + tokens)?;
     let mut rt = Runner::new(&w)?;
+    rt.skip = skip;
     println!(
         "{model}: loaded and compiled in {:.1} s on {}",
         t.elapsed().as_secs_f64(),

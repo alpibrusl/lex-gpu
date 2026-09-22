@@ -5,7 +5,8 @@
 
 use half::f16;
 use tile_front::llama::{
-    QLayout, Split, kv_append, matmul_q, matvec_q, rmsnorm, rope, rope_tables, silu_mul,
+    QLayout, Split, kv_append, matmul_q, matmul_q_glu, matvec_q, matvec_q_rms, rmsnorm, rope,
+    rope_tables, silu_mul,
 };
 use tile_front::{Program, Tensor, check, run_dyn};
 use tile_ir::reference::fill_pattern_f32;
@@ -110,11 +111,11 @@ fn matvec_every_layout_matches_the_interpreter() {
                     .collect::<Vec<_>>()
             };
             let two_level = layout.super_groups.is_some();
-            let sp = Split {
+            let split = |o: u32| Split {
                 layout,
                 cols: n_in,
                 qh: if layout.six {
-                    pattern(n_in * n_out / 4, 10)
+                    pattern(n_in * n_out / 4, 10 + o)
                         .iter()
                         .map(|v| ((v + 1.0) * 127.5) as u8 as i8)
                         .collect()
@@ -122,20 +123,27 @@ fn matvec_every_layout_matches_the_interpreter() {
                     vec![]
                 },
                 q: if layout.packed4 || layout.six {
-                    pattern(n_in * n_out / 2, 4)
+                    pattern(n_in * n_out / 2, 4 + o)
                         .iter()
                         .map(|v| ((v + 1.0) * 127.5) as u8 as i8)
                         .collect()
                 } else {
-                    pattern(n_in * n_out, 4)
+                    pattern(n_in * n_out, 4 + o)
                         .iter()
                         .map(|v| (v * 31.0).round() as i8)
                         .collect()
                 },
-                sc: if two_level { small(groups, 5) } else { vec![] },
-                d: f16s(if two_level { supers } else { groups }, 6),
-                mn: layout.min.then(|| (small(groups, 7), f16s(supers, 8))),
+                sc: if two_level {
+                    small(groups, 5 + o)
+                } else {
+                    vec![]
+                },
+                d: f16s(if two_level { supers } else { groups }, 6 + o),
+                mn: layout
+                    .min
+                    .then(|| (small(groups, 7 + o), f16s(supers, 8 + o))),
             };
+            let sp = split(0);
             let mut t = vec![Tensor::new(DType::F32, &[1, n_in], &pattern(n_in, 3))];
             t.extend(sp.weight_tensors(n_out));
             if residual {
@@ -166,6 +174,47 @@ fn matvec_every_layout_matches_the_interpreter() {
                 let out = t.len() - 1;
                 let p = matmul_q(rows, n_in, n_out, 8, n_in, layout, residual).unwrap();
                 same(&gpu, &p, t, &[], out, 256);
+            }
+
+            // Gate and up fused with SiLU·mul, for one row and a batch.
+            if !residual {
+                let up = split(100);
+                for rows in [1usize, 4] {
+                    let mut t = vec![Tensor::new(
+                        DType::F32,
+                        &[rows, n_in],
+                        &pattern(rows * n_in, 13),
+                    )];
+                    t.extend(sp.weight_tensors(n_out));
+                    t.extend(up.weight_tensors(n_out));
+                    t.push(Tensor::zeros(DType::F32, &[rows, n_out]));
+                    let out = t.len() - 1;
+                    let p = matmul_q_glu(rows, n_in, n_out, 8, layout, None).unwrap();
+                    same(&gpu, &p, t, &[], out, 256);
+                }
+
+                // The same, with the FFN's RMSNorm folded into the matvec,
+                // and a plain matvec with the attention norm folded in.
+                let g = Tensor::new(DType::F32, &[1, n_in], &pattern(n_in, 14));
+                for (p, extra) in [
+                    (
+                        matmul_q_glu(1, n_in, n_out, 8, layout, Some(1e-5)).unwrap(),
+                        true,
+                    ),
+                    (matvec_q_rms(n_in, n_out, 8, layout, 1e-5).unwrap(), false),
+                ] {
+                    let mut t = vec![
+                        Tensor::new(DType::F32, &[1, n_in], &pattern(n_in, 13)),
+                        g.clone(),
+                    ];
+                    t.extend(sp.weight_tensors(n_out));
+                    if extra {
+                        t.extend(up.weight_tensors(n_out));
+                    }
+                    t.push(Tensor::zeros(DType::F32, &[1, n_out]));
+                    let out = t.len() - 1;
+                    same(&gpu, &p, t, &[], out, 256);
+                }
             }
         }
     }
