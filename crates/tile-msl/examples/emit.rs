@@ -24,7 +24,8 @@ fn main() -> Result<(), String> {
                 Some("q4k") => QLayout::Q4_K,
                 Some("q6k") => QLayout::Q6_K,
                 Some("q8") => QLayout::Q8_0,
-                _ => return Err("layout: q4k, q6k or q8".into()),
+                Some("nvfp4") => QLayout::NVFP4,
+                _ => return Err("layout: q4k, q6k, q8 or nvfp4".into()),
             };
             let (n_in, n_out) = (num(2)?, num(3)?);
             matvec_q(n_in, n_out, 8, n_in, layout, false)?

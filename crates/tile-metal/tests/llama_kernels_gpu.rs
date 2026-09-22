@@ -409,6 +409,124 @@ fn split_kv_attention_matches_the_interpreter() {
     }
 }
 
+/// Qwen3.5's gates and its depthwise convolution, at the model's shapes.
+#[test]
+fn delta_gates_and_conv_match_the_interpreter() {
+    use tile_front::qwen::{build_conv_silu, build_gates};
+    let gpu = Gpu::open().expect("metal device");
+    let (hv, dv) = (48usize, 128usize);
+    // `dt_bias` reaches 19 in the real weights: softplus must stay linear
+    // there rather than overflowing through `exp`.
+    let dt: Vec<f32> = (0..hv)
+        .map(|i| -6.0 + 25.0 * (i as f32) / hv as f32)
+        .collect();
+    let gates = vec![
+        Tensor::new(DType::F32, &[hv], &pattern(hv, 40)),
+        Tensor::new(DType::F32, &[hv], &pattern(hv, 41)),
+        Tensor::new(
+            DType::F32,
+            &[hv],
+            &pattern(hv, 42)
+                .iter()
+                .map(|x| 0.5 + x.abs())
+                .collect::<Vec<_>>(),
+        ),
+        Tensor::new(DType::F32, &[hv], &dt),
+        Tensor::zeros(DType::F32, &[hv, dv]),
+        Tensor::zeros(DType::F32, &[hv, dv]),
+    ];
+    for out in [4, 5] {
+        same(&gpu, &build_gates(hv, dv), gates.clone(), &[], out, 64);
+    }
+
+    let (ch, kern) = (10240usize, 4usize);
+    let conv = vec![
+        Tensor::new(DType::F32, &[kern - 1, ch], &pattern((kern - 1) * ch, 43)),
+        Tensor::new(DType::F32, &[1, ch], &pattern(ch, 44)),
+        Tensor::new(DType::F32, &[kern, ch], &pattern(kern * ch, 45)),
+        Tensor::zeros(DType::F32, &[1, ch]),
+    ];
+    // The output, and the window the step leaves behind.
+    for out in [3, 0] {
+        same(
+            &gpu,
+            &build_conv_silu(ch, kern, 256).unwrap(),
+            conv.clone(),
+            &[],
+            out,
+            256,
+        );
+    }
+}
+
+/// Qwen3.5's gated-delta state update, at the model's own shape.
+#[test]
+fn delta_state_matches_the_interpreter() {
+    use tile_front::qwen::DeltaNet;
+    let gpu = Gpu::open().expect("metal device");
+    let c = DeltaNet {
+        v_heads: 48,
+        k_heads: 16,
+        k_dim: 128,
+        v_dim: 128,
+        rows: 8,
+    };
+    let prog = c.build_step().unwrap();
+    let (hv, dk, dv) = (c.v_heads, c.k_dim, c.v_dim);
+    let gates = |seed, lo: f32, hi: f32| -> Vec<f32> {
+        pattern(hv * dv, seed)
+            .iter()
+            .map(|x| lo + (hi - lo) * x.abs().min(1.0))
+            .collect()
+    };
+    let t = vec![
+        Tensor::new(DType::F32, &[hv * dv, dk], &pattern(hv * dv * dk, 30)),
+        Tensor::new(DType::F32, &[hv, dk], &pattern(hv * dk, 31)),
+        Tensor::new(DType::F32, &[hv, dk], &pattern(hv * dk, 32)),
+        Tensor::new(DType::F32, &[hv * dv], &pattern(hv * dv, 33)),
+        Tensor::new(DType::F32, &[hv * dv], &gates(34, 0.5, 1.0)),
+        Tensor::new(DType::F32, &[hv * dv], &gates(35, 0.1, 0.9)),
+        Tensor::zeros(DType::F32, &[hv * dv]),
+    ];
+    // The output, and the state the step leaves behind.
+    for out in [6, 0] {
+        same(&gpu, &prog, t.clone(), &[], out, 128);
+    }
+}
+
+/// NVFP4 (Qwen3.5's MLX weights): E2M1 codes two per byte, an FP8 E4M3
+/// scale per 16, one f32 scale per tensor held per row.
+#[test]
+fn nvfp4_matvec_matches_the_interpreter() {
+    let gpu = Gpu::open().expect("metal device");
+    let (n_in, n_out) = (512, 64);
+    // Scale bytes with a sane exponent (no NaN, no subnormals).
+    let scales: Vec<f32> = pattern(n_out * n_in / 16, 21)
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let e = 4 + (i % 8) as u8;
+            let m = ((v.abs() * 8.0) as u8) & 7;
+            ((e << 3) | m) as i8 as f32
+        })
+        .collect();
+    let codes: Vec<f32> = pattern(n_out * n_in / 2, 22)
+        .iter()
+        .map(|v| ((v + 1.0) * 127.5) as u8 as i8 as f32)
+        .collect();
+    for rows in [1usize, 4] {
+        let t = vec![
+            Tensor::new(DType::F32, &[rows, n_in], &pattern(rows * n_in, 23)),
+            Tensor::new(DType::I8, &[n_out, n_in / 2], &codes),
+            Tensor::new(DType::I8, &[n_out, n_in / 16], &scales),
+            Tensor::new(DType::F32, &[n_out], &vec![0.0125f32; n_out]),
+            Tensor::zeros(DType::F32, &[rows, n_out]),
+        ];
+        let p = matmul_q(rows, n_in, n_out, 8, n_in, QLayout::NVFP4, false).unwrap();
+        same(&gpu, &p, t, &[], 4, 256);
+    }
+}
+
 /// The batched forward pass's kernels (prefill, speculative verify).
 #[test]
 fn batched_kernels_match_the_interpreter() {

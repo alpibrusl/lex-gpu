@@ -210,6 +210,10 @@ impl BinOp {
 pub enum UnOp {
     Rsqrt,
     Sigmoid,
+    /// `log(1 + exp(x))`, evaluated as `max(x, 0) + log(1 + exp(-|x|))` so
+    /// a large `x` neither overflows nor loses the linear part. Qwen3.5's
+    /// decay gate is `exp(-A softplus(a + bias))`, and its bias reaches 19.
+    Softplus,
 }
 
 impl UnOp {
@@ -217,6 +221,7 @@ impl UnOp {
         match self {
             UnOp::Rsqrt => 1.0 / x.sqrt(),
             UnOp::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            UnOp::Softplus => x.max(0.0) + (-x.abs()).exp().ln_1p(),
         }
     }
 
@@ -224,6 +229,7 @@ impl UnOp {
         match self {
             UnOp::Rsqrt => "rsqrt",
             UnOp::Sigmoid => "sigmoid",
+            UnOp::Softplus => "softplus",
         }
     }
 }
@@ -288,6 +294,13 @@ pub enum Op {
     /// [`Op::Dequant`] for unsigned 4-bit values packed two per byte.
     /// Which nibbles it takes is the [`Nibbles`] mode.
     Dequant4(Arg, Arg, Option<Arg>, usize, Nibbles),
+    /// NVFP4: 4-bit float values (E2M1: sign, 2-bit exponent, 1-bit
+    /// mantissa, magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6) packed two per byte
+    /// as [`Nibbles::Pairs`], an FP8 E4M3 scale per `group` values held in
+    /// an `I8` tile, and one f32 scale per row (a whole tensor's, repeated).
+    /// Value `e2m1(q) * e4m3(s) * gs[row]`; output `[r, c]` in f32.
+    /// `q: [r, c/2]`, `s: [r, c/group]`, `gs: [r]`.
+    DequantFp4(Arg, Arg, Arg, usize),
     /// Unsigned 6-bit values split into bit planes, as Q6_K stores them: a
     /// 4-bit plane `lo: [r, c/2]` (column `2k` low nibble of byte `k`,
     /// `2k + 1` high) and a 2-bit plane `hi: [r, c/4]` (columns `4k..4k+3`

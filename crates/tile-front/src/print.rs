@@ -123,6 +123,12 @@ fn op(p: &Program, o: &Op) -> String {
             arg(p, *s)
         ),
         Op::SwapPairs(a) => format!("swap_pairs {}", arg(p, *a)),
+        Op::DequantFp4(q, s, gs, g) => format!(
+            "dequant_fp4 {}, {}, row {} group {g}",
+            arg(p, *q),
+            arg(p, *s),
+            arg(p, *gs)
+        ),
         Op::Dequant(q, s, m, g) | Op::Dequant4(q, s, m, g, _) => {
             let min = m.map_or(String::new(), |m| format!(", min {}", arg(p, m)));
             let name = match o {

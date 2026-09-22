@@ -26,6 +26,26 @@ use std::time::{Duration, Instant};
 use half::f16;
 use tile_ir::DType;
 
+/// One NVFP4 value: sign, 2-bit exponent, 1-bit mantissa.
+pub fn e2m1(code: u8) -> f32 {
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let v = MAG[(code & 7) as usize];
+    if code & 8 != 0 { -v } else { v }
+}
+
+/// One FP8 E4M3 byte (OCP `e4m3fn`: no infinities, max 448).
+pub fn e4m3(b: u8) -> f32 {
+    let (e, m) = ((b >> 3) & 0xF, (b & 7) as f32);
+    let v = if e == 0 {
+        m * 2.0f32.powi(-9)
+    } else if e == 15 && m == 7.0 {
+        f32::NAN
+    } else {
+        (1.0 + m / 8.0) * 2.0f32.powi(e as i32 - 7)
+    };
+    if b & 0x80 != 0 { -v } else { v }
+}
+
 use crate::ir::{
     Arg, Block, IdxExpr, Nibbles, Op, PipeDecl, Program, Reduce, Role, Stmt, TileTy, Var, View,
 };
@@ -556,6 +576,21 @@ impl Interp<'_> {
                         let nib = if high { byte >> 4 } else { byte & 0xF };
                         let g = row * (c / group) + col / group;
                         nib as f32 * ts.data[g] - tm.as_ref().map_or(0.0, |m| m.data[g])
+                    })
+                    .collect();
+                Some(Val::Tile(self.fresh(DType::F32, &[r, c], out)))
+            }
+            Op::DequantFp4(q, sc, gs, group) => {
+                let (tq, ts, tg) = (self.arg(*q)?, self.arg(*sc)?, self.arg(*gs)?);
+                let (r, c) = (tq.ty.shape[0], 2 * tq.ty.shape[1]);
+                let out = (0..r * c)
+                    .map(|i| {
+                        let (row, col) = (i / c, i % c);
+                        let byte = (tq.data[row * c / 2 + col / 2] as i32) & 0xFF;
+                        let code = if col % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                        let g = row * (c / group) + col / group;
+                        let scale = e4m3(ts.data[g] as i32 as u8);
+                        e2m1(code as u8) * scale * tg.data[row]
                     })
                     .collect();
                 Some(Val::Tile(self.fresh(DType::F32, &[r, c], out)))

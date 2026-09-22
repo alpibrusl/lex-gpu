@@ -767,6 +767,41 @@ impl Checker<'_> {
                 }
                 Some(reg(DType::F32, &[tq.shape[0], cols]))
             }
+            Op::DequantFp4(q, sc, gs, group) => {
+                let tys = self.args(&[*q, *sc, *gs])?;
+                let tq = self.tile(tys[0].clone(), "nvfp4 values")?;
+                let ts = self.tile(tys[1].clone(), "nvfp4 scales")?;
+                let tg = self.tile(tys[2].clone(), "nvfp4 row scales")?;
+                if tq.dtype != DType::I8 || ts.dtype != DType::I8 {
+                    self.err(Kind::Type, "nvfp4 values and FP8 scales must be I8".into());
+                    return None;
+                }
+                if tg.dtype != DType::F32 {
+                    self.err(Kind::Type, "nvfp4 row scales must be F32".into());
+                    return None;
+                }
+                let (r, c) = (
+                    tq.shape.first().copied().unwrap_or(0),
+                    2 * tq.shape.get(1).copied().unwrap_or(0),
+                );
+                let ok = tq.shape.len() == 2
+                    && *group > 0
+                    && c.is_multiple_of(*group)
+                    && ts.shape == [r, c / group]
+                    && tg.shape == [r];
+                if !ok {
+                    self.err(
+                        Kind::Shape,
+                        format!(
+                            "nvfp4 of {:?} values with scales {:?} and row scales {:?} in groups \
+                             of {group}",
+                            tq.shape, ts.shape, tg.shape
+                        ),
+                    );
+                    return None;
+                }
+                Some(reg(DType::F32, &[r, c]))
+            }
             Op::Dequant6(lo, hi, s, group) => {
                 let tys = self.args(&[*lo, *hi, *s])?;
                 let tl = self.tile(tys[0].clone(), "dequant6 low plane")?;
