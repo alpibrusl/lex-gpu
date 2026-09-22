@@ -130,11 +130,12 @@ const FP4_TABLES: &str = concat!(
     // values that needs fixing, and `2t - 1` maps them from 0.5 and 0.75
     // to 0 and 0.5.
     "inline float2 fp4_pair(uint b) {\n",
-    "    const uint2 c = uint2(b & 0xFu, b >> 4u);\n",
-    "    const float2 t = as_type<float2>(((c & 7u) << 22u) + 0x3F000000u);\n",
-    "    const float2 lo = float2((c & 7u) < 2u);\n",
-    "    const float2 v = t * (1.0f + lo) - lo;\n",
-    "    return as_type<float2>(as_type<uint2>(v) | ((c & 8u) << 28u));\n",
+    "    const ushort2 c = ushort2(b & 0xFu, b >> 4u);\n",
+    "    const ushort2 mag = c & 7;\n",
+    "    const half2 t = as_type<half2>(ushort2((mag << 9) + 0x3800));\n",
+    "    const half2 lo = half2(mag < 2);\n",
+    "    const half2 v = t * (half2(1.0h) + lo) - lo;\n",
+    "    return float2(as_type<half2>(ushort2(as_type<ushort2>(v) | (c & 8) << 12)));\n",
     "}\n",
     "inline float fp8_e4m3(uint b) {\n",
     "    const uint e = (b >> 3u) & 0xFu, m = b & 7u;\n",
