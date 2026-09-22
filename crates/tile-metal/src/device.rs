@@ -233,6 +233,41 @@ impl Gpu {
         best
     }
 
+    /// Run a sequence of dispatches in one command buffer and wait once.
+    ///
+    /// The compute encoder is serial (Metal's default): each dispatch
+    /// finishes, and its writes are visible, before the next starts. So this
+    /// has the same semantics as calling [`Gpu::run`] for each in turn,
+    /// without a CPU round trip between them.
+    pub fn run_all(&self, steps: &[(&Pipeline, &[&Buffer])]) {
+        autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            for (pipeline, buffers) in steps {
+                let l = pipeline.plan.launch;
+                enc.set_compute_pipeline_state(&pipeline.pso);
+                for (i, &b) in buffers.iter().enumerate() {
+                    enc.set_buffer(i as u64, Some(b), 0);
+                }
+                enc.dispatch_thread_groups(
+                    MTLSize::new(
+                        l.threadgroups[0] as u64,
+                        l.threadgroups[1] as u64,
+                        l.threadgroups[2] as u64,
+                    ),
+                    MTLSize::new(
+                        l.threads_per_threadgroup[0] as u64,
+                        l.threads_per_threadgroup[1] as u64,
+                        l.threads_per_threadgroup[2] as u64,
+                    ),
+                );
+            }
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        });
+    }
+
     fn dispatch(&self, pipeline: &Pipeline, buffers: &[&Buffer], iters: usize) {
         let l = pipeline.plan.launch;
         let groups = MTLSize::new(

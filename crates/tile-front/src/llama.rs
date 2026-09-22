@@ -58,6 +58,12 @@ pub fn rmsnorm(n: usize, eps: f32) -> Program {
 pub struct QLayout {
     pub group: usize,
     pub min: bool,
+    /// Unsigned 4-bit values, two per byte, paired across a chunk of the
+    /// matvec's width `kc`: byte `k` of each chunk holds columns `k` (low
+    /// nibble) and `k + kc/2` (high nibble). The loader packs for the width
+    /// the schedule will use ([`Split::pack`]); the layout is the schedule's
+    /// choice, made once at load time.
+    pub packed4: bool,
 }
 
 impl QLayout {
@@ -65,20 +71,29 @@ impl QLayout {
     pub const Q8_0: QLayout = QLayout {
         group: 32,
         min: false,
+        packed4: false,
     };
     /// Q6_K: 16 values per sub-block scale (`d * sc`), values centred at 0.
     pub const Q6_K: QLayout = QLayout {
         group: 16,
         min: false,
+        packed4: false,
     };
-    /// Q4_K: 32 values per sub-block, `d * sc * q - dmin * m`.
+    /// Q4_K: 32 values per sub-block, `d * sc * q - dmin * m`, with the
+    /// 4-bit values kept packed: half the bytes of one per value.
     pub const Q4_K: QLayout = QLayout {
         group: 32,
         min: true,
+        packed4: true,
     };
 
     fn tag(self) -> String {
-        format!("g{}{}", self.group, if self.min { "m" } else { "" })
+        format!(
+            "g{}{}{}",
+            self.group,
+            if self.min { "m" } else { "" },
+            if self.packed4 { "p4" } else { "" }
+        )
     }
 }
 
@@ -97,6 +112,9 @@ pub fn matvec_q(
 ) -> Result<Program, String> {
     use Arg::Move;
     let g = layout.group;
+    if layout.packed4 && !kc.is_multiple_of(2) {
+        return Err(format!("packed 4-bit chunks must be even; kc is {kc}"));
+    }
     if !n_out.is_multiple_of(bo) || !n_in.is_multiple_of(kc) || !kc.is_multiple_of(g) {
         return Err(format!(
             "matvec {n_out}x{n_in}: bo {bo} must divide the rows, kc {kc} the columns, \
@@ -110,7 +128,8 @@ pub fn matvec_q(
     );
     let mut b = Builder::new(&name);
     let px = b.param("x", DType::F32, &[1, n_in], false);
-    let pq = b.param("wq", DType::I8, &[n_out, n_in], false);
+    let qcols = if layout.packed4 { n_in / 2 } else { n_in };
+    let pq = b.param("wq", DType::I8, &[n_out, qcols], false);
     let ps = b.param("ws", DType::F32, &[n_out, n_in / g], false);
     let pm = layout
         .min
@@ -128,37 +147,73 @@ pub fn matvec_q(
         vec![Ty::Tile(acc_ty)],
         |b, c, p| {
             let rows = IdxExpr::scaled(pid, bo, 0);
-            let x = b.op(
-                "x",
-                Op::Load(
-                    at(px, [IdxExpr::lit(0), IdxExpr::scaled(c, kc, 0)], [1, kc]),
-                    reg(DType::F32, &[1, kc]),
-                ),
-            );
-            let q = b.op(
-                "q",
-                Op::Load(
-                    at(pq, [rows.clone(), IdxExpr::scaled(c, kc, 0)], [bo, kc]),
-                    reg(DType::I8, &[bo, kc]),
-                ),
-            );
-            let groups = |b: &mut Builder, p, name| {
+            // `cols` columns of this chunk starting `col0` into it: a slice of
+            // x, and the matching per-group scales and mins.
+            let x_at = |b: &mut Builder, col0: usize, cols: usize| {
+                b.op(
+                    "x",
+                    Op::Load(
+                        at(
+                            px,
+                            [IdxExpr::lit(0), IdxExpr::scaled(c, kc, col0)],
+                            [1, cols],
+                        ),
+                        reg(DType::F32, &[1, cols]),
+                    ),
+                )
+            };
+            let groups = |b: &mut Builder, p, name, col0: usize, cols: usize| {
                 b.op(
                     name,
                     Op::Load(
                         at(
                             p,
-                            [rows.clone(), IdxExpr::scaled(c, kc / g, 0)],
-                            [bo, kc / g],
+                            [rows.clone(), IdxExpr::scaled(c, kc / g, col0 / g)],
+                            [bo, cols / g],
                         ),
-                        reg(DType::F32, &[bo, kc / g]),
+                        reg(DType::F32, &[bo, cols / g]),
                     ),
                 )
             };
-            let s = groups(b, ps, "s");
-            let m = pm.map(|pm| Move(groups(b, pm, "m")));
-            let w = b.op("w", Op::Dequant(Move(q), Move(s), m, g));
-            let part = b.op("part", Op::MatMulNT(Move(x), Move(w), DType::F32));
+            let part = if layout.packed4 {
+                // Byte k of a chunk holds columns k (low nibble) and
+                // k + kc/2 (high): each half dequantises in the thread that
+                // owns the byte, and the dot product splits in two.
+                let h = kc / 2;
+                let q = b.op(
+                    "q",
+                    Op::Load(
+                        at(pq, [rows.clone(), IdxExpr::scaled(c, h, 0)], [bo, h]),
+                        reg(DType::I8, &[bo, h]),
+                    ),
+                );
+                let mut halves = vec![];
+                for (high, col0) in [(false, 0), (true, h)] {
+                    let x = x_at(b, col0, h);
+                    let s = groups(b, ps, "s", col0, h);
+                    let m = pm.map(|pm| Move(groups(b, pm, "m", col0, h)));
+                    let qa = if high { Move(q) } else { Arg::Borrow(q) };
+                    let w = b.op("w", Op::Dequant4(qa, Move(s), m, g, high));
+                    halves.push(b.op("part", Op::MatMulNT(Move(x), Move(w), DType::F32)));
+                }
+                b.op(
+                    "part",
+                    Op::Binary(BinOp::Add, Move(halves[0]), Move(halves[1])),
+                )
+            } else {
+                let x = x_at(b, 0, kc);
+                let q = b.op(
+                    "q",
+                    Op::Load(
+                        at(pq, [rows.clone(), IdxExpr::scaled(c, kc, 0)], [bo, kc]),
+                        reg(DType::I8, &[bo, kc]),
+                    ),
+                );
+                let s = groups(b, ps, "s", 0, kc);
+                let m = pm.map(|pm| Move(groups(b, pm, "m", 0, kc)));
+                let w = b.op("w", Op::Dequant(Move(q), Move(s), m, g));
+                b.op("part", Op::MatMulNT(Move(x), Move(w), DType::F32))
+            };
             vec![b.op("acc", Op::Binary(BinOp::Add, Move(p[0]), Move(part)))]
         },
     );
@@ -212,6 +267,42 @@ pub fn rope(heads: usize, hd: usize, out: DType) -> Program {
     b.finish()
 }
 
+/// Append one position to a head-major KV cache: row `h` of `x`
+/// (`[heads, hd]`, any float dtype) goes to cache row `h * cap + pos`, in
+/// f16. `pos` is a runtime scalar bounded by the capacity, so the checker
+/// proves the write lands inside the cache for every position.
+pub fn kv_append(heads: usize, hd: usize, cap: usize, x_dtype: DType) -> Program {
+    use Arg::Move;
+    let mut b = Builder::new(&format!(
+        "kv_append_{heads}x{hd}_cap{cap}_{}",
+        x_dtype.suffix()
+    ));
+    let px = b.param("x", x_dtype, &[heads, hd], false);
+    let pc = b.param("cache", DType::F16, &[heads * cap, hd], true);
+    let pos = b.dyn_index("pos", cap - 1);
+    for h in 0..heads {
+        let r = b.op(
+            "row",
+            Op::Load(
+                at(px, [IdxExpr::lit(h), IdxExpr::lit(0)], [1, hd]),
+                reg(x_dtype, &[1, hd]),
+            ),
+        );
+        let r = if x_dtype == DType::F16 {
+            r
+        } else {
+            b.op("row16", Op::Convert(Move(r), DType::F16))
+        };
+        let dst = at(
+            pc,
+            [IdxExpr::lit(h * cap).plus(pos, 1), IdxExpr::lit(0)],
+            [1, hd],
+        );
+        b.effect(Op::Store(Move(r), dst));
+    }
+    b.finish()
+}
+
 /// `y = silu(g) * u = g * sigmoid(g) * u`, in chunks of `chunk` per instance.
 pub fn silu_mul(n: usize, chunk: usize) -> Result<Program, String> {
     use Arg::{Borrow, Move};
@@ -246,6 +337,11 @@ pub fn silu_mul(n: usize, chunk: usize) -> Result<Program, String> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Split {
     pub layout: QLayout,
+    /// Row length in values. Needed to find a packed value's byte.
+    pub cols: usize,
+    /// For packed layouts, the chunk width values are paired across; the
+    /// matvec that reads them must use it as its `kc`. 0 when unpacked.
+    pub pack: usize,
     pub q: Vec<i8>,
     pub s: Vec<f32>,
     pub m: Option<Vec<f32>>,
@@ -258,9 +354,27 @@ impl Split {
         (lo..hi)
             .map(|i| {
                 let min = self.m.as_ref().map_or(0.0, |m| m[i / g]);
-                self.q[i] as f32 * self.s[i / g] - min
+                self.value(i) * self.s[i / g] - min
             })
             .collect()
+    }
+
+    /// Quantised value `i`, unpacked if the layout is packed.
+    pub fn value(&self, i: usize) -> f32 {
+        if self.layout.packed4 {
+            let (row, col) = (i / self.cols, i % self.cols);
+            let (chunk, w, h) = (col / self.pack, col % self.pack, self.pack / 2);
+            let b = self.q[row * self.cols / 2 + chunk * h + w % h] as u8;
+            (if w < h { b & 0xF } else { b >> 4 }) as f32
+        } else {
+            self.q[i] as f32
+        }
+    }
+
+    /// Values as the kernels' `I8` tensor holds them (packed bytes when
+    /// packed), for building interpreter tensors.
+    pub fn q_f32(&self) -> Vec<f32> {
+        self.q.iter().map(|&b| b as f32).collect()
     }
 }
 
@@ -280,6 +394,8 @@ pub fn split_q8_0(blocks: &[u8]) -> Split {
     }
     Split {
         layout: QLayout::Q8_0,
+        cols: 0,
+        pack: 0,
         q,
         s,
         m: None,
@@ -315,6 +431,8 @@ pub fn split_q6_k(blocks: &[u8]) -> Split {
     }
     Split {
         layout: QLayout::Q6_K,
+        cols: 0,
+        pack: 0,
         q,
         s,
         m: None,
@@ -337,10 +455,17 @@ fn scale_min_k4(j: usize, sc: &[u8]) -> (u8, u8) {
 /// bytes of 6-bit scales and mins, 128 bytes of nibbles. Sub-block `j`
 /// (32 values) is `d * sc_j * q - dmin * m_j`; even sub-blocks take the low
 /// nibbles of a 32-byte run, odd ones the high nibbles.
-pub fn split_q4_k(blocks: &[u8]) -> Split {
+/// `cols` is the matrix's row length: values are repacked two per byte in
+/// pairing across chunks of `pack` that the matvec schedule expects (the
+/// runtime uses whole rows: `pack == cols`).
+pub fn split_q4_k(blocks: &[u8], cols: usize, pack: usize) -> Split {
+    assert!(
+        pack > 0 && pack.is_multiple_of(2) && cols.is_multiple_of(pack),
+        "Q4_K rows of {cols} are not whole chunks"
+    );
     let (blocks, rest) = blocks.as_chunks::<144>();
     assert!(rest.is_empty(), "not whole Q4_K blocks");
-    let mut q = Vec::with_capacity(blocks.len() * 256);
+    let mut v = Vec::with_capacity(blocks.len() * 256);
     let mut s = Vec::with_capacity(blocks.len() * 8);
     let mut m = Vec::with_capacity(blocks.len() * 8);
     for blk in blocks {
@@ -352,14 +477,22 @@ pub fn split_q4_k(blocks: &[u8]) -> Split {
             s.push(d * scj as f32);
             m.push(dmin * mj as f32);
             let run = &qs[32 * (j / 2)..32 * (j / 2) + 32];
-            q.extend(
+            v.extend(
                 run.iter()
-                    .map(|&b| if j % 2 == 0 { b & 0xF } else { b >> 4 } as i8),
+                    .map(|&b| if j % 2 == 0 { b & 0xF } else { b >> 4 }),
             );
         }
     }
+    // Pair column k of each chunk with column k + chunk/2 in one byte.
+    let h = pack / 2;
+    let q = v
+        .chunks(pack)
+        .flat_map(|ch| (0..h).map(move |k| (ch[k] | (ch[k + h] << 4)) as i8))
+        .collect();
     Split {
         layout: QLayout::Q4_K,
+        cols,
+        pack,
         q,
         s,
         m: Some(m),
@@ -427,18 +560,27 @@ mod tests {
 
     #[test]
     fn matvec_matches_dequantised_weights_in_every_layout() {
-        let (n_in, n_out) = (128, 16);
+        let (n_in, n_out) = (512, 16);
         for layout in [QLayout::Q8_0, QLayout::Q6_K, QLayout::Q4_K] {
             for residual in [false, true] {
-                let p = matvec_q(n_in, n_out, 4, 64, layout, residual).unwrap();
+                let p = matvec_q(n_in, n_out, 4, 256, layout, residual).unwrap();
                 ok(&p);
                 let groups = n_out * n_in / layout.group;
                 let sp = Split {
                     layout,
-                    q: pattern(n_in * n_out, 4)
-                        .iter()
-                        .map(|v| (v * 31.0).round() as i8)
-                        .collect(),
+                    cols: n_in,
+                    pack: if layout.packed4 { 256 } else { 0 },
+                    q: if layout.packed4 {
+                        pattern(n_in * n_out / 2, 4)
+                            .iter()
+                            .map(|v| ((v + 1.0) * 127.5) as u8 as i8)
+                            .collect()
+                    } else {
+                        pattern(n_in * n_out, 4)
+                            .iter()
+                            .map(|v| (v * 31.0).round() as i8)
+                            .collect()
+                    },
                     s: pattern(groups, 5).iter().map(|v| v.abs() * 0.01).collect(),
                     m: layout
                         .min
@@ -446,10 +588,10 @@ mod tests {
                 };
                 let x = pattern(n_in, 3);
                 let r = pattern(n_out, 6);
-                let qf: Vec<f32> = sp.q.iter().map(|&v| v as f32).collect();
+                let qf = sp.q_f32();
                 let mut t = vec![
                     Tensor::new(DType::F32, &[1, n_in], &x),
-                    Tensor::new(DType::I8, &[n_out, n_in], &qf),
+                    Tensor::new(DType::I8, &[n_out, qf.len() / n_out], &qf),
                     Tensor::new(DType::F32, &[n_out, n_in / layout.group], &sp.s),
                 ];
                 if let Some(m) = &sp.m {
@@ -474,6 +616,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn kv_append_writes_each_head_at_the_runtime_position() {
+        use crate::run_dyn;
+        let (heads, hd, cap) = (2, 4, 8);
+        let p = kv_append(heads, hd, cap, DType::F32);
+        ok(&p);
+        let x = pattern(heads * hd, 11);
+        let mut t = vec![
+            Tensor::new(DType::F32, &[heads, hd], &x),
+            Tensor::zeros(DType::F16, &[heads * cap, hd]),
+        ];
+        run_dyn(&p, &mut t, &[5]).unwrap();
+        for h in 0..heads {
+            let row = (h * cap + 5) * hd;
+            for j in 0..hd {
+                let want = half::f16::from_f32(x[h * hd + j]).to_f32();
+                assert_eq!(t[1].data[row + j], want);
+            }
+        }
+        // Past the capacity is refused before anything runs.
+        assert!(run_dyn(&p, &mut t, &[cap as u32]).is_err());
     }
 
     #[test]
@@ -606,7 +771,7 @@ mod tests {
     #[test]
     fn q4_k_split_dequantises_exactly_like_ggml() {
         let raw = blocks(3, 144, &[0, 2], 21);
-        let sp = split_q4_k(&raw);
+        let sp = split_q4_k(&raw, 256, 256);
         let want: Vec<f32> = raw.chunks(144).flat_map(ggml_q4_k).collect();
         assert_eq!(sp.dequant(0, 3 * 256), want, "must be bit-identical");
     }

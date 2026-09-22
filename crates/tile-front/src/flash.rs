@@ -169,6 +169,7 @@ impl FlashDecode {
                     Arg::Borrow(k),
                     Arg::Borrow(v),
                     [p[0], p[1], p[2]],
+                    None,
                 );
                 b.drop(k);
                 b.drop(v);
@@ -249,6 +250,7 @@ impl FlashDecode {
                 Arg::Borrow(kcur),
                 Arg::Borrow(vcur),
                 [ms, ls, accs],
+                None,
             );
 
             // The tiles just consumed become the free buffers.
@@ -274,6 +276,7 @@ impl FlashDecode {
                 Arg::Borrow(kcur),
                 Arg::Borrow(vcur),
                 [ms, ls, accs],
+                None,
             );
             b.drop(kcur);
             b.drop(vcur);
@@ -281,6 +284,71 @@ impl FlashDecode {
         b.drop(kfree);
         b.drop(vfree);
         finish(&mut b, &c, pid, po, 0, qs, [ms, ls, accs]);
+        Ok(b.finish())
+    }
+
+    /// Decode attention over a runtime length: one program for every
+    /// position of a generation. `kv_rows()` is the cache capacity (and
+    /// the static bound); two runtime scalars carry the live length and the
+    /// number of `bk` blocks covering it (`ceil(len / bk)`). K/V blocks are
+    /// loaded synchronously into threadgroup memory; the last block's
+    /// columns past `len` are masked before the softmax.
+    pub fn build_dynamic(&self) -> Result<Program, String> {
+        let c = *self;
+        if c.bq == 0 || c.bk == 0 || !c.q_rows.is_multiple_of(c.bq) {
+            return Err("bq must divide q_rows and bk must be nonzero".into());
+        }
+        if c.consumers != 0 || c.heads == 0 {
+            return Err("dynamic attention is single-role and needs heads".into());
+        }
+        let cap = c.kv_rows();
+        if !cap.is_multiple_of(c.bk) {
+            return Err(format!(
+                "cache capacity {cap} must be whole blocks of {}",
+                c.bk
+            ));
+        }
+        let mut b = Builder::new(&format!(
+            "flash_decode_dyn_{}_bq{}_bk{}_cap{cap}",
+            c.dtype.suffix(),
+            c.bq,
+            c.bk
+        ));
+        let pq = b.param("q", c.dtype, &[c.heads * c.q_rows, c.d], false);
+        let pk = b.param("k", c.dtype, &[c.heads * cap, c.d], false);
+        let pv = b.param("v", c.dtype, &[c.heads * cap, c.d], false);
+        let po = b.param("o", DType::F32, &[c.heads * c.q_rows, c.d], true);
+        let pid = b.grid(c.heads);
+        let len = b.dyn_index("len", cap);
+        let nkb = b.dyn_index("nkb", cap / c.bk);
+
+        let (qs, [ms, ls, accs]) = setup(&mut b, &c, pid, pq, 0, c.n_qb());
+        let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
+        let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
+        let carry = vec![
+            Ty::Array(m_ty.clone(), c.n_qb()),
+            Ty::Array(m_ty, c.n_qb()),
+            Ty::Array(acc_ty, c.n_qb()),
+        ];
+        let kv = TileTy::new(c.dtype, &[c.bk, c.d], Space::Threadgroup);
+        let out = b.for_range_dyn(0, cap / c.bk, nkb, vec![ms, ls, accs], carry, |b, i, p| {
+            let at = IdxExpr::scaled(i, c.bk, 0).plus(pid, cap);
+            let k = b.op("k", Op::Load(rows(pk, at.clone(), c.bk, c.d), kv.clone()));
+            let v = b.op("v", Op::Load(rows(pv, at, c.bk, c.d), kv.clone()));
+            let out = attend(
+                b,
+                &c,
+                qs,
+                Arg::Borrow(k),
+                Arg::Borrow(v),
+                [p[0], p[1], p[2]],
+                Some((i, len)),
+            );
+            b.drop(k);
+            b.drop(v);
+            out.to_vec()
+        });
+        finish(&mut b, &c, pid, po, 0, qs, [out[0], out[1], out[2]]);
         Ok(b.finish())
     }
 
@@ -353,6 +421,7 @@ impl FlashDecode {
                             Arg::BorrowPart(kv, 0),
                             Arg::BorrowPart(kv, 1),
                             [p[0], p[1], p[2]],
+                            None,
                         );
                         b.effect(Op::Release(h, kv));
                         out.to_vec()
@@ -452,7 +521,17 @@ fn rows(param: usize, start: IdxExpr, rows: usize, d: usize) -> View {
 
 /// One KV block against every query block: the online-softmax update.
 /// `k` and `v` are borrowed by every iteration of the inner loop.
-fn attend(b: &mut Builder, c: &FlashDecode, qs: Var, k: Arg, v: Arg, state: [Var; 3]) -> [Var; 3] {
+/// With `mask = Some((block, len))`, the columns of block `block` at or past
+/// the runtime length `len` are masked out before the softmax.
+fn attend(
+    b: &mut Builder,
+    c: &FlashDecode,
+    qs: Var,
+    k: Arg,
+    v: Arg,
+    state: [Var; 3],
+    mask: Option<(Var, Var)>,
+) -> [Var; 3] {
     use Arg::{Borrow, Move};
     let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
     let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
@@ -461,7 +540,13 @@ fn attend(b: &mut Builder, c: &FlashDecode, qs: Var, k: Arg, v: Arg, state: [Var
     let out = b.map_each(state.to_vec(), elem, 3, |b, qb, p| {
         let (m, l, acc) = (p[0], p[1], p[2]);
         let s = b.op("s", Op::MatMulNT(Arg::BorrowElem(qs, qb), k, DType::F32));
-        let s = b.op("s", Op::Scale(Move(s), scale));
+        let mut s = b.op("s", Op::Scale(Move(s), scale));
+        if let Some((blk, len)) = mask {
+            s = b.op(
+                "s",
+                Op::MaskCols(Move(s), IdxExpr::scaled(blk, c.bk, 0), len),
+            );
+        }
         let mb = b.op("mb", Op::RowReduce(Reduce::Max, Borrow(s)));
         let m_new = b.op("m", Op::Binary(BinOp::Max, Borrow(m), Move(mb)));
         let d = b.op("dm", Op::Binary(BinOp::Sub, Move(m), Borrow(m_new)));

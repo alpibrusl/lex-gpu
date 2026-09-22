@@ -11,32 +11,36 @@ there is in [`docs/roadmap.md`](docs/roadmap.md).
 
 **Where it stands:** a Llama-3.1-8B served by Ollama, in 4-bit, runs entirely
 on kernels this compiler generated, and produces the same tokens as Ollama.
-It does so slowly. Correctness came first; speed is the next phase.
+Speed is now the work: decode is at a third of Ollama's on the 8B and just
+over half on the 1B, up 4× and 12× from where correctness left it.
 
 | Phase | State | Details |
 | --- | --- | --- |
 | **P0** Spine | closed | RMSNorm at 98.1% of the copy ceiling (463.6 GB/s) on an M4 Max, matching the reference. [`docs/P0.md`](docs/P0.md) |
 | **P1** Types | closed (in the interpreter) | Linear tiles, effect-typed copies and barrier-synchronised pipes check a flash-attention decode loop: plain, double-buffered, and warp-specialised for Hopper. All variants match PyTorch. [`docs/P1.md`](docs/P1.md) |
 | **P2** Metal, correct | **exit test met** | Llama-3.1-8B in int4 (Q4_K_M, from Ollama) runs on tile kernels on the GPU, and its greedy tokens are identical to Ollama's. [`docs/P2.md`](docs/P2.md) |
-| P3 Metal, fast | next | Close the gap to Ollama below: fewer dispatches, no host round trips, simdgroup matrices, split-K attention, minimal barriers. |
+| **P3** Metal, fast | in progress | One command buffer per token, split-K reductions, and lazy loads that fuse dequantisation into the matvec. Next: vectorised loads, native Q4_K scales, graph fusion, prefill. [`docs/P3.md`](docs/P3.md) |
 
 Measured on an M4 Max, each model greedy-decoded on 4 prompts × 24 tokens
 next to Ollama itself (`scripts/tile_vs_ollama.py`):
 
 | Model | Weights | Tokens identical to Ollama | Log-prob gap vs Ollama | vs f32 reference | tile | Ollama |
 | --- | --- | --- | --- | --- | --- | --- |
-| `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.008 | ≤ 0.007 | 13 tok/s | ~275 tok/s |
-| `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.09 | ≤ 0.007 | 6 tok/s | ~86 tok/s |
+| `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.008 | ≤ 0.007 | ~159 tok/s | ~275 tok/s |
+| `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.09 | ≤ 0.007 | ~28 tok/s | ~86 tok/s |
 
 How to read the table:
 - **Correctness:** tile agrees with an f32 PyTorch reference to within 0.007 on
   both models. Ollama differs from both by more, up to 0.09 on the 8B,
   because llama.cpp's quantised kernels round differently. So the remaining
   gap is on Ollama's side, not tile's.
-- **Speed:** tile is 14–21× slower. Every op is a separate dispatch that
-  waits for the last (418 per token on the 8B), two rows per layer go through
-  the CPU, and the kernels are the simplest correct ones. That is what P2
-  promised, and it is the baseline P3 starts from.
+- **Speed:** tile reaches 58% of Ollama on the 1B and 33% on the 8B. At P2's
+  end it was 13 and 6 tok/s: every op was a separate dispatch that waited
+  for the last, and the kernels were the simplest correct ones.
+  `cargo run --release -p tile-rt --example profile -- --model llama3.1:8b`
+  shows where the time goes now. [`docs/P3.md`](docs/P3.md) lists what
+  closes the rest: vectorised loads, native Q4_K scales, fused small ops,
+  prefill.
 
 What runs where:
 - **Copy and RMSNorm** are hand-planned P0 kernels. They run on the GPU at
@@ -45,8 +49,9 @@ What runs where:
   matvec (Q8_0 / Q4_K / Q6_K), RoPE, flash-decode attention, SiLU·mul. They
   are checked, run in the interpreter, and are lowered to MSL to run on the
   GPU.
-- **Host glue:** the embedding-row lookup and the KV-cache append still run
-  on the CPU, on unified memory. They are the next things to become kernels.
+- **Host glue:** the embedding-row lookup and the RoPE tables are written by
+  the CPU, on unified memory, before each token's command buffer. Everything
+  inside the token, KV-cache append included, runs on the GPU.
 
 ## Examples
 
@@ -69,7 +74,7 @@ token and every top-5 log-probability. On `llama3.1:8b`:
 'The capital of France is'
   tile   : ' a city of grandeur and beauty, with a rich history and culture that is reflected in its stunning architecture, world-class'
   24/24 tokens identical to Ollama, worst |dlogprob| 0.0134 (tolerance 0.1)  PASS
-  tile decode 5.9 tok/s on the GPU (P2: correct, not fast)
+  tile decode 28.5 tok/s on the GPU
 
 'def fibonacci(n):'
   tile   : ' \n    if n <= 0: \n        return "Input should be a positive integer" \n    elif n =='
@@ -238,6 +243,8 @@ included) and reference, plus these suites:
   one diagnostic each;
 - tile-metal `flash_gpu`: the lowered kernel on the GPU, against PyTorch.
   This one needs macOS; CI's paravirtualised device is enough.
+- tile-metal `llama_kernels_gpu`: every Llama kernel on the GPU against the
+  interpreter, at real sizes and in every weight layout.
 - tile-rt `llama_ollama`: Llama 3.2 1B and Llama 3.1 8B on the GPU against
   the Ollama-checked reference. It needs macOS and the models pulled; for any
   model missing, it prints `SKIPPED`.

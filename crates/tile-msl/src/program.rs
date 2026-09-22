@@ -18,6 +18,13 @@
 //!   proves nothing still owns the destination buffer.
 //! - Barriers are conservative: before every threadgroup write, and between
 //!   staging and use. Deriving the minimal set from the effect graph is P3.
+//! - **Loads from read-only parameters are lazy.** A register-tile load
+//!   becomes an address expression, not a copy; `convert` and `dequant` over
+//!   lazy operands stay lazy. A consumer reads any element straight from
+//!   device memory, so nothing is staged: a quantised matvec reads each
+//!   weight once, dequantises it inline, and feeds the reduction. That is
+//!   operator fusion, decided here rather than written by hand. A lazy tile
+//!   is materialised only where storage is required (loop carries, arrays).
 //!
 //! Everything is computed in f32 and narrowed only where a tile's dtype says
 //! so, which is exactly what the interpreter does — so the GPU and the
@@ -57,6 +64,17 @@ enum Loc {
     /// A threadgroup tile: `name[e]` is flat element `e`.
     Tg(String, TileTy),
     Index(String),
+    /// A tile not held anywhere: an MSL expression for element `@I@`,
+    /// evaluated where it is read (a load from a read-only parameter, or
+    /// a conversion or dequantisation of one).
+    Lazy(String, TileTy),
+}
+
+/// The index placeholder in a lazy tile's expression.
+const AT: &str = "@I@";
+
+fn at_index(template: &str, idx: &str) -> String {
+    template.replace(AT, &format!("({idx})"))
 }
 
 /// How an op reads one operand at a flat element index.
@@ -65,6 +83,8 @@ enum Access {
     Local(String),
     /// Any element, from threadgroup memory: `base[..]`.
     Shared(String),
+    /// Any element, computed from device memory where it is read.
+    Lazy(String),
 }
 
 struct Gen<'a> {
@@ -75,6 +95,8 @@ struct Gen<'a> {
     locs: HashMap<Var, Loc>,
     arena: usize,
     scratch: usize,
+    /// Scratch floats the current op's operands were staged into.
+    staged: usize,
     barriers: usize,
 }
 
@@ -98,10 +120,14 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
         locs: HashMap::new(),
         arena: 0,
         scratch: 0,
+        staged: 0,
         barriers: 0,
     };
     if let Some(pid) = prog.pid {
         g.locs.insert(pid, Loc::Index("gid".into()));
+    }
+    for (i, &(x, _)) in prog.dyn_scalars.iter().enumerate() {
+        g.locs.insert(x, Loc::Index(format!("scalars[{i}]")));
     }
     g.block(&prog.body)?;
 
@@ -143,6 +169,13 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
             "    device {cv}{}* {} [[buffer({i})]],",
             p.dtype.msl_scalar(),
             param_ident(i, &p.name)
+        );
+    }
+    if !prog.dyn_scalars.is_empty() {
+        let _ = writeln!(
+            s,
+            "    constant uint* scalars [[buffer({})]],",
+            prog.params.len()
         );
     }
     s.push_str("    uint tid [[thread_index_in_threadgroup]],\n");
@@ -190,6 +223,7 @@ fn v(var: Var) -> String {
 fn storage(l: &Loc) -> String {
     match l {
         Loc::Reg(n, _) | Loc::RegArr(n, _, _) | Loc::Tg(n, _) | Loc::Index(n) => n.clone(),
+        Loc::Lazy(e, _) => e.clone(),
     }
 }
 
@@ -324,6 +358,10 @@ impl Gen<'_> {
                 Arg::Move(x) | Arg::Borrow(x) => match self.loc(x)? {
                     Loc::Reg(n, t) => (n, t, true),
                     Loc::Tg(n, t) => (n, t, false),
+                    Loc::Lazy(e, t) => {
+                        out.push((Access::Lazy(e), t));
+                        continue;
+                    }
                     _ => return Err("operand is not a tile".into()),
                 },
                 Arg::BorrowElem(arr, i) => {
@@ -348,6 +386,7 @@ impl Gen<'_> {
                 out.push((Access::Shared(base), ty));
             }
         }
+        self.staged = off;
         if !stage.is_empty() {
             self.scratch = self.scratch.max(off);
             // Nobody may still be reading the scratch from the previous op.
@@ -364,6 +403,7 @@ impl Gen<'_> {
         match a {
             Access::Local(x) => format!("float({x}[k])"),
             Access::Shared(x) => format!("float({x}[{at}])"),
+            Access::Lazy(t) => format!("float({})", at_index(t, at)),
         }
     }
 
@@ -381,6 +421,7 @@ impl Gen<'_> {
                 index,
                 start,
                 end,
+                end_dyn,
                 init,
                 params,
                 body,
@@ -391,8 +432,17 @@ impl Gen<'_> {
                     self.bind_copy(p, &src)?;
                 }
                 let iname = v(*index);
+                let stop = match end_dyn {
+                    Some(d) => {
+                        let Loc::Index(dn) = self.loc(*d)? else {
+                            return Err("dynamic loop end is not a scalar".into());
+                        };
+                        format!("min({end}u, {dn})")
+                    }
+                    None => format!("{end}u"),
+                };
                 self.line(&format!(
-                    "for (uint {iname} = {start}u; {iname} < {end}u; ++{iname}) {{"
+                    "for (uint {iname} = {start}u; {iname} < {stop}; ++{iname}) {{"
                 ));
                 self.depth += 1;
                 self.locs.insert(*index, Loc::Index(iname));
@@ -524,6 +574,10 @@ impl Gen<'_> {
                 self.line(&format!("threadgroup {}* {name};", t.dtype.msl_scalar()));
                 self.locs.insert(p, Loc::Tg(name, t.clone()));
             }
+            Loc::Lazy(_, t) => {
+                let t = t.clone();
+                self.declare_reg(p, &t);
+            }
             Loc::Index(_) => return Err("an index cannot be carried".into()),
         }
         let dst = self.loc(p)?;
@@ -554,6 +608,19 @@ impl Gen<'_> {
                 if d != s {
                     self.line(&format!("{d} = {s};"));
                 }
+            }
+            // A lazy value needs storage now: evaluate the elements each
+            // thread owns.
+            (Loc::Reg(d, t), Loc::Lazy(e, _)) => {
+                let (d, t, e) = (d.clone(), t.clone(), e.clone());
+                self.owned(
+                    t.elems(),
+                    &[format!(
+                        "{d}[k] = {}({});",
+                        t.dtype.msl_scalar(),
+                        at_index(&e, "e")
+                    )],
+                );
             }
             _ => return Err("carry changes storage class".into()),
         }
@@ -601,6 +668,12 @@ impl Gen<'_> {
                         self.every(t.elems(), &format!("{name}[e] = {st}({src});"));
                         self.barrier();
                     }
+                    _ if !self.prog.params[view.param].writable
+                        && std::env::var_os("TILE_NO_LAZY").is_none() =>
+                    {
+                        let e = format!("{st}({})", self.addr(view, AT)?);
+                        self.locs.insert(x, Loc::Lazy(e, t.clone()));
+                    }
                     _ => {
                         let name = self.declare_reg(x, t);
                         self.owned(t.elems(), &[format!("{name}[k] = {st}({src});")]);
@@ -631,7 +704,7 @@ impl Gen<'_> {
                 let ops = self.operands(&[*a], &[true], n)?;
                 let target = self.addr(view, "e")?;
                 match &ops[0].0 {
-                    Access::Local(_) => {
+                    Access::Local(_) | Access::Lazy(_) => {
                         let val = Self::read(&ops[0].0, "e");
                         self.owned(n, &[format!("{target} = {dt}({val});")]);
                     }
@@ -643,6 +716,42 @@ impl Gen<'_> {
                 }
             }
             Op::Drop(_) => {}
+            Op::Convert(a, dt) if self.lazy(*a).is_some() => {
+                let x = dst.ok_or("op without a result")?;
+                let (e, t) = self.lazy(*a).expect("checked");
+                let e = format!("{}(float({e}))", dt.msl_scalar());
+                self.locs.insert(x, Loc::Lazy(e, reg(*dt, &t.shape)));
+            }
+            Op::Dequant(q, s, m, group) | Op::Dequant4(q, s, m, group, _)
+                if [Some(*q), Some(*s), *m]
+                    .iter()
+                    .flatten()
+                    .all(|a| self.lazy(*a).is_some()) =>
+            {
+                let x = dst.ok_or("op without a result")?;
+                let (qe, tq) = self.lazy(*q).expect("checked");
+                let (se, _) = self.lazy(*s).expect("checked");
+                let c = tq.shape[1];
+                let gidx = format!("({AT} / {c}u) * {}u + ({AT} % {c}u) / {group}u", c / group);
+                let qv = match op {
+                    Op::Dequant4(.., high) => format!(
+                        "float(((uint)(uchar)({qe}) >> {}u) & 0xFu)",
+                        if *high { 4 } else { 0 }
+                    ),
+                    _ => format!("float({qe})"),
+                };
+                let sv = format!("float({})", at_index(&se, &gidx));
+                let mv = match m {
+                    Some(m) => {
+                        let (me, _) = self.lazy(*m).expect("checked");
+                        format!(" - float({})", at_index(&me, &gidx))
+                    }
+                    None => String::new(),
+                };
+                let e = format!("({qv} * {sv}{mv})");
+                self.locs
+                    .insert(x, Loc::Lazy(e, reg(DType::F32, &tq.shape)));
+            }
             Op::Dup(a) | Op::Exp(a) | Op::Scale(a, _) | Op::Convert(a, _) | Op::Unary(_, a) => {
                 let x = dst.ok_or("op without a result")?;
                 let ty = self.arg_ty(*a)?;
@@ -689,6 +798,25 @@ impl Gen<'_> {
                 let name = self.declare_reg(x, &reg(dt, &ta.shape));
                 self.owned(n, &[format!("{name}[k] = {}({expr});", dt.msl_scalar())]);
             }
+            Op::MaskCols(a, first, limit) => {
+                let x = dst.ok_or("op without a result")?;
+                let ty = self.arg_ty(*a)?;
+                let (n, cols) = (ty.elems(), ty.shape[1]);
+                let ops = self.operands(&[*a], &[true], n)?;
+                let src = Self::read(&ops[0].0, "e");
+                let Loc::Index(lim) = self.loc(*limit)? else {
+                    return Err("mask limit is not a scalar".into());
+                };
+                let f = self.idx(first)?;
+                let name = self.declare_reg(x, &reg(ty.dtype, &ty.shape));
+                self.owned(
+                    n,
+                    &[format!(
+                        "{name}[k] = {}(({f} + e % {cols}u) >= {lim} ? -INFINITY : {src});",
+                        ty.dtype.msl_scalar()
+                    )],
+                );
+            }
             Op::SwapPairs(a) => {
                 let x = dst.ok_or("op without a result")?;
                 let ty = self.arg_ty(*a)?;
@@ -718,6 +846,25 @@ impl Gen<'_> {
                 let name = self.declare_reg(x, &reg(DType::F32, &tq.shape));
                 self.owned(n, &[format!("{name}[k] = {qv} * {sv}{mv};")]);
             }
+            Op::Dequant4(q, s, m, group, high) => {
+                let x = dst.ok_or("op without a result")?;
+                let tq = self.arg_ty(*q)?;
+                let (n, c) = (tq.elems(), tq.shape[1]);
+                let mut args = vec![*q, *s];
+                args.extend(*m);
+                let local: Vec<bool> = (0..args.len()).map(|i| i == 0).collect();
+                let ops = self.operands(&args, &local, n)?;
+                let at = format!("(e / {c}u) * {}u + (e % {c}u) / {group}u", c / group);
+                let byte = Self::read(&ops[0].0, "e");
+                let shift = if *high { 4 } else { 0 };
+                let qv = format!("float(((uint)(uchar)({byte}) >> {shift}u) & 0xFu)");
+                let sv = Self::read(&ops[1].0, &at);
+                let mv = ops
+                    .get(2)
+                    .map_or(String::new(), |o| format!(" - {}", Self::read(&o.0, &at)));
+                let name = self.declare_reg(x, &reg(DType::F32, &tq.shape));
+                self.owned(n, &[format!("{name}[k] = {qv} * {sv}{mv};")]);
+            }
             Op::MatMulNT(a, b, acc) | Op::MatMul(a, b, acc) => {
                 let x = dst.ok_or("matmul without a result")?;
                 let (ta, tb) = (self.arg_ty(*a)?, self.arg_ty(*b)?);
@@ -731,16 +878,69 @@ impl Gen<'_> {
                 } else {
                     Self::read(&ops[1].0, &format!("p * {n}u + j"))
                 };
-                let name = self.declare_reg(x, &reg(*acc, &[m, n]));
-                self.owned(
-                    m * n,
-                    &[
-                        format!("const uint i = e / {n}u, j = e % {n}u;"),
-                        "float s = 0.0f;".into(),
-                        format!("for (uint p = 0; p < {kd}u; ++p) s += {av} * {bv};"),
-                        format!("{name}[k] = {}(s);", acc.msl_scalar()),
-                    ],
-                );
+                let outs = m * n;
+                // Fewer outputs than threads (a matrix-vector product): give
+                // each output a power-of-two group of lanes within one
+                // simdgroup, split the reduction across them, and combine
+                // with shuffles. Otherwise one thread per output.
+                let mut lanes = 1;
+                while lanes * 2 <= self.threads / outs && lanes * 2 <= 32 {
+                    lanes *= 2;
+                }
+                if lanes >= 2 {
+                    let res = self.staged;
+                    self.scratch = self.scratch.max(res + outs);
+                    // The partial sums go to scratch. With nothing staged
+                    // (lazy operands), no staging barrier protects it, and a
+                    // previous op's readers — the last chunk's result, say —
+                    // may still be reading it: write-after-read. Wait.
+                    if self.staged == 0 {
+                        self.barrier();
+                    }
+                    self.line("{");
+                    self.depth += 1;
+                    self.line(&format!(
+                        "const uint o = tid / {lanes}u, lane = tid % {lanes}u;"
+                    ));
+                    self.line("float s = 0.0f;");
+                    self.line(&format!("if (o < {outs}u) {{"));
+                    self.depth += 1;
+                    self.line(&format!("const uint i = o / {n}u, j = o % {n}u;"));
+                    self.line(&format!(
+                        "for (uint p = lane; p < {kd}u; p += {lanes}u) s += {av} * {bv};"
+                    ));
+                    self.depth -= 1;
+                    self.line("}");
+                    self.line(&format!(
+                        "for (uint d = {}u; d > 0; d /= 2) s += simd_shuffle_down(s, d);",
+                        lanes / 2
+                    ));
+                    self.line(&format!(
+                        "if (o < {outs}u && lane == 0) scratch[{res} + o] = s;"
+                    ));
+                    self.depth -= 1;
+                    self.line("}");
+                    self.barrier();
+                    let name = self.declare_reg(x, &reg(*acc, &[m, n]));
+                    self.owned(
+                        outs,
+                        &[format!(
+                            "{name}[k] = {}(scratch[{res} + e]);",
+                            acc.msl_scalar()
+                        )],
+                    );
+                } else {
+                    let name = self.declare_reg(x, &reg(*acc, &[m, n]));
+                    self.owned(
+                        outs,
+                        &[
+                            format!("const uint i = e / {n}u, j = e % {n}u;"),
+                            "float s = 0.0f;".into(),
+                            format!("for (uint p = 0; p < {kd}u; ++p) s += {av} * {bv};"),
+                            format!("{name}[k] = {}(s);", acc.msl_scalar()),
+                        ],
+                    );
+                }
             }
             Op::RowReduce(r, a) => {
                 let x = dst.ok_or("reduce without a result")?;
@@ -767,8 +967,18 @@ impl Gen<'_> {
                 let x = dst.ok_or("array without a result")?;
                 let mut elems = vec![];
                 for &e in vs {
-                    let Loc::Reg(n, t) = self.loc(e)? else {
-                        return Err("arrays of threadgroup tiles are not lowered".into());
+                    let (n, t) = match self.loc(e)? {
+                        Loc::Reg(n, t) => (n, t),
+                        l @ Loc::Lazy(_, _) => {
+                            let Loc::Lazy(_, t) = &l else { unreachable!() };
+                            let t = t.clone();
+                            let n = format!("{}_m", v(e));
+                            let per = self.per(t.elems());
+                            self.line(&format!("{} {n}[{per}];", t.dtype.msl_scalar()));
+                            self.assign(&Loc::Reg(n.clone(), t.clone()), &l)?;
+                            (n, t)
+                        }
+                        _ => return Err("arrays of threadgroup tiles are not lowered".into()),
                     };
                     elems.push((n, t));
                 }
@@ -794,10 +1004,21 @@ impl Gen<'_> {
         Ok(())
     }
 
+    /// The expression and type of a lazy operand, if it is one.
+    fn lazy(&self, a: Arg) -> Option<(String, TileTy)> {
+        match a {
+            Arg::Move(x) | Arg::Borrow(x) => match self.locs.get(&x) {
+                Some(Loc::Lazy(e, t)) => Some((e.clone(), t.clone())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn arg_ty(&self, a: Arg) -> Result<TileTy, String> {
         Ok(match a {
             Arg::Move(x) | Arg::Borrow(x) => match self.loc(x)? {
-                Loc::Reg(_, t) | Loc::Tg(_, t) => t,
+                Loc::Reg(_, t) | Loc::Tg(_, t) | Loc::Lazy(_, t) => t,
                 _ => return Err("operand is not a tile".into()),
             },
             Arg::BorrowElem(arr, _) => match self.loc(arr)? {

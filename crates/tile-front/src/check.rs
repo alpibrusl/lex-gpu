@@ -145,6 +145,10 @@ pub fn check(prog: &Program, target: &Target) -> Result<Report, Vec<Diag>> {
         c.define(pid, Ty::Index, &mut top);
         c.ranges.insert(pid, Some((0, prog.grid as i64 - 1)));
     }
+    for &(v, max) in &prog.dyn_scalars {
+        c.define(v, Ty::Index, &mut top);
+        c.ranges.insert(v, Some((0, max as i64)));
+    }
     c.block(&prog.body);
     let peak = c.report.peak_threadgroup_bytes;
     if peak > target.max_threadgroup_bytes {
@@ -701,7 +705,7 @@ impl Checker<'_> {
                 }
                 Some(reg(t.dtype, &t.shape))
             }
-            Op::Dequant(q, s, m, group) => {
+            Op::Dequant(q, s, m, group) | Op::Dequant4(q, s, m, group, _) => {
                 let mut ops = vec![*q, *s];
                 ops.extend(*m);
                 let tys = self.args(&ops)?;
@@ -733,10 +737,11 @@ impl Checker<'_> {
                         return None;
                     }
                 }
+                let cols = tq.shape.get(1).copied().unwrap_or(0);
                 let ok = tq.shape.len() == 2
                     && *group > 0
-                    && tq.shape[1] % group == 0
-                    && ts.shape == [tq.shape[0], tq.shape[1] / group];
+                    && cols % group == 0
+                    && ts.shape == [tq.shape[0], cols / group];
                 if !ok {
                     self.err(
                         Kind::Shape,
@@ -747,7 +752,7 @@ impl Checker<'_> {
                     );
                     return None;
                 }
-                Some(reg(DType::F32, &tq.shape))
+                Some(reg(DType::F32, &[tq.shape[0], cols]))
             }
             Op::RowReduce(_, a) => {
                 let ty = self.args(&[*a])?.remove(0);
@@ -760,6 +765,20 @@ impl Checker<'_> {
                     return None;
                 }
                 Some(reg(t.dtype, &[t.shape[0]]))
+            }
+            Op::MaskCols(a, first, limit) => {
+                let ty = self.args(&[*a])?.remove(0);
+                let t = self.tile(ty, "mask operand")?;
+                if !self.numeric(&t, "mask operand") {
+                    return None;
+                }
+                if t.shape.len() != 2 {
+                    self.err(Kind::Shape, "mask_cols needs a 2-d tile".into());
+                    return None;
+                }
+                self.expr_range(first)?;
+                self.range_of(*limit)?;
+                Some(reg(t.dtype, &t.shape))
             }
             Op::Convert(a, dt) => {
                 let ty = self.args(&[*a])?.remove(0);
@@ -947,6 +966,7 @@ impl Checker<'_> {
                 index,
                 start,
                 end,
+                end_dyn,
                 init,
                 params,
                 body,
@@ -969,6 +989,26 @@ impl Checker<'_> {
                         return None;
                     }
                     carry.push(want);
+                }
+                if let Some(d) = end_dyn {
+                    if self.in_role {
+                        self.err(
+                            Kind::Protocol,
+                            "a role's loops need static trip counts to prove its pipes balance"
+                                .into(),
+                        );
+                        return None;
+                    }
+                    if let Some((_, hi)) = self.range_of(*d)?
+                        && hi > *end as i64
+                    {
+                        let n = self.name(*d).to_string();
+                        self.err(
+                            Kind::Bounds,
+                            format!("loop end `{n}` may reach {hi}, past the static bound {end}"),
+                        );
+                        return None;
+                    }
                 }
                 let range = (start < end).then(|| (*start as i64, *end as i64 - 1));
                 let outer = self.mult;

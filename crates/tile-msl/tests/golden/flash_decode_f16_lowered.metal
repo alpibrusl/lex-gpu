@@ -2,7 +2,7 @@
 // kernel : flash_decode_f16_bq4_bk16_s2
 // target : apple-m-series
 // launch : 2 threadgroups x 128 threads
-// tg mem : 8192 B tiles + 1024 B scratch of 32768 B
+// tg mem : 8192 B tiles + 1280 B scratch of 32768 B
 
 #include <metal_stdlib>
 using namespace metal;
@@ -17,24 +17,24 @@ kernel void flash_decode_f16_bq4_bk16_s2(
 {
     threadgroup float4 arena4[512];
     threadgroup uchar* arena = (threadgroup uchar*)arena4;
-    threadgroup float scratch[256];
-    half v1[2];
+    threadgroup float scratch[320];
+    half v1_m[2];
     for (uint k = 0; k < 2u; ++k) {
         const uint e = k * 128u + tid;
         if (e < 256u) {
-            v1[k] = half(p0_q[((uint)(0 + 8 * gid) + ((e) / 64u % 4u)) * 64u + ((uint)(0) + ((e) / 1u % 64u)) * 1u]);
+            v1_m[k] = half(half(p0_q[((uint)(0 + 8 * gid) + (((e)) / 64u % 4u)) * 64u + ((uint)(0) + (((e)) / 1u % 64u)) * 1u]));
         }
     }
-    half v2[2];
+    half v2_m[2];
     for (uint k = 0; k < 2u; ++k) {
         const uint e = k * 128u + tid;
         if (e < 256u) {
-            v2[k] = half(p0_q[((uint)(4 + 8 * gid) + ((e) / 64u % 4u)) * 64u + ((uint)(0) + ((e) / 1u % 64u)) * 1u]);
+            v2_m[k] = half(half(p0_q[((uint)(4 + 8 * gid) + (((e)) / 64u % 4u)) * 64u + ((uint)(0) + (((e)) / 1u % 64u)) * 1u]));
         }
     }
     half v3[2][2];
-    for (uint k = 0; k < 2u; ++k) v3[0][k] = v1[k];
-    for (uint k = 0; k < 2u; ++k) v3[1][k] = v2[k];
+    for (uint k = 0; k < 2u; ++k) v3[0][k] = v1_m[k];
+    for (uint k = 0; k < 2u; ++k) v3[1][k] = v2_m[k];
     float v4[1];
     for (uint k = 0; k < 1u; ++k) {
         const uint e = k * 128u + tid;
@@ -138,14 +138,22 @@ kernel void flash_decode_f16_bq4_bk16_s2(
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            {
+                const uint o = tid / 2u, lane = tid % 2u;
+                float s = 0.0f;
+                if (o < 64u) {
+                    const uint i = o / 16u, j = o % 16u;
+                    for (uint p = lane; p < 64u; p += 2u) s += float((scratch + 0)[i * 64u + p]) * float(v23[j * 64u + p]);
+                }
+                for (uint d = 1u; d > 0; d /= 2) s += simd_shuffle_down(s, d);
+                if (o < 64u && lane == 0) scratch[256 + o] = s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             float v35[1];
             for (uint k = 0; k < 1u; ++k) {
                 const uint e = k * 128u + tid;
                 if (e < 64u) {
-                    const uint i = e / 16u, j = e % 16u;
-                    float s = 0.0f;
-                    for (uint p = 0; p < 64u; ++p) s += float((scratch + 0)[i * 64u + p]) * float(v23[j * 64u + p]);
-                    v35[k] = float(s);
+                    v35[k] = float(scratch[256 + e]);
                 }
             }
             float v36[1];
@@ -319,14 +327,22 @@ kernel void flash_decode_f16_bq4_bk16_s2(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const uint o = tid / 2u, lane = tid % 2u;
+            float s = 0.0f;
+            if (o < 64u) {
+                const uint i = o / 16u, j = o % 16u;
+                for (uint p = lane; p < 64u; p += 2u) s += float((scratch + 0)[i * 64u + p]) * float(v23[j * 64u + p]);
+            }
+            for (uint d = 1u; d > 0; d /= 2) s += simd_shuffle_down(s, d);
+            if (o < 64u && lane == 0) scratch[256 + o] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float v65[1];
         for (uint k = 0; k < 1u; ++k) {
             const uint e = k * 128u + tid;
             if (e < 64u) {
-                const uint i = e / 16u, j = e % 16u;
-                float s = 0.0f;
-                for (uint p = 0; p < 64u; ++p) s += float((scratch + 0)[i * 64u + p]) * float(v23[j * 64u + p]);
-                v65[k] = float(s);
+                v65[k] = float(scratch[256 + e]);
             }
         }
         float v66[1];

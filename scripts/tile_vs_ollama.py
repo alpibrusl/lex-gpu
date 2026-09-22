@@ -103,7 +103,7 @@ def main():
         if diverged is not None:
             print(f"  diverged at step {diverged}: tile {tk.decode([mine[diverged][0]])!r}, "
                   f"ollama {ref[diverged]['token']!r}")
-        print(f"  tile decode {timing.get('decode_tok_s', 0):.1f} tok/s on the GPU (P2: correct, not fast)")
+        print(f"  tile decode {timing.get('decode_tok_s', 0):.1f} tok/s on the GPU")
     sys.exit(0 if all_ok else 1)
 
 

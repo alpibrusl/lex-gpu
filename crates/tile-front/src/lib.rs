@@ -21,5 +21,5 @@ pub mod llama;
 pub mod print;
 
 pub use check::{Diag, Kind, Report, check};
-pub use interp::{Tensor, run};
+pub use interp::{Tensor, run, run_dyn};
 pub use ir::{Builder, Program};
