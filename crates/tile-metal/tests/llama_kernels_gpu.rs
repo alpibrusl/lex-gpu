@@ -82,9 +82,15 @@ fn same(
         .iter()
         .map(|x| x.abs())
         .fold(1e-6f32, f32::max);
+    // An f16 output carries about 5e-4 of relative precision, so one
+    // rounding step apart is all a correct kernel can promise there.
+    let tol = match want[out].dtype {
+        DType::F16 => 1e-3,
+        _ => 1e-5,
+    };
     assert!(
-        abs / scale < 1e-5,
-        "{}: GPU vs interpreter max abs err {abs:e} on outputs up to {scale:e}",
+        abs / scale < tol,
+        "{}: GPU vs interpreter max abs err {abs:e} on outputs up to {scale:e} (tolerance {tol:e})",
         prog.name
     );
 }
@@ -407,6 +413,50 @@ fn split_kv_attention_matches_the_interpreter() {
             );
         }
     }
+}
+
+/// Qwen3.5's attention prologue at the model's shape: 24 query heads of
+/// 256, a rotated quarter, and f16 out for the attention kernel.
+#[test]
+fn qwen_qk_rope_matches_the_interpreter() {
+    use tile_front::qwen::{build_mul, build_qk_rope};
+    let gpu = Gpu::open().expect("metal device");
+    let (hd, rot) = (256usize, 64usize);
+    for (heads, gate) in [(24usize, true), (4, false)] {
+        let width = if gate { 2 * hd } else { hd };
+        let prog = build_qk_rope(heads, hd, rot, gate, DType::F16, 1e-6).unwrap();
+        let mut t = vec![
+            Tensor::new(DType::F32, &[heads, width], &pattern(heads * width, 50)),
+            Tensor::new(
+                DType::F32,
+                &[1, hd],
+                &pattern(hd, 51).iter().map(|v| 1.0 + v).collect::<Vec<_>>(),
+            ),
+            Tensor::new(DType::F32, &[1, rot / 2], &pattern(rot / 2, 52)),
+            Tensor::new(DType::F32, &[1, rot / 2], &pattern(rot / 2, 53)),
+            Tensor::zeros(DType::F16, &[heads, hd]),
+        ];
+        if gate {
+            t.push(Tensor::zeros(DType::F32, &[heads, hd]));
+        }
+        let outs: &[usize] = if gate { &[4, 5] } else { &[4] };
+        for &out in outs {
+            same(&gpu, &prog, t.clone(), &[], out, 256);
+        }
+    }
+    let n = 24 * hd;
+    same(
+        &gpu,
+        &build_mul(n, 256).unwrap(),
+        vec![
+            Tensor::new(DType::F32, &[1, n], &pattern(n, 54)),
+            Tensor::new(DType::F32, &[1, n], &pattern(n, 55)),
+            Tensor::zeros(DType::F32, &[1, n]),
+        ],
+        &[],
+        2,
+        256,
+    );
 }
 
 /// Qwen3.5's gates and its depthwise convolution, at the model's shapes.

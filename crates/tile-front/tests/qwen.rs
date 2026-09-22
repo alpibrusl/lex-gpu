@@ -1,6 +1,6 @@
 //! Qwen3.5's gated-delta state update, against the rule it implements.
 
-use tile_front::qwen::{DeltaNet, build_conv_silu, build_gates, reference};
+use tile_front::qwen::{DeltaNet, build_conv_silu, build_gates, build_qk_rope, reference};
 use tile_front::{Tensor, check, run};
 use tile_ir::reference::fill_pattern_f32;
 use tile_ir::{DType, Target};
@@ -210,5 +210,67 @@ fn conv_silu_matches_a_sliding_window() {
             );
         }
         state = t[0].data.clone();
+    }
+}
+
+/// The attention prologue: a per-head norm, a rotation of the first
+/// quarter of the head pairing `i` with `i + rot/2`, the rest untouched,
+/// and the query's gate through a sigmoid.
+#[test]
+fn qk_rope_normalises_rotates_and_gates() {
+    let (heads, hd, rot, eps) = (4usize, 16usize, 8usize, 1e-6f32);
+    let half = rot / 2;
+    for gate in [false, true] {
+        let width = if gate { 2 * hd } else { hd };
+        let prog = build_qk_rope(heads, hd, rot, gate, DType::F32, eps).unwrap();
+        check(&prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+        let x = pattern(heads * width, 70);
+        let nw: Vec<f32> = pattern(hd, 71).iter().map(|v| 1.0 + v).collect();
+        let cos = pattern(half, 72);
+        let sin = pattern(half, 73);
+        let mut t = vec![
+            Tensor::new(DType::F32, &[heads, width], &x),
+            Tensor::new(DType::F32, &[1, hd], &nw),
+            Tensor::new(DType::F32, &[1, half], &cos),
+            Tensor::new(DType::F32, &[1, half], &sin),
+            Tensor::zeros(DType::F32, &[heads, hd]),
+        ];
+        if gate {
+            t.push(Tensor::zeros(DType::F32, &[heads, hd]));
+        }
+        run(&prog, &mut t).expect("interpret");
+
+        for h in 0..heads {
+            let row = &x[h * width..h * width + hd];
+            let ms = row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / hd as f64;
+            let r = 1.0 / (ms + eps as f64).sqrt();
+            let n: Vec<f64> = row
+                .iter()
+                .zip(&nw)
+                .map(|(v, w)| *v as f64 * *w as f64 * r)
+                .collect();
+            for i in 0..hd {
+                let want = if i < half {
+                    n[i] * cos[i] as f64 - n[i + half] * sin[i] as f64
+                } else if i < rot {
+                    n[i] * cos[i - half] as f64 + n[i - half] * sin[i - half] as f64
+                } else {
+                    n[i]
+                };
+                let got = t[4].data[h * hd + i] as f64;
+                assert!(
+                    (got - want).abs() <= 1e-5 * want.abs().max(1e-3),
+                    "gate {gate} head {h} dim {i}: {got} vs {want}"
+                );
+            }
+            if gate {
+                for i in 0..hd {
+                    let g = x[h * width + hd + i] as f64;
+                    let want = 1.0 / (1.0 + (-g).exp());
+                    let got = t[5].data[h * hd + i] as f64;
+                    assert!((got - want).abs() < 1e-6, "head {h} gate {i}");
+                }
+            }
+        }
     }
 }
