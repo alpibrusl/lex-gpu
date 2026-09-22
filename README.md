@@ -265,6 +265,21 @@ included) and reference, plus these suites:
   model missing, it prints `SKIPPED`. Run it with `--release`: in a debug
   build it takes many minutes.
 
+### 7. Ollama's baseline, here or on an NVIDIA GPU in the cloud
+
+```sh
+python3 scripts/ollama_bench.py --model llama3.1:8b          # decode and prefill at 0/512/1440 context
+GCP_PROJECT=<project> scripts/gcp/nvidia_test.sh              # same, plus the test suite, on an L4 in europe-west4
+```
+
+On this M4 Max, Ollama decodes the 8B at 86/84/82 tok/s (0/512/1,440
+positions) and prefills at ~900 tok/s. The 1B decodes at 263–266 tok/s and
+prefills at 5,300–6,200 tok/s. The cloud script creates the VM, runs the
+workspace tests and the same benchmark on the GPU, copies the results home,
+and deletes the VM. [`docs/cloud.md`](docs/cloud.md) covers GPUs, EU zones,
+quota and the cost guard rails. It becomes the CUDA backend's test bed
+once that backend exists.
+
 ## Layering
 
 ```text
