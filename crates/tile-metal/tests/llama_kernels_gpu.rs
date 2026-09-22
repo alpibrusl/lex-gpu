@@ -96,6 +96,20 @@ fn matvec_every_layout_matches_the_interpreter() {
     for layout in [QLayout::Q8_0, QLayout::Q6_K, QLayout::Q4_K] {
         for residual in [false, true] {
             let groups = n_out * n_in / layout.group;
+            let supers = n_out * n_in / (layout.group * layout.super_groups.unwrap_or(1));
+            let f16s = |n, seed| {
+                pattern(n, seed)
+                    .iter()
+                    .map(|v| f16::from_f32(0.001 + v.abs() * 0.01))
+                    .collect::<Vec<_>>()
+            };
+            let small = |n, seed| {
+                pattern(n, seed)
+                    .iter()
+                    .map(|v| ((v + 1.0) * 31.5) as i8)
+                    .collect::<Vec<_>>()
+            };
+            let two_level = layout.super_groups.is_some();
             let sp = Split {
                 layout,
                 cols: n_in,
@@ -111,20 +125,12 @@ fn matvec_every_layout_matches_the_interpreter() {
                         .map(|v| (v * 31.0).round() as i8)
                         .collect()
                 },
-                s: pattern(groups, 5).iter().map(|v| v.abs() * 0.01).collect(),
-                m: layout
-                    .min
-                    .then(|| pattern(groups, 7).iter().map(|v| v * 0.05).collect()),
+                sc: if two_level { small(groups, 5) } else { vec![] },
+                d: f16s(if two_level { supers } else { groups }, 6),
+                mn: layout.min.then(|| (small(groups, 7), f16s(supers, 8))),
             };
-            let qf = sp.q_f32();
-            let mut t = vec![
-                Tensor::new(DType::F32, &[1, n_in], &pattern(n_in, 3)),
-                Tensor::new(DType::I8, &[n_out, qf.len() / n_out], &qf),
-                Tensor::new(DType::F32, &[n_out, n_in / layout.group], &sp.s),
-            ];
-            if let Some(m) = &sp.m {
-                t.push(Tensor::new(DType::F32, &[n_out, n_in / layout.group], m));
-            }
+            let mut t = vec![Tensor::new(DType::F32, &[1, n_in], &pattern(n_in, 3))];
+            t.extend(sp.weight_tensors(n_out));
             if residual {
                 t.push(Tensor::new(DType::F32, &[1, n_out], &pattern(n_out, 6)));
             }

@@ -98,6 +98,21 @@ struct Gen<'a> {
     /// Scratch floats the current op's operands were staged into.
     staged: usize,
     barriers: usize,
+    /// Lazy dequantisations, by result: the per-element value and the
+    /// per-group scale and min as separate expressions, so a reduction over
+    /// them can evaluate the group terms once per run instead of per value.
+    dq: HashMap<Var, Dq>,
+}
+
+/// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
+/// `G = (I / cols) * (cols / group) + (I % cols) / group`.
+#[derive(Clone, Debug)]
+struct Dq {
+    v: String,
+    s: String,
+    m: Option<String>,
+    cols: usize,
+    group: usize,
 }
 
 /// Lower `prog` (which must already pass `tile_front::check` for `target`)
@@ -122,6 +137,7 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
         scratch: 0,
         staged: 0,
         barriers: 0,
+        dq: HashMap::new(),
     };
     if let Some(pid) = prog.pid {
         g.locs.insert(pid, Loc::Index("gid".into()));
@@ -217,6 +233,19 @@ fn param_ident(i: usize, name: &str) -> String {
 
 fn v(var: Var) -> String {
     format!("v{}", var.0)
+}
+
+/// Consecutive elements per lane per step in a split-K reduction: the
+/// largest of `TILE_VEC` (default 8), 4, 2 that tiles the reduction evenly.
+fn split_k_vec(kd: usize, lanes: usize) -> usize {
+    let want: usize = std::env::var("TILE_VEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    [want, 4, 2]
+        .into_iter()
+        .find(|&v| v <= want && v > 0 && kd.is_multiple_of(lanes * v))
+        .unwrap_or(1)
 }
 
 /// The storage name a location reads from.
@@ -748,6 +777,16 @@ impl Gen<'_> {
                     }
                     None => String::new(),
                 };
+                self.dq.insert(
+                    x,
+                    Dq {
+                        v: qv.clone(),
+                        s: format!("float({se})"),
+                        m: m.map(|m| format!("float({})", self.lazy(m).expect("checked").0)),
+                        cols: c,
+                        group: *group,
+                    },
+                );
                 let e = format!("({qv} * {sv}{mv})");
                 self.locs
                     .insert(x, Loc::Lazy(e, reg(DType::F32, &tq.shape)));
@@ -906,9 +945,54 @@ impl Gen<'_> {
                     self.line(&format!("if (o < {outs}u) {{"));
                     self.depth += 1;
                     self.line(&format!("const uint i = o / {n}u, j = o % {n}u;"));
-                    self.line(&format!(
-                        "for (uint p = lane; p < {kd}u; p += {lanes}u) s += {av} * {bv};"
-                    ));
+                    // Each lane takes runs of `vec` consecutive elements, so
+                    // the compiler can merge a run's loads into wide ones.
+                    let vec = split_k_vec(kd, lanes);
+                    // B is a lazy dequantisation whose groups each run fits
+                    // inside: form the group's scale and min once per run.
+                    let dq = match b {
+                        Arg::Move(v) | Arg::Borrow(v) if nt => self.dq.get(v).cloned(),
+                        _ => None,
+                    }
+                    .filter(|d| vec > 1 && d.cols == kd && d.group.is_multiple_of(vec));
+                    if let Some(d) = dq {
+                        let g = d.group;
+                        let vv = at_index(&d.v, &format!("j * {kd}u + p"));
+                        self.line(&format!(
+                            "for (uint p0 = lane * {vec}u; p0 < {kd}u; p0 += {}u) {{",
+                            lanes * vec
+                        ));
+                        self.line(&format!(
+                            "    const uint grp = j * {}u + p0 / {g}u;",
+                            kd / g
+                        ));
+                        self.line(&format!("    const float sg = {};", at_index(&d.s, "grp")));
+                        let mg = match &d.m {
+                            Some(m) => {
+                                self.line(&format!("    const float mg = {};", at_index(m, "grp")));
+                                " - mg"
+                            }
+                            None => "",
+                        };
+                        self.line(&format!(
+                            "    for (uint u = 0; u < {vec}u; ++u) {{ const uint p = p0 + u; \
+                             s += {av} * ({vv} * sg{mg}); }}"
+                        ));
+                        self.line("}");
+                    } else if vec > 1 {
+                        self.line(&format!(
+                            "for (uint p0 = lane * {vec}u; p0 < {kd}u; p0 += {}u) {{",
+                            lanes * vec
+                        ));
+                        self.line(&format!(
+                            "    for (uint u = 0; u < {vec}u; ++u) {{ const uint p = p0 + u; s += {av} * {bv}; }}"
+                        ));
+                        self.line("}");
+                    } else {
+                        self.line(&format!(
+                            "for (uint p = lane; p < {kd}u; p += {lanes}u) s += {av} * {bv};"
+                        ));
+                    }
                     self.depth -= 1;
                     self.line("}");
                     self.line(&format!(

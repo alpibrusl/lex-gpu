@@ -172,7 +172,7 @@ impl Weights {
 impl QMat {
     /// Bytes the kernels read for this matrix: values, scales, mins.
     pub fn device_bytes(&self) -> usize {
-        self.w.q.len() + 4 * self.w.s.len() + self.w.m.as_ref().map_or(0, |m| 4 * m.len())
+        self.w.device_bytes()
     }
 }
 
@@ -248,8 +248,9 @@ mod gpu {
         cols: usize,
         layout: QLayout,
         q: Buffer,
-        s: Buffer,
-        m: Option<Buffer>,
+        /// Scale parameters in `QLayout::scale_params` order, in the file's
+        /// own encoding.
+        scales: Vec<Buffer>,
     }
 
     fn upload_q(gpu: &Gpu, w: &QMat) -> QBuf {
@@ -258,8 +259,7 @@ mod gpu {
             cols: w.cols,
             layout: w.w.layout,
             q: gpu.upload(&w.w.q),
-            s: gpu.upload(&w.w.s),
-            m: w.w.m.as_ref().map(|m| gpu.upload(m)),
+            scales: w.w.scale_bytes().iter().map(|b| gpu.upload(b)).collect(),
         }
     }
 
@@ -541,8 +541,8 @@ mod gpu {
             y: &'a Buffer,
         ) -> Dispatch<'a> {
             let p = &self.k.mv[&(w.cols, w.rows, w.layout, r.is_some())];
-            let mut bufs = vec![x, &w.q, &w.s];
-            bufs.extend(w.m.as_ref());
+            let mut bufs = vec![x, &w.q];
+            bufs.extend(w.scales.iter());
             bufs.extend(r);
             bufs.push(y);
             (label, p, bufs)
