@@ -5,7 +5,7 @@
 
 use half::f16;
 use tile_front::llama::{
-    QLayout, Split, kv_append, matvec_q, rmsnorm, rope, rope_tables, silu_mul,
+    QLayout, Split, kv_append, matmul_q, matvec_q, rmsnorm, rope, rope_tables, silu_mul,
 };
 use tile_front::{Program, Tensor, check, run_dyn};
 use tile_ir::reference::fill_pattern_f32;
@@ -145,6 +145,28 @@ fn matvec_every_layout_matches_the_interpreter() {
             let out = t.len() - 1;
             let p = matvec_q(n_in, n_out, 8, n_in, layout, residual).unwrap();
             same(&gpu, &p, t, &[], out, 256);
+
+            // The same weights against a small batch of token rows: each
+            // weight read once for all of them (speculative verify, prefill).
+            for rows in [3usize, 8, 16] {
+                let mut t = vec![Tensor::new(
+                    DType::F32,
+                    &[rows, n_in],
+                    &pattern(rows * n_in, 11),
+                )];
+                t.extend(sp.weight_tensors(n_out));
+                if residual {
+                    t.push(Tensor::new(
+                        DType::F32,
+                        &[rows, n_out],
+                        &pattern(rows * n_out, 12),
+                    ));
+                }
+                t.push(Tensor::zeros(DType::F32, &[rows, n_out]));
+                let out = t.len() - 1;
+                let p = matmul_q(rows, n_in, n_out, 8, n_in, layout, residual).unwrap();
+                same(&gpu, &p, t, &[], out, 256);
+            }
         }
     }
 }
@@ -263,5 +285,103 @@ fn dynamic_attention_and_f16_kv_append_match_the_interpreter() {
         &[37],
         1,
         64,
+    );
+}
+
+/// The batched forward pass's kernels (prefill, speculative verify).
+#[test]
+fn batched_kernels_match_the_interpreter() {
+    use tile_front::flash::FlashDecode;
+    use tile_front::llama::{kv_append_rows, rmsnorm_rows, rope_rows};
+    use tile_ir::Space;
+    let gpu = Gpu::open().expect("metal device");
+    let (t, n) = (5usize, 4096usize);
+    for pick in [None, Some(t - 1)] {
+        let out_rows = if pick.is_some() { 1 } else { t };
+        same(
+            &gpu,
+            &rmsnorm_rows(t, n, 1e-5, pick),
+            vec![
+                Tensor::new(DType::F32, &[t, n], &pattern(t * n, 1)),
+                Tensor::new(DType::F32, &[1, n], &pattern(n, 2)),
+                Tensor::zeros(DType::F32, &[out_rows, n]),
+            ],
+            &[],
+            2,
+            256,
+        );
+    }
+    let (heads, hd) = (8usize, 128usize);
+    let mut cos = vec![];
+    let mut sin = vec![];
+    for pos in 0..t {
+        let (c, s) = rope_tables(20 + pos, hd, 500000.0, None);
+        cos.extend(c);
+        sin.extend(s);
+    }
+    same(
+        &gpu,
+        &rope_rows(t, heads, hd, DType::F16),
+        vec![
+            Tensor::new(DType::F32, &[t * heads, hd], &pattern(t * heads * hd, 3)),
+            Tensor::new(DType::F32, &[t, hd], &cos),
+            Tensor::new(DType::F32, &[t, hd], &sin),
+            Tensor::zeros(DType::F16, &[t * heads, hd]),
+        ],
+        &[],
+        3,
+        256,
+    );
+    let cap = 64;
+    for dt in [DType::F16, DType::F32] {
+        same(
+            &gpu,
+            &kv_append_rows(t, heads, hd, cap, dt),
+            vec![
+                Tensor::new(dt, &[t * heads, hd], &pattern(t * heads * hd, 4)),
+                Tensor::zeros(DType::F16, &[heads * cap, hd]),
+            ],
+            &[30],
+            1,
+            64,
+        );
+    }
+    let group = 4;
+    let cfg = FlashDecode {
+        q_rows: group,
+        d: hd,
+        seq: cap,
+        bq: group,
+        bk: 16,
+        stages: 1,
+        dtype: DType::F16,
+        kv_space: Space::Threadgroup,
+        consumers: 0,
+        heads,
+        kv_cap: cap,
+    };
+    let hg = heads * group;
+    let prog = cfg.build_causal(t).unwrap();
+    let pos0 = 30usize;
+    same(
+        &gpu,
+        &prog,
+        vec![
+            Tensor::new(DType::F16, &[t * hg, hd], &pattern(t * hg * hd, 5)),
+            Tensor::new(
+                DType::F16,
+                &[heads * cap, hd],
+                &pattern(heads * cap * hd, 6),
+            ),
+            Tensor::new(
+                DType::F16,
+                &[heads * cap, hd],
+                &pattern(heads * cap * hd, 7),
+            ),
+            Tensor::zeros(DType::F32, &[t * hg, hd]),
+        ],
+        &[pos0 as u32, (pos0 + t).div_ceil(16) as u32],
+        3,
+        128,
     );
 }

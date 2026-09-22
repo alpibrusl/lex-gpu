@@ -144,6 +144,21 @@ pub fn matvec_q(
     layout: QLayout,
     residual: bool,
 ) -> Result<Program, String> {
+    matmul_q(1, n_in, n_out, bo, kc, layout, residual)
+}
+
+/// [`matvec_q`] for `t` rows of activations at once (`x: [t, n_in]`,
+/// `y: [t, n_out]`): prefill's shape, where each weight is read once for
+/// every token of the batch.
+pub fn matmul_q(
+    t: usize,
+    n_in: usize,
+    n_out: usize,
+    bo: usize,
+    kc: usize,
+    layout: QLayout,
+    residual: bool,
+) -> Result<Program, String> {
     use Arg::Move;
     let g = layout.group;
     let sup = g * layout.super_groups.unwrap_or(1);
@@ -154,12 +169,17 @@ pub fn matvec_q(
         ));
     }
     let name = format!(
-        "matvec_{}_{n_out}x{n_in}{}",
+        "{}_{}_{n_out}x{n_in}{}",
+        if t == 1 {
+            "matvec".to_string()
+        } else {
+            format!("matmul{t}")
+        },
         layout.tag(),
         if residual { "_res" } else { "" }
     );
     let mut b = Builder::new(&name);
-    let px = b.param("x", DType::F32, &[1, n_in], false);
+    let px = b.param("x", DType::F32, &[t, n_in], false);
     let qcols = if layout.packed4 || layout.six {
         n_in / 2
     } else {
@@ -174,11 +194,11 @@ pub fn matvec_q(
         .into_iter()
         .map(|(name, dt, per)| (b.param(name, dt, &[n_out, n_in / per], false), dt, per))
         .collect();
-    let pr = residual.then(|| b.param("r", DType::F32, &[1, n_out], false));
-    let py = b.param("y", DType::F32, &[1, n_out], true);
+    let pr = residual.then(|| b.param("r", DType::F32, &[t, n_out], false));
+    let py = b.param("y", DType::F32, &[t, n_out], true);
     let pid = b.grid(n_out / bo);
 
-    let acc_ty = reg(DType::F32, &[1, bo]);
+    let acc_ty = reg(DType::F32, &[t, bo]);
     let acc = b.op("acc", Op::Fill(acc_ty.clone(), 0.0));
     let out = b.for_range(
         0,
@@ -194,9 +214,9 @@ pub fn matvec_q(
                         at(
                             px,
                             [IdxExpr::lit(0), IdxExpr::scaled(c, kc, col0)],
-                            [1, cols],
+                            [t, cols],
                         ),
-                        reg(DType::F32, &[1, cols]),
+                        reg(DType::F32, &[t, cols]),
                     ),
                 )
             };
@@ -284,13 +304,13 @@ pub fn matvec_q(
         },
     );
     let mut y = out[0];
-    let dst = at(py, [IdxExpr::lit(0), IdxExpr::scaled(pid, bo, 0)], [1, bo]);
+    let dst = at(py, [IdxExpr::lit(0), IdxExpr::scaled(pid, bo, 0)], [t, bo]);
     if let Some(pr) = pr {
         let r = b.op(
             "r",
             Op::Load(
-                at(pr, [IdxExpr::lit(0), IdxExpr::scaled(pid, bo, 0)], [1, bo]),
-                reg(DType::F32, &[1, bo]),
+                at(pr, [IdxExpr::lit(0), IdxExpr::scaled(pid, bo, 0)], [t, bo]),
+                reg(DType::F32, &[t, bo]),
             ),
         );
         y = b.op("y", Op::Binary(BinOp::Add, Move(y), Move(r)));
@@ -365,6 +385,131 @@ pub fn kv_append(heads: usize, hd: usize, cap: usize, x_dtype: DType) -> Program
             [1, hd],
         );
         b.effect(Op::Store(Move(r), dst));
+    }
+    b.finish()
+}
+
+/// RMSNorm over `rows` rows of `n` (`x, w: [1, n], y`), one grid instance
+/// per row. With `pick = Some(r)`, only row `r` is normalised, into a
+/// `[1, n]` output: prefill's last row, for the output head.
+pub fn rmsnorm_rows(rows: usize, n: usize, eps: f32, pick: Option<usize>) -> Program {
+    use Arg::{Borrow, Move};
+    let name = match pick {
+        Some(r) => format!("rmsnorm_row{r}_of{rows}_{n}"),
+        None => format!("rmsnorm_{rows}x{n}"),
+    };
+    let mut b = Builder::new(&name);
+    let px = b.param("x", DType::F32, &[rows, n], false);
+    let pw = b.param("w", DType::F32, &[1, n], false);
+    let out_rows = if pick.is_some() { 1 } else { rows };
+    let py = b.param("y", DType::F32, &[out_rows, n], true);
+    let (src, dst) = match pick {
+        Some(r) => (IdxExpr::lit(r), IdxExpr::lit(0)),
+        None => {
+            let pid = b.grid(rows);
+            (IdxExpr::scaled(pid, 1, 0), IdxExpr::scaled(pid, 1, 0))
+        }
+    };
+    let x = b.op(
+        "x",
+        Op::Load(
+            at(px, [src, IdxExpr::lit(0)], [1, n]),
+            reg(DType::F32, &[1, n]),
+        ),
+    );
+    let sq = b.op("sq", Op::Binary(BinOp::Mul, Borrow(x), Borrow(x)));
+    let ss = b.op("ss", Op::RowReduce(Reduce::Sum, Move(sq)));
+    let ms = b.op("ms", Op::Scale(Move(ss), 1.0 / n as f32));
+    let e = b.op("eps", Op::Fill(reg(DType::F32, &[1]), eps));
+    let t = b.op("t", Op::Binary(BinOp::Add, Move(ms), Move(e)));
+    let r = b.op("r", Op::Unary(UnOp::Rsqrt, Move(t)));
+    let xn = b.op("xn", Op::Binary(BinOp::Mul, Move(x), Move(r)));
+    let w = b.op("w", Op::Load(row(pw, n), reg(DType::F32, &[1, n])));
+    let y = b.op("y", Op::Binary(BinOp::Mul, Move(xn), Move(w)));
+    b.effect(Op::Store(Move(y), at(py, [dst, IdxExpr::lit(0)], [1, n])));
+    b.finish()
+}
+
+/// RoPE for `tokens` tokens of `heads` heads each (`x: [tokens*heads, hd]`),
+/// with per-token tables `cos, sin: [tokens, hd]`. One grid instance per
+/// token; output in the same order, narrowed to `out`.
+pub fn rope_rows(tokens: usize, heads: usize, hd: usize, out: DType) -> Program {
+    use Arg::{Borrow, Move};
+    let mut b = Builder::new(&format!("rope_{tokens}x{heads}x{hd}_{}", out.suffix()));
+    let px = b.param("x", DType::F32, &[tokens * heads, hd], false);
+    let pc = b.param("cos", DType::F32, &[tokens, hd], false);
+    let ps = b.param("sin", DType::F32, &[tokens, hd], false);
+    let py = b.param("y", out, &[tokens * heads, hd], true);
+    let pid = b.grid(tokens);
+    let block = [IdxExpr::scaled(pid, heads, 0), IdxExpr::lit(0)];
+    let table = [IdxExpr::scaled(pid, 1, 0), IdxExpr::lit(0)];
+    let x = b.op(
+        "x",
+        Op::Load(
+            at(px, block.clone(), [heads, hd]),
+            reg(DType::F32, &[heads, hd]),
+        ),
+    );
+    let c = b.op(
+        "cos",
+        Op::Load(at(pc, table.clone(), [1, hd]), reg(DType::F32, &[1, hd])),
+    );
+    let s = b.op(
+        "sin",
+        Op::Load(at(ps, table, [1, hd]), reg(DType::F32, &[1, hd])),
+    );
+    let sw = b.op("sw", Op::SwapPairs(Borrow(x)));
+    let a = b.op("a", Op::Binary(BinOp::Mul, Move(x), Move(c)));
+    let z = b.op("z", Op::Binary(BinOp::Mul, Move(sw), Move(s)));
+    let y = b.op("y", Op::Binary(BinOp::Add, Move(a), Move(z)));
+    let y = if out == DType::F32 {
+        y
+    } else {
+        b.op("y", Op::Convert(Move(y), out))
+    };
+    b.effect(Op::Store(Move(y), at(py, block, [heads, hd])));
+    b.finish()
+}
+
+/// Append `tokens` positions to a head-major KV cache: row `t * heads + h`
+/// of `x` goes to cache row `h * cap + pos0 + t`, in f16. `pos0` is a
+/// runtime scalar bounded so the last write stays inside the cache.
+pub fn kv_append_rows(
+    tokens: usize,
+    heads: usize,
+    hd: usize,
+    cap: usize,
+    x_dtype: DType,
+) -> Program {
+    use Arg::Move;
+    let mut b = Builder::new(&format!(
+        "kv_append_{tokens}x{heads}x{hd}_cap{cap}_{}",
+        x_dtype.suffix()
+    ));
+    let px = b.param("x", x_dtype, &[tokens * heads, hd], false);
+    let pc = b.param("cache", DType::F16, &[heads * cap, hd], true);
+    let pos0 = b.dyn_index("pos0", cap - tokens);
+    for t in 0..tokens {
+        for h in 0..heads {
+            let r = b.op(
+                "row",
+                Op::Load(
+                    at(px, [IdxExpr::lit(t * heads + h), IdxExpr::lit(0)], [1, hd]),
+                    reg(x_dtype, &[1, hd]),
+                ),
+            );
+            let r = if x_dtype == DType::F16 {
+                r
+            } else {
+                b.op("row16", Op::Convert(Move(r), DType::F16))
+            };
+            let dst = at(
+                pc,
+                [IdxExpr::lit(h * cap + t).plus(pos0, 1), IdxExpr::lit(0)],
+                [1, hd],
+            );
+            b.effect(Op::Store(Move(r), dst));
+        }
     }
     b.finish()
 }

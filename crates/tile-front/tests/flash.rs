@@ -169,3 +169,59 @@ fn dynamic_length_attention_matches_the_reference_at_every_length() {
         assert!(err < TOL, "len {len}: max rel err {err:e}");
     }
 }
+
+/// Prefill / speculative verify: `tokens` new queries at `pos0..`, each
+/// seeing only the positions up to its own. Queries and outputs in the
+/// natural [token, kv head, group, d] order.
+#[test]
+fn causal_attention_sees_exactly_its_own_prefix() {
+    use tile_front::run_dyn;
+    let (heads, group, cap, bk) = (2usize, 4usize, 64usize, 16usize);
+    let hg = heads * group;
+    let cfg = FlashDecode {
+        q_rows: group,
+        d: D,
+        seq: cap,
+        bq: group,
+        bk,
+        stages: 1,
+        dtype: DType::F16,
+        kv_space: Space::Threadgroup,
+        consumers: 0,
+        heads,
+        kv_cap: cap,
+    };
+    for (tokens, pos0) in [(1usize, 0usize), (5, 20), (4, 12), (8, 56)] {
+        let prog = cfg.build_causal(tokens).unwrap();
+        check(&prog, &Target::apple_m_series()).expect("check");
+        let mk = |rows: usize, seed: u32| {
+            let mut x = vec![0.0; rows * D];
+            fill_pattern_f32(&mut x, seed);
+            Tensor::new(DType::F16, &[rows, D], &x)
+        };
+        let mut t = vec![
+            mk(tokens * hg, 1),
+            mk(heads * cap, 2),
+            mk(heads * cap, 3),
+            Tensor::zeros(DType::F32, &[tokens * hg, D]),
+        ];
+        let nkb = (pos0 + tokens).div_ceil(bk) as u32;
+        run_dyn(&prog, &mut t, &[pos0 as u32, nkb]).expect("interpret");
+        for tok in 0..tokens {
+            let len = pos0 + tok + 1;
+            for h in 0..heads {
+                let r0 = tok * hg + h * group;
+                let q = &t[0].data[r0 * D..(r0 + group) * D];
+                let k = &t[1].data[h * cap * D..(h * cap + len) * D];
+                let v = &t[2].data[h * cap * D..(h * cap + len) * D];
+                let want = flash::reference(q, k, v, group, len, D);
+                let got = &t[3].data[r0 * D..(r0 + group) * D];
+                let err = max_rel_err(got, &want);
+                assert!(
+                    err < TOL,
+                    "tokens {tokens} pos0 {pos0} token {tok} head {h}: {err:e}"
+                );
+            }
+        }
+    }
+}
