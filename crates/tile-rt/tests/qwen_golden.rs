@@ -118,3 +118,56 @@ fn qwen35_matches_the_reference_that_matches_ollama() {
         rt.device()
     );
 }
+
+/// A prompt fed as one batch must land where the same prompt lands token
+/// by token. This is the gate speculative decoding sits behind: a verify
+/// is only sound if a batch and a sequence agree.
+#[test]
+fn a_batch_lands_where_the_same_tokens_land_one_by_one() {
+    let golden = include_str!("data/qwen35_27b_golden.txt");
+    let (model, cases) = parse(golden);
+    let prompt = &cases[0].prompt;
+    let mut rt = match Runner::load(&model, prompt.len() + 16) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+
+    // One at a time.
+    rt.reset();
+    let mut one = vec![];
+    for &t in prompt {
+        one.push(rt.step(t).expect("step"));
+    }
+
+    // The same tokens as a single batch, every position's logits.
+    rt.reset();
+    let many = rt.forward(prompt, true).expect("batch");
+    assert_eq!(many.len(), prompt.len());
+
+    let mut worst = 0.0f32;
+    for (i, (b, s)) in many.iter().zip(&one).enumerate() {
+        let top = |v: &[f32]| {
+            (0..v.len())
+                .max_by(|&a, &c| v[a].total_cmp(&v[c]))
+                .expect("logits")
+        };
+        assert_eq!(
+            top(b),
+            top(s),
+            "position {i}: the batch and the sequence pick different tokens"
+        );
+        let scale = s.iter().map(|x| x.abs()).fold(1e-6, f32::max);
+        let d = b
+            .iter()
+            .zip(s)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+            / scale;
+        worst = worst.max(d);
+    }
+    eprintln!("batch vs sequence: worst logit difference {worst:e} of scale");
+    assert!(worst < 1e-3, "batch differs from the sequence by {worst:e}");
+}

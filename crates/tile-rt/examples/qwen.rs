@@ -47,6 +47,35 @@ fn main() -> Result<(), String> {
     let per = t.elapsed().as_secs_f64() / steps as f64;
     println!("{:.1} ms/token ({:.1} tok/s)", 1e3 * per, 1.0 / per);
 
+    // What a batch costs against the same tokens one at a time: the
+    // number speculative decoding lives or dies by.
+    println!(
+        "\n  {:>6} {:>10} {:>12} {:>14}",
+        "tokens", "ms/pass", "ms/token", "vs one step"
+    );
+    let mut base = 0.0;
+    for batch in [1usize, 2, 3, 4] {
+        let ids: Vec<u32> = (0..batch).map(|i| (1000 + i) as u32).collect();
+        rt.reset();
+        rt.forward(&ids, true)?; // warm the pipelines for this size
+        let t = Instant::now();
+        let reps = 3;
+        for _ in 0..reps {
+            rt.reset();
+            rt.forward(&ids, true)?;
+        }
+        let per = t.elapsed().as_secs_f64() / reps as f64;
+        if batch == 1 {
+            base = per;
+        }
+        println!(
+            "  {batch:>6} {:>10.1} {:>12.1} {:>13.2}x",
+            1e3 * per,
+            1e3 * per / batch as f64,
+            per / base
+        );
+    }
+
     // Where the time goes, per call site, from the command buffer's own
     // timestamps. Each dispatch waits, so the step itself is slower here.
     rt.sync = true;

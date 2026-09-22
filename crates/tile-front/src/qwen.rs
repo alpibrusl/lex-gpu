@@ -617,14 +617,28 @@ pub fn build_matvec_dense(
     bo: usize,
     w: DType,
 ) -> Result<Program, String> {
+    build_matvec_dense_rows(1, n_in, n_out, bo, w)
+}
+
+/// [`build_matvec_dense`] for `tokens` rows of activations at once.
+pub fn build_matvec_dense_rows(
+    tokens: usize,
+    n_in: usize,
+    n_out: usize,
+    bo: usize,
+    w: DType,
+) -> Result<Program, String> {
     use Arg::Move;
     if bo == 0 || !n_out.is_multiple_of(bo) {
         return Err(format!("{n_out} rows do not split into {bo}"));
     }
-    let mut b = Builder::new(&format!("matvec_dense_{n_out}x{n_in}_{}", w.suffix()));
-    let px = b.param("x", DType::F32, &[1, n_in], false);
+    let mut b = Builder::new(&format!(
+        "matvec_dense{tokens}_{n_out}x{n_in}_{}",
+        w.suffix()
+    ));
+    let px = b.param("x", DType::F32, &[tokens, n_in], false);
     let pw = b.param("w", w, &[n_out, n_in], false);
-    let py = b.param("y", DType::F32, &[1, n_out], true);
+    let py = b.param("y", DType::F32, &[tokens, n_out], true);
     let row = b.grid(n_out / bo);
     let x = b.op(
         "x",
@@ -632,9 +646,9 @@ pub fn build_matvec_dense(
             View {
                 param: px,
                 offset: vec![IdxExpr::lit(0), IdxExpr::lit(0)],
-                shape: vec![1, n_in],
+                shape: vec![tokens, n_in],
             },
-            TileTy::new(DType::F32, &[1, n_in], Space::Reg),
+            TileTy::new(DType::F32, &[tokens, n_in], Space::Reg),
         ),
     );
     let wt = b.op(
@@ -654,7 +668,7 @@ pub fn build_matvec_dense(
         View {
             param: py,
             offset: vec![IdxExpr::lit(0), IdxExpr::scaled(row, bo, 0)],
-            shape: vec![1, bo],
+            shape: vec![tokens, bo],
         },
     ));
     Ok(b.finish())
