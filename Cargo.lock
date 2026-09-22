@@ -199,6 +199,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tile-front"
+version = "0.0.1"
+dependencies = [
+ "half",
+ "tile-ir",
+]
+
+[[package]]
 name = "tile-ir"
 version = "0.0.1"
 dependencies = [

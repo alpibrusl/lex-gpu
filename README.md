@@ -7,9 +7,10 @@ per-target kernel rewrites.
 The full design is in [`docs/design.md`](docs/design.md). The plan for getting
 there is in [`docs/roadmap.md`](docs/roadmap.md).
 
-**Status: P0.** Two kernels, one target, no language yet. What exists is the
-spine the rest is built on — IR, target table, planner, MSL emitter, reference
-interpreter, device glue, and a harness that prints a bandwidth number.
+**Status: P1 in progress.** P0 is closed: RMSNorm runs at 98.1% of the copy
+ceiling (463.6 GB/s) on an M4 Max. P1's first slice, `tile-front`, type-checks
+linear tiles and runs a flash-attention decode loop in an interpreter against
+PyTorch; findings and what is left are in [`docs/P1.md`](docs/P1.md).
 
 ## What P0 answers
 
@@ -68,6 +69,7 @@ in its smallest possible form.
 | Crate | Responsibility | Builds off a Mac |
 | --- | --- | --- |
 | `tile-ir` | Tile IR, target table, planner, CPU reference interpreter | yes |
+| `tile-front` | Typed tile programs: linearity/effect checker, interpreter (P1) | yes |
 | `tile-msl` | MSL text emission + golden files | yes |
 | `tile-metal` | Compile, allocate, dispatch, time | **no** |
 | `tile-bench` | P0 harness: emit, verify, measure | yes (device path gated) |
