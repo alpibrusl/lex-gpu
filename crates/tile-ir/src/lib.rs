@@ -87,15 +87,19 @@ impl DType {
     }
 }
 
-/// Where a tile lives. P0 only needs two of these, but the enum is the thing
-/// that later makes placement a type-level decision rather than a `T*`.
+/// Where a tile lives. The enum is the thing that makes placement a
+/// type-level decision rather than a `T*`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Space {
     /// Device memory. On Apple silicon this is the same physical memory the CPU
     /// sees; the cost table differs, the type does not.
     Global,
-    /// Metal `threadgroup` / CUDA `__shared__` / AMD LDS.
+    /// Metal `threadgroup` / CUDA `__shared__` / AMD LDS. Counted against
+    /// `Target::max_threadgroup_bytes`.
     Threadgroup,
+    /// Per-thread registers, distributed across the threadgroup. Not budgeted
+    /// yet: register pressure is an occupancy question for P3's cost model.
+    Reg,
 }
 
 /// How a kernel parameter is used. Enough, for now, to emit `const` correctly
@@ -118,8 +122,9 @@ pub struct BufferParam {
 }
 
 /// The hardware table. This is *data*: adding a target means adding a row, not
-/// a code path. P0 has one row; the NVIDIA and AMD rows land with P1 so that
-/// schedules for them can be type-checked long before anything lowers to them.
+/// a code path. Only the Apple row has a backend. The NVIDIA and AMD rows exist
+/// so that schedules for them can be type-checked long before anything lowers
+/// to them — the insurance against a Metal-shaped abstraction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     pub name: &'static str,
@@ -130,6 +135,10 @@ pub struct Target {
     pub max_threadgroup_bytes: usize,
     /// True when device and host share physical memory (no weight staging).
     pub unified_memory: bool,
+    /// True when a global -> threadgroup copy can be issued and waited on
+    /// later by hardware (TMA / cp.async). Without it an async copy still
+    /// type-checks, but lowers to a synchronous one and the checker warns.
+    pub async_copy: bool,
 }
 
 impl Target {
@@ -144,6 +153,32 @@ impl Target {
             max_threads_per_threadgroup: 1024,
             max_threadgroup_bytes: 32 * 1024,
             unified_memory: true,
+            async_copy: false,
+        }
+    }
+
+    /// NVIDIA H100 (sm_90). 227 KiB is the largest dynamic shared-memory
+    /// allocation one block can opt into (228 KiB per SM, 1 KiB reserved).
+    pub const fn nvidia_hopper() -> Target {
+        Target {
+            name: "nvidia-hopper",
+            simd_width: 32,
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_bytes: 227 * 1024,
+            unified_memory: false,
+            async_copy: true,
+        }
+    }
+
+    /// AMD MI300 (CDNA3): wave64, 64 KiB LDS, no async copy engine.
+    pub const fn amd_cdna3() -> Target {
+        Target {
+            name: "amd-cdna3",
+            simd_width: 64,
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_bytes: 64 * 1024,
+            unified_memory: false,
+            async_copy: false,
         }
     }
 }

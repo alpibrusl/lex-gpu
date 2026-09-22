@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/tile-ir",
+    "crates/tile-front",
     "crates/tile-msl",
     "crates/tile-metal",
     "crates/tile-bench",
@@ -15,6 +16,7 @@ repository = "https://github.com/alpibrusl/lex-gpu"
 
 [workspace.dependencies]
 tile-ir = { path = "crates/tile-ir" }
+tile-front = { path = "crates/tile-front" }
 tile-msl = { path = "crates/tile-msl" }
 tile-metal = { path = "crates/tile-metal" }
 half = "2"
