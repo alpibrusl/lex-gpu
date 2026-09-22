@@ -1628,7 +1628,10 @@ impl Gen<'_> {
                         (
                             2,
                             format!("const float2 bq = FP4_P[(uint)(uchar)({byte}) & 0xFFu]; "),
-                            vec![format!("(bq.x * sgr[rr])"), format!("(bq.y * sgr[rr])")],
+                            vec![
+                                "(bq.x * sgr[rr])".to_string(),
+                                "(bq.y * sgr[rr])".to_string(),
+                            ],
                         )
                     }
                     Pack::Six(lo, lc, hi, hc) => {
