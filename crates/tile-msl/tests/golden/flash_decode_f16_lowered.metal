@@ -143,7 +143,9 @@ kernel void flash_decode_f16_bq4_bk16_s2(
                 float s = 0.0f;
                 if (o < 64u) {
                     const uint i = o / 16u, j = o % 16u;
-                    for (uint p = lane; p < 64u; p += 2u) s += float((scratch + 0)[i * 64u + p]) * float(v23[j * 64u + p]);
+                    for (uint p0 = lane * 8u; p0 < 64u; p0 += 16u) {
+                        for (uint u = 0; u < 8u; ++u) { const uint p = p0 + u; s += float((scratch + 0)[i * 64u + p]) * float(v23[j * 64u + p]); }
+                    }
                 }
                 for (uint d = 1u; d > 0; d /= 2) s += simd_shuffle_down(s, d);
                 if (o < 64u && lane == 0) scratch[256 + o] = s;
@@ -332,7 +334,9 @@ kernel void flash_decode_f16_bq4_bk16_s2(
             float s = 0.0f;
             if (o < 64u) {
                 const uint i = o / 16u, j = o % 16u;
-                for (uint p = lane; p < 64u; p += 2u) s += float((scratch + 0)[i * 64u + p]) * float(v23[j * 64u + p]);
+                for (uint p0 = lane * 8u; p0 < 64u; p0 += 16u) {
+                    for (uint u = 0; u < 8u; ++u) { const uint p = p0 + u; s += float((scratch + 0)[i * 64u + p]) * float(v23[j * 64u + p]); }
+                }
             }
             for (uint d = 1u; d > 0; d /= 2) s += simd_shuffle_down(s, d);
             if (o < 64u && lane == 0) scratch[256 + o] = s;
