@@ -5,4 +5,6 @@
 //! decode loop needs a Metal device.
 
 pub mod gguf;
+pub mod json;
 pub mod llama;
+pub mod qwen;
