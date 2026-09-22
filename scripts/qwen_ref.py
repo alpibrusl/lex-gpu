@@ -265,6 +265,43 @@ def log_softmax(v):
     return v - m - np.log(np.exp(v - m).sum())
 
 
+PROMPTS = [
+    "The capital of France is",
+    "def fibonacci(n):",
+    "Once upon a time, in a small village,",
+]
+
+
+def write_golden(a, tk):
+    """The fixture the Rust test reads, in `llama_ref.py`'s line format:
+
+        model <tag>
+        case <prompt ids...>
+        step <next id> <id>:<logprob> ...   (top-k, best first)
+    """
+    out = [f"model {a.model}"]
+    for prompt in PROMPTS:
+        ids = tk.encode(prompt, add_special_tokens=False).ids
+        m = Model(a.model)
+        logits = m.forward(ids)
+        out.append("case " + " ".join(map(str, ids)))
+        print(f"{prompt!r}: {len(ids)} tokens", file=sys.stderr)
+        for i in range(a.steps):
+            lp = log_softmax(logits)
+            top = np.argsort(lp)[::-1][: a.top]
+            nxt = int(top[0])
+            out.append(
+                f"step {nxt} " + " ".join(f"{int(j)}:{lp[j]:.6f}" for j in top)
+            )
+            print(f"  {i:2d} {tk.decode([nxt])!r}", file=sys.stderr)
+            logits = m.forward([nxt])
+    path = pathlib.Path(a.write_golden)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out) + "\n")
+    print(f"wrote {path}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default=MODEL)
@@ -272,10 +309,18 @@ def main():
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--top", type=int, default=5)
     ap.add_argument("--compare", action="store_true", help="check against Ollama's own log-probs")
+    ap.add_argument(
+        "--write-golden",
+        nargs="?",
+        const="crates/tile-rt/tests/data/qwen35_27b_golden.txt",
+        help="write the fixture the Rust tests read (several prompts)",
+    )
     ap.add_argument("--tol", type=float, default=0.15)
     a = ap.parse_args()
 
     tk = tokenizer(a.model)
+    if a.write_golden:
+        return write_golden(a, tk)
     ids = tk.encode(a.prompt, add_special_tokens=False).ids
     print(f"{a.model}: {a.prompt!r} -> {len(ids)} tokens {ids}")
     m = Model(a.model, verbose=True)

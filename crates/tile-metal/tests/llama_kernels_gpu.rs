@@ -409,6 +409,41 @@ fn split_kv_attention_matches_the_interpreter() {
     }
 }
 
+/// Qwen3.5's gated-delta state update, at the model's own shape.
+#[test]
+fn delta_state_matches_the_interpreter() {
+    use tile_front::qwen::DeltaNet;
+    let gpu = Gpu::open().expect("metal device");
+    let c = DeltaNet {
+        v_heads: 48,
+        k_heads: 16,
+        k_dim: 128,
+        v_dim: 128,
+        rows: 8,
+    };
+    let prog = c.build_step().unwrap();
+    let (hv, dk, dv) = (c.v_heads, c.k_dim, c.v_dim);
+    let gates = |seed, lo: f32, hi: f32| -> Vec<f32> {
+        pattern(hv * dv, seed)
+            .iter()
+            .map(|x| lo + (hi - lo) * x.abs().min(1.0))
+            .collect()
+    };
+    let t = vec![
+        Tensor::new(DType::F32, &[hv * dv, dk], &pattern(hv * dv * dk, 30)),
+        Tensor::new(DType::F32, &[hv, dk], &pattern(hv * dk, 31)),
+        Tensor::new(DType::F32, &[hv, dk], &pattern(hv * dk, 32)),
+        Tensor::new(DType::F32, &[hv * dv], &pattern(hv * dv, 33)),
+        Tensor::new(DType::F32, &[hv * dv], &gates(34, 0.5, 1.0)),
+        Tensor::new(DType::F32, &[hv * dv], &gates(35, 0.1, 0.9)),
+        Tensor::zeros(DType::F32, &[hv * dv]),
+    ];
+    // The output, and the state the step leaves behind.
+    for out in [6, 0] {
+        same(&gpu, &prog, t.clone(), &[], out, 128);
+    }
+}
+
 /// NVFP4 (Qwen3.5's MLX weights): E2M1 codes two per byte, an FP8 E4M3
 /// scale per 16, one f32 scale per tensor held per row.
 #[test]
