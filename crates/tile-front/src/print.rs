@@ -111,7 +111,10 @@ fn op(p: &Program, o: &Op) -> String {
         Op::Exp(a) => format!("exp {}", arg(p, *a)),
         Op::Unary(u, a) => format!("{} {}", u.name(), arg(p, *a)),
         Op::SwapPairs(a) => format!("swap_pairs {}", arg(p, *a)),
-        Op::Dequant(q, s, g) => format!("dequant {}, {} group {g}", arg(p, *q), arg(p, *s)),
+        Op::Dequant(q, s, m, g) => {
+            let min = m.map_or(String::new(), |m| format!(", min {}", arg(p, m)));
+            format!("dequant {}, {}{min} group {g}", arg(p, *q), arg(p, *s))
+        }
         Op::Scale(a, s) => format!("scale {}, {s}", arg(p, *a)),
         Op::RowReduce(r, a) => {
             let n = match r {

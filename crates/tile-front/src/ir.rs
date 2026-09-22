@@ -268,9 +268,10 @@ pub enum Op {
     /// Swap adjacent elements: `out[2i] = a[2i+1]`, `out[2i+1] = a[2i]`.
     /// With a sign-folded sine table this is RoPE's rotation of pairs.
     SwapPairs(Arg),
-    /// `q[r,c] * s[r, c / group]` in f32: quantised values meet their
-    /// scales. The only way to compute with an `I8` tile.
-    Dequant(Arg, Arg, usize),
+    /// `q[r,c] * s[r, c / group] - m[r, c / group]` in f32: quantised
+    /// values meet their scales (and, for affine formats such as Q4_K, their
+    /// mins). The only way to compute with an `I8` tile.
+    Dequant(Arg, Arg, Option<Arg>, usize),
     Scale(Arg, f32),
     /// `[m,n] -> [m]`.
     RowReduce(Reduce, Arg),

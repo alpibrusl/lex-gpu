@@ -24,8 +24,7 @@
 
 use std::path::Path;
 
-use half::f16;
-use tile_front::llama::split_q8_0;
+use tile_front::llama::{Split, split_q4_k, split_q6_k, split_q8_0};
 
 use crate::gguf::{GgmlType, Gguf};
 
@@ -46,60 +45,63 @@ pub struct Config {
     pub max_seq: usize,
 }
 
-/// A Q8_0 matrix `[rows, cols]`, split into values and per-32 scales.
-pub struct Q8 {
+/// A quantised matrix `[rows, cols]` (Q8_0, Q4_K or Q6_K in the file),
+/// repacked into values plus per-group scales and mins.
+pub struct QMat {
     pub rows: usize,
     pub cols: usize,
-    pub q: Vec<i8>,
-    pub s: Vec<f16>,
+    pub w: Split,
 }
 
-impl Q8 {
-    fn load(g: &Gguf, name: &str) -> Result<Q8, String> {
+impl QMat {
+    fn load(g: &Gguf, name: &str) -> Result<QMat, String> {
         let (t, b) = g.raw(name)?;
-        if t.ty != GgmlType::Q8_0 || t.dims.len() != 2 {
+        if t.dims.len() != 2 {
             return Err(format!(
-                "`{name}` is {:?} {:?}; only 2-d Q8_0 matrices are supported",
-                t.ty, t.dims
+                "`{name}` is {:?}-d, expected a matrix",
+                t.dims.len()
             ));
         }
-        let (q, s) = split_q8_0(b);
-        Ok(Q8 {
+        let w = match t.ty {
+            GgmlType::Q8_0 => split_q8_0(b),
+            GgmlType::Q4_K => split_q4_k(b),
+            GgmlType::Q6_K => split_q6_k(b),
+            other => {
+                return Err(format!(
+                    "`{name}` is {other:?}; supported: Q8_0, Q4_K, Q6_K"
+                ));
+            }
+        };
+        Ok(QMat {
             rows: t.dims[1],
             cols: t.dims[0],
-            q,
-            s,
+            w,
         })
     }
 
     /// Row `r`, dequantised (the embedding lookup).
     pub fn row(&self, r: usize) -> Vec<f32> {
-        let q = &self.q[r * self.cols..(r + 1) * self.cols];
-        let s = &self.s[r * self.cols / 32..(r + 1) * self.cols / 32];
-        q.iter()
-            .enumerate()
-            .map(|(i, &v)| v as f32 * s[i / 32].to_f32())
-            .collect()
+        self.w.dequant(r * self.cols, (r + 1) * self.cols)
     }
 }
 
 pub struct Layer {
     pub attn_norm: Vec<f32>,
-    pub wq: Q8,
-    pub wk: Q8,
-    pub wv: Q8,
-    pub wo: Q8,
+    pub wq: QMat,
+    pub wk: QMat,
+    pub wv: QMat,
+    pub wo: QMat,
     pub ffn_norm: Vec<f32>,
-    pub gate: Q8,
-    pub up: Q8,
-    pub down: Q8,
+    pub gate: QMat,
+    pub up: QMat,
+    pub down: QMat,
 }
 
 pub struct Weights {
     pub cfg: Config,
-    pub emb: Q8,
+    pub emb: QMat,
     /// `None` when the output projection is tied to the embedding.
-    pub out: Option<Q8>,
+    pub out: Option<QMat>,
     pub out_norm: Vec<f32>,
     pub layers: Vec<Layer>,
 }
@@ -119,7 +121,7 @@ impl Weights {
         let int = |k: &str| g.int(&format!("llama.{k}")).map(|v| v as usize);
         let n_head = int("attention.head_count")?;
         let dim = int("embedding_length")?;
-        let emb = Q8::load(&g, "token_embd.weight")?;
+        let emb = QMat::load(&g, "token_embd.weight")?;
         let cfg = Config {
             n_layer: int("block_count")?,
             dim,
@@ -142,20 +144,20 @@ impl Weights {
             let n = |k: &str| format!("blk.{i}.{k}.weight");
             layers.push(Layer {
                 attn_norm: g.f32s(&n("attn_norm"))?,
-                wq: Q8::load(&g, &n("attn_q"))?,
-                wk: Q8::load(&g, &n("attn_k"))?,
-                wv: Q8::load(&g, &n("attn_v"))?,
-                wo: Q8::load(&g, &n("attn_output"))?,
+                wq: QMat::load(&g, &n("attn_q"))?,
+                wk: QMat::load(&g, &n("attn_k"))?,
+                wv: QMat::load(&g, &n("attn_v"))?,
+                wo: QMat::load(&g, &n("attn_output"))?,
                 ffn_norm: g.f32s(&n("ffn_norm"))?,
-                gate: Q8::load(&g, &n("ffn_gate"))?,
-                up: Q8::load(&g, &n("ffn_up"))?,
-                down: Q8::load(&g, &n("ffn_down"))?,
+                gate: QMat::load(&g, &n("ffn_gate"))?,
+                up: QMat::load(&g, &n("ffn_up"))?,
+                down: QMat::load(&g, &n("ffn_down"))?,
             });
         }
         let out = g
             .tensors
             .contains_key("output.weight")
-            .then(|| Q8::load(&g, "output.weight"))
+            .then(|| QMat::load(&g, "output.weight"))
             .transpose()?;
         Ok(Weights {
             out_norm: g.f32s("output_norm.weight")?,
@@ -181,16 +183,17 @@ pub use gpu::Runner;
 #[cfg(target_os = "macos")]
 mod gpu {
     use std::collections::HashMap;
+    use std::collections::hash_map::Entry;
 
     use half::f16;
     use tile_front::flash::FlashDecode;
-    use tile_front::llama::{matvec_q8, rmsnorm, rope, rope_tables, silu_mul};
+    use tile_front::llama::{QLayout, matvec_q, rmsnorm, rope, rope_tables, silu_mul};
     use tile_front::{Program, check};
     use tile_ir::{DType, Space, Target};
     use tile_metal::{Buffer, Gpu, Pipeline};
     use tile_msl::program::lower;
 
-    use super::{Config, Q8, Weights};
+    use super::{Config, QMat, Weights};
 
     const THREADS: usize = 256;
     const BO: usize = 8;
@@ -205,15 +208,26 @@ mod gpu {
         gpu.build_lowered(&lower(prog, target, threads)?)
     }
 
+    /// Which matvec pipeline a matrix needs: (cols, rows, layout, residual).
+    type MvKey = (usize, usize, QLayout, bool);
+
     struct QBuf {
+        rows: usize,
+        cols: usize,
+        layout: QLayout,
         q: Buffer,
         s: Buffer,
+        m: Option<Buffer>,
     }
 
-    fn upload_q8(gpu: &Gpu, w: &Q8) -> QBuf {
+    fn upload_q(gpu: &Gpu, w: &QMat) -> QBuf {
         QBuf {
-            q: gpu.upload(&w.q),
-            s: gpu.upload(&w.s),
+            rows: w.rows,
+            cols: w.cols,
+            layout: w.w.layout,
+            q: gpu.upload(&w.w.q),
+            s: gpu.upload(&w.w.s),
+            m: w.w.m.as_ref().map(|m| gpu.upload(m)),
         }
     }
 
@@ -233,12 +247,9 @@ mod gpu {
 
     struct Kernels {
         rms: Pipeline,
-        q: Pipeline,
-        kv: Pipeline,
-        o_res: Pipeline,
-        gate_up: Pipeline,
-        down_res: Pipeline,
-        lm: Pipeline,
+        /// One matvec pipeline per (shape, layout, residual) the model uses:
+        /// Q4_K_M files mix Q4_K and Q6_K within a layer.
+        mv: HashMap<MvKey, Pipeline>,
         rope_q: Pipeline,
         rope_k: Pipeline,
         silu: Pipeline,
@@ -284,14 +295,30 @@ mod gpu {
             let gpu = Gpu::open()?;
             let c: &Config = &w.cfg;
             let kvd = c.n_kv * c.head_dim;
+            let key = |m: &QMat, res: bool| (m.cols, m.rows, m.w.layout, res);
+            let mut keys = vec![key(w.out.as_ref().unwrap_or(&w.emb), false)];
+            for l in &w.layers {
+                keys.extend([
+                    key(&l.wq, false),
+                    key(&l.wk, false),
+                    key(&l.wv, false),
+                    key(&l.wo, true),
+                    key(&l.gate, false),
+                    key(&l.up, false),
+                    key(&l.down, true),
+                ]);
+            }
+            let mut mv = HashMap::new();
+            for kk in keys {
+                if let Entry::Vacant(slot) = mv.entry(kk) {
+                    let (n_in, n_out, layout, res) = kk;
+                    let p = matvec_q(n_in, n_out, BO, KC, layout, res)?;
+                    slot.insert(compile(&gpu, &p, THREADS)?);
+                }
+            }
             let k = Kernels {
                 rms: compile(&gpu, &rmsnorm(c.dim, c.eps), THREADS)?,
-                q: compile(&gpu, &matvec_q8(c.dim, c.dim, BO, KC, false)?, THREADS)?,
-                kv: compile(&gpu, &matvec_q8(c.dim, kvd, BO, KC, false)?, THREADS)?,
-                o_res: compile(&gpu, &matvec_q8(c.dim, c.dim, BO, KC, true)?, THREADS)?,
-                gate_up: compile(&gpu, &matvec_q8(c.dim, c.ffn, BO, KC, false)?, THREADS)?,
-                down_res: compile(&gpu, &matvec_q8(c.ffn, c.dim, BO, KC, true)?, THREADS)?,
-                lm: compile(&gpu, &matvec_q8(c.dim, c.vocab, BO, KC, false)?, THREADS)?,
+                mv,
                 rope_q: compile(&gpu, &rope(c.n_head, c.head_dim, DType::F16), THREADS)?,
                 rope_k: compile(&gpu, &rope(c.n_kv, c.head_dim, DType::F16), THREADS)?,
                 silu: compile(&gpu, &silu_mul(c.ffn, THREADS)?, THREADS)?,
@@ -301,14 +328,14 @@ mod gpu {
                 .iter()
                 .map(|l| LayerBufs {
                     attn_norm: gpu.upload(&l.attn_norm),
-                    wq: upload_q8(&gpu, &l.wq),
-                    wk: upload_q8(&gpu, &l.wk),
-                    wv: upload_q8(&gpu, &l.wv),
-                    wo: upload_q8(&gpu, &l.wo),
+                    wq: upload_q(&gpu, &l.wq),
+                    wk: upload_q(&gpu, &l.wk),
+                    wv: upload_q(&gpu, &l.wv),
+                    wo: upload_q(&gpu, &l.wo),
                     ffn_norm: gpu.upload(&l.ffn_norm),
-                    gate: upload_q8(&gpu, &l.gate),
-                    up: upload_q8(&gpu, &l.up),
-                    down: upload_q8(&gpu, &l.down),
+                    gate: upload_q(&gpu, &l.gate),
+                    up: upload_q(&gpu, &l.up),
+                    down: upload_q(&gpu, &l.down),
                     kcache: gpu.zeroed::<f16>(c.n_kv * c.max_seq * c.head_dim),
                     vcache: gpu.zeroed::<f16>(c.n_kv * c.max_seq * c.head_dim),
                 })
@@ -332,8 +359,8 @@ mod gpu {
                 logits: f(c.vocab),
             };
             Ok(Runner {
-                emb: upload_q8(&gpu, &w.emb),
-                out: w.out.as_ref().map(|o| upload_q8(&gpu, o)),
+                emb: upload_q(&gpu, &w.emb),
+                out: w.out.as_ref().map(|o| upload_q(&gpu, o)),
                 out_norm: gpu.upload(&w.out_norm),
                 gpu,
                 w,
@@ -414,6 +441,21 @@ mod gpu {
             Ok(logits)
         }
 
+        /// `y = W x (+ r)` with the pipeline for `W`'s shape and layout.
+        fn mv(&self, w: &QBuf, x: &Buffer, r: Option<&Buffer>, y: &Buffer) {
+            let p = &self.k.mv[&(w.cols, w.rows, w.layout, r.is_some())];
+            let mut bufs = vec![x, &w.q, &w.s];
+            bufs.extend(w.m.as_ref());
+            bufs.extend(r);
+            bufs.push(y);
+            self.gpu.run(p, &bufs);
+        }
+
+        /// Matvec pipelines compiled for this model.
+        pub fn matvec_variants(&self) -> usize {
+            self.k.mv.len()
+        }
+
         /// One step through every layer and the output head. Returns the
         /// number of dispatches.
         fn layers_and_head(&self, pos: usize, c: &Config) -> usize {
@@ -423,9 +465,9 @@ mod gpu {
             let attn = &self.attention[&(pos + 1)];
             for l in &self.layers {
                 gpu.run(&k.rms, &[&a.x, &l.attn_norm, &a.h]);
-                gpu.run(&k.q, &[&a.h, &l.wq.q, &l.wq.s, &a.q32]);
-                gpu.run(&k.kv, &[&a.h, &l.wk.q, &l.wk.s, &a.k32]);
-                gpu.run(&k.kv, &[&a.h, &l.wv.q, &l.wv.s, &a.v32]);
+                self.mv(&l.wq, &a.h, None, &a.q32);
+                self.mv(&l.wk, &a.h, None, &a.k32);
+                self.mv(&l.wv, &a.h, None, &a.v32);
                 gpu.run(&k.rope_q, &[&a.q32, &a.cos, &a.sin, &a.q16]);
                 gpu.run(&k.rope_k, &[&a.k32, &a.cos, &a.sin, &a.k16]);
 
@@ -442,16 +484,16 @@ mod gpu {
                 }
 
                 gpu.run(attn, &[&a.q16, &l.kcache, &l.vcache, &a.o]);
-                gpu.run(&k.o_res, &[&a.o, &l.wo.q, &l.wo.s, &a.x, &a.x2]);
+                self.mv(&l.wo, &a.o, Some(&a.x), &a.x2);
                 gpu.run(&k.rms, &[&a.x2, &l.ffn_norm, &a.h]);
-                gpu.run(&k.gate_up, &[&a.h, &l.gate.q, &l.gate.s, &a.g]);
-                gpu.run(&k.gate_up, &[&a.h, &l.up.q, &l.up.s, &a.u]);
+                self.mv(&l.gate, &a.h, None, &a.g);
+                self.mv(&l.up, &a.h, None, &a.u);
                 gpu.run(&k.silu, &[&a.g, &a.u, &a.a]);
-                gpu.run(&k.down_res, &[&a.a, &l.down.q, &l.down.s, &a.x2, &a.x]);
+                self.mv(&l.down, &a.a, Some(&a.x2), &a.x);
             }
             gpu.run(&k.rms, &[&a.x, &self.out_norm, &a.h]);
             let out = self.out.as_ref().unwrap_or(&self.emb);
-            gpu.run(&k.lm, &[&a.h, &out.q, &out.s, &a.logits]);
+            self.mv(out, &a.h, None, &a.logits);
             self.layers.len() * 13 + 2
         }
     }

@@ -13,9 +13,15 @@ compare:
 - for every token in Ollama's top-k at every step, tile's log-probability
   must agree within `--tol`.
 
-Ollama runs llama.cpp, which quantises activations to 8 bits inside its
-Q8_0 matmuls; tile does not. That, not a bug, is why the numbers differ in
-the third decimal.
+The tolerance is not zero because Ollama runs llama.cpp, whose quantised
+Metal kernels round differently from an f32 computation. Measured worst
+differences: 0.008 on llama3.2:1b (Q8_0) and 0.09 on llama3.1:8b (Q4_K_M,
+32 layers). Against an f32 PyTorch reference, tile is within 0.007 on both:
+the gap is llama.cpp's rounding, not tile's. A real bug is far larger. A
+missing BOS token, for example, shifted log-probabilities by 1.9 while every
+token still matched.
+
+    python3 scripts/tile_vs_ollama.py --model llama3.1:8b    # P2's exit model
 """
 
 import argparse
@@ -54,7 +60,7 @@ def main():
     ap.add_argument("--prompt", action="append")
     ap.add_argument("--steps", type=int, default=24)
     ap.add_argument("--top", type=int, default=5)
-    ap.add_argument("--tol", type=float, default=0.05)
+    ap.add_argument("--tol", type=float, default=0.1)
     a = ap.parse_args()
     prompts = a.prompt or [
         "The capital of France is",

@@ -701,8 +701,10 @@ impl Checker<'_> {
                 }
                 Some(reg(t.dtype, &t.shape))
             }
-            Op::Dequant(q, s, group) => {
-                let tys = self.args(&[*q, *s])?;
+            Op::Dequant(q, s, m, group) => {
+                let mut ops = vec![*q, *s];
+                ops.extend(*m);
+                let tys = self.args(&ops)?;
                 let tq = self.tile(tys[0].clone(), "dequant values")?;
                 let ts = self.tile(tys[1].clone(), "dequant scales")?;
                 if tq.dtype != DType::I8 {
@@ -714,6 +716,22 @@ impl Checker<'_> {
                 }
                 if !self.numeric(&ts, "dequant scales") {
                     return None;
+                }
+                if let Some(tm) = tys.get(2) {
+                    let tm = self.tile(tm.clone(), "dequant mins")?;
+                    if !self.numeric(&tm, "dequant mins") {
+                        return None;
+                    }
+                    if tm.shape != ts.shape || tm.dtype != ts.dtype {
+                        self.err(
+                            Kind::Shape,
+                            format!(
+                                "dequant mins {:?}{:?} do not match scales {:?}{:?}",
+                                tm.dtype, tm.shape, ts.dtype, ts.shape
+                            ),
+                        );
+                        return None;
+                    }
                 }
                 let ok = tq.shape.len() == 2
                     && *group > 0

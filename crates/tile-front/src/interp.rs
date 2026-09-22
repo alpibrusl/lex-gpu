@@ -483,14 +483,18 @@ impl Interp<'_> {
                 let out = (0..t.data.len()).map(|i| t.data[i ^ 1]).collect();
                 Some(Val::Tile(self.fresh(t.ty.dtype, &t.ty.shape, out)))
             }
-            Op::Dequant(q, s, group) => {
+            Op::Dequant(q, s, m, group) => {
                 let (tq, ts) = (self.arg(*q)?, self.arg(*s)?);
+                let tm = m.map(|m| self.arg(m)).transpose()?;
                 let c = tq.ty.shape[1];
                 let out = tq
                     .data
                     .iter()
                     .enumerate()
-                    .map(|(i, &x)| x * ts.data[(i / c) * (c / group) + (i % c) / group])
+                    .map(|(i, &x)| {
+                        let g = (i / c) * (c / group) + (i % c) / group;
+                        x * ts.data[g] - tm.as_ref().map_or(0.0, |m| m.data[g])
+                    })
                     .collect();
                 Some(Val::Tile(self.fresh(DType::F32, &tq.ty.shape, out)))
             }
