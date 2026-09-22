@@ -8,3 +8,4 @@ pub mod gguf;
 pub mod json;
 pub mod llama;
 pub mod qwen;
+pub mod qwen_run;
