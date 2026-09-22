@@ -178,11 +178,35 @@ fn run_device(args: &Args, target: &Target) -> ExitCode {
         pass(correct.ok()),
     );
 
+    // A virtualised GPU reaches a small fraction of the bandwidth of the
+    // silicon it runs on, and it throttles both kernels equally -- so the ratio
+    // passes while meaning nothing. Say so, or a green CI run on a hosted macOS
+    // runner reads as P0 being finished.
+    if !is_real_gpu(&info.name) {
+        println!();
+        println!(
+            "NOTE: `{}` is a virtualised GPU. The correctness result above is real;",
+            info.name
+        );
+        println!(
+            "      the {:.1} GB/s ceiling is not, and neither is the ratio measured against it.",
+            perf[0].gb_per_s()
+        );
+        println!("      P0's exit test needs a physical M-series device.");
+    }
+
     if fast_enough && correct.ok() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Whether the Metal device is physical silicon rather than a VM's
+/// paravirtualised adapter (what hosted CI runners expose).
+#[cfg(target_os = "macos")]
+fn is_real_gpu(device_name: &str) -> bool {
+    !device_name.contains("Paravirtual") && !device_name.contains("Virtual")
 }
 
 #[cfg(target_os = "macos")]
