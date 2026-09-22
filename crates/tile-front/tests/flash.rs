@@ -18,10 +18,9 @@ const GOLDEN: &[u8] = include_bytes!("data/flash_decode_f16_q32_d128_s512.f32");
 const TOL: f32 = 1e-4;
 
 fn golden() -> Vec<f32> {
-    GOLDEN
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
+    let (words, rest) = GOLDEN.as_chunks::<4>();
+    assert!(rest.is_empty());
+    words.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 fn input(rows: usize, seed: u32) -> Tensor {
