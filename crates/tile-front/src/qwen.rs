@@ -491,6 +491,112 @@ pub fn build_delta_qk(
     Ok(b.finish())
 }
 
+/// `y = W x` for a small dense matrix: Qwen3.5's `in_proj_a` and
+/// `in_proj_b` are 48 rows of bf16, too small to be worth quantising and
+/// the only unquantised matrices in a layer.
+pub fn build_matvec_dense(
+    n_in: usize,
+    n_out: usize,
+    bo: usize,
+    w: DType,
+) -> Result<Program, String> {
+    use Arg::Move;
+    if bo == 0 || !n_out.is_multiple_of(bo) {
+        return Err(format!("{n_out} rows do not split into {bo}"));
+    }
+    let mut b = Builder::new(&format!("matvec_dense_{n_out}x{n_in}_{}", w.suffix()));
+    let px = b.param("x", DType::F32, &[1, n_in], false);
+    let pw = b.param("w", w, &[n_out, n_in], false);
+    let py = b.param("y", DType::F32, &[1, n_out], true);
+    let row = b.grid(n_out / bo);
+    let x = b.op(
+        "x",
+        Op::Load(
+            View {
+                param: px,
+                offset: vec![IdxExpr::lit(0), IdxExpr::lit(0)],
+                shape: vec![1, n_in],
+            },
+            TileTy::new(DType::F32, &[1, n_in], Space::Reg),
+        ),
+    );
+    let wt = b.op(
+        "w",
+        Op::Load(
+            View {
+                param: pw,
+                offset: vec![IdxExpr::scaled(row, bo, 0), IdxExpr::lit(0)],
+                shape: vec![bo, n_in],
+            },
+            TileTy::new(w, &[bo, n_in], Space::Reg),
+        ),
+    );
+    let y = b.op("y", Op::MatMulNT(Move(x), Move(wt), DType::F32));
+    b.effect(Op::Store(
+        Move(y),
+        View {
+            param: py,
+            offset: vec![IdxExpr::lit(0), IdxExpr::scaled(row, bo, 0)],
+            shape: vec![1, bo],
+        },
+    ));
+    Ok(b.finish())
+}
+
+/// The gated norm that ends a linear-attention layer: normalise each value
+/// head's output with a weight, then multiply by `silu(z)`.
+///
+/// This norm is *not* one of the ones Qwen3.5 stores as a delta from 1:
+/// its weight is used as it comes.
+///
+/// Parameters: `y [v_heads, v_dim]`, the norm weight `[1, v_dim]`,
+/// `z [v_heads, v_dim]`, and the output `[v_heads, v_dim]`.
+pub fn build_gated_norm(v_heads: usize, v_dim: usize, eps: f32) -> Program {
+    use Arg::{Borrow, Move};
+    let mut b = Builder::new(&format!("delta_gated_norm_h{v_heads}x{v_dim}"));
+    let py = b.param("y", DType::F32, &[v_heads, v_dim], false);
+    let pw = b.param("w", DType::F32, &[1, v_dim], false);
+    let pz = b.param("z", DType::F32, &[v_heads, v_dim], false);
+    let po = b.param("o", DType::F32, &[v_heads, v_dim], true);
+    let head = b.grid(v_heads);
+    let tile = TileTy::new(DType::F32, &[1, v_dim], Space::Reg);
+    let rows = |param| View {
+        param,
+        offset: vec![IdxExpr::scaled(head, 1, 0), IdxExpr::lit(0)],
+        shape: vec![1, v_dim],
+    };
+    let y = b.op("y", Op::Load(rows(py), tile.clone()));
+    let sq = b.op("sq", Op::Binary(BinOp::Mul, Borrow(y), Borrow(y)));
+    let ss = b.op("ss", Op::RowReduce(Reduce::Sum, Move(sq)));
+    let ms = b.op("ms", Op::Scale(Move(ss), 1.0 / v_dim as f32));
+    let e = b.op(
+        "eps",
+        Op::Fill(TileTy::new(DType::F32, &[1], Space::Reg), eps),
+    );
+    let t = b.op("t", Op::Binary(BinOp::Add, Move(ms), Move(e)));
+    let r = b.op("r", Op::Unary(UnOp::Rsqrt, Move(t)));
+    let y = b.op("y", Op::Binary(BinOp::Mul, Move(y), Move(r)));
+    // The norm weight is one row, shared by every head.
+    let w = b.op(
+        "w",
+        Op::Load(
+            View {
+                param: pw,
+                offset: vec![IdxExpr::lit(0), IdxExpr::lit(0)],
+                shape: vec![1, v_dim],
+            },
+            tile.clone(),
+        ),
+    );
+    let y = b.op("y", Op::Binary(BinOp::Mul, Move(y), Move(w)));
+    let z = b.op("z", Op::Load(rows(pz), tile));
+    let sz = b.op("sz", Op::Unary(UnOp::Sigmoid, Borrow(z)));
+    let sz = b.op("sz", Op::Binary(BinOp::Mul, Move(z), Move(sz)));
+    let o = b.op("o", Op::Binary(BinOp::Mul, Move(y), Move(sz)));
+    b.effect(Op::Store(Move(o), rows(po)));
+    b.finish()
+}
+
 /// Elementwise `y = a * b` over `n` values, `chunk` per instance: the
 /// attention output meeting its gate before the output projection.
 pub fn build_mul(n: usize, chunk: usize) -> Result<Program, String> {

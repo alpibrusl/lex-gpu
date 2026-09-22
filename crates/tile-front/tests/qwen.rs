@@ -1,7 +1,8 @@
 //! Qwen3.5's gated-delta state update, against the rule it implements.
 
 use tile_front::qwen::{
-    DeltaNet, build_conv_silu, build_delta_qk, build_gates, build_qk_rope, reference,
+    DeltaNet, build_conv_silu, build_delta_qk, build_gated_norm, build_gates, build_matvec_dense,
+    build_qk_rope, reference,
 };
 use tile_front::{Tensor, check, run};
 use tile_ir::reference::fill_pattern_f32;
@@ -296,5 +297,59 @@ fn delta_qk_normalises_scales_and_repeats_per_value_head() {
                 );
             }
         }
+    }
+}
+
+/// The gated norm that ends a linear-attention layer, and the small dense
+/// matvec its gates come from.
+#[test]
+fn gated_norm_and_dense_matvec_match_their_formulas() {
+    let (hv, dv, eps) = (3usize, 8usize, 1e-6f32);
+    let prog = build_gated_norm(hv, dv, eps);
+    check(&prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+    let y = pattern(hv * dv, 90);
+    let w = pattern(dv, 91);
+    let z = pattern(hv * dv, 92);
+    let mut t = vec![
+        Tensor::new(DType::F32, &[hv, dv], &y),
+        Tensor::new(DType::F32, &[1, dv], &w),
+        Tensor::new(DType::F32, &[hv, dv], &z),
+        Tensor::zeros(DType::F32, &[hv, dv]),
+    ];
+    run(&prog, &mut t).expect("interpret");
+    for h in 0..hv {
+        let row = &y[h * dv..(h + 1) * dv];
+        let ms = row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / dv as f64;
+        let r = 1.0 / (ms + eps as f64).sqrt();
+        for i in 0..dv {
+            let zi = z[h * dv + i] as f64;
+            let want = row[i] as f64 * r * w[i] as f64 * (zi / (1.0 + (-zi).exp()));
+            let got = t[3].data[h * dv + i] as f64;
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1e-3),
+                "head {h} dim {i}: {got} vs {want}"
+            );
+        }
+    }
+
+    let (n_in, n_out) = (32usize, 6usize);
+    let prog = build_matvec_dense(n_in, n_out, 2, DType::F32).unwrap();
+    let x = pattern(n_in, 93);
+    let wd = pattern(n_in * n_out, 94);
+    let mut t = vec![
+        Tensor::new(DType::F32, &[1, n_in], &x),
+        Tensor::new(DType::F32, &[n_out, n_in], &wd),
+        Tensor::zeros(DType::F32, &[1, n_out]),
+    ];
+    run(&prog, &mut t).expect("interpret");
+    for r in 0..n_out {
+        let want: f64 = (0..n_in)
+            .map(|i| x[i] as f64 * wd[r * n_in + i] as f64)
+            .sum();
+        let got = t[2].data[r] as f64;
+        assert!(
+            (got - want).abs() <= 1e-5 * want.abs().max(1e-3),
+            "row {r}: {got} vs {want}"
+        );
     }
 }
