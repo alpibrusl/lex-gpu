@@ -151,7 +151,38 @@ pub fn run(prog: &Program, globals: &mut [Tensor]) -> Result<()> {
     run_with(prog, globals, RunOptions::default())
 }
 
+/// Run a program that reads runtime scalars, one value per
+/// `Program::dyn_scalars` entry, in order.
+pub fn run_dyn(prog: &Program, globals: &mut [Tensor], scalars: &[u32]) -> Result<()> {
+    run_full(prog, globals, scalars, RunOptions::default())
+}
+
 pub fn run_with(prog: &Program, globals: &mut [Tensor], opts: RunOptions) -> Result<()> {
+    run_full(prog, globals, &[], opts)
+}
+
+fn run_full(
+    prog: &Program,
+    globals: &mut [Tensor],
+    scalars: &[u32],
+    opts: RunOptions,
+) -> Result<()> {
+    if scalars.len() != prog.dyn_scalars.len() {
+        return Err(format!(
+            "{} reads {} runtime scalars, got {}",
+            prog.name,
+            prog.dyn_scalars.len(),
+            scalars.len()
+        ));
+    }
+    for (&(v, max), &x) in prog.dyn_scalars.iter().zip(scalars) {
+        if x as usize > max {
+            return Err(format!(
+                "scalar `{}` = {x} exceeds its bound {max}",
+                prog.name_of(v)
+            ));
+        }
+    }
     if globals.len() != prog.params.len() {
         return Err(format!(
             "{} expects {} tensors, got {}",
@@ -181,6 +212,9 @@ pub fn run_with(prog: &Program, globals: &mut [Tensor], opts: RunOptions) -> Res
     };
     // Instances are independent by construction (disjoint writes are the
     // program's contract), so running them one after another is faithful.
+    for (&(v, _), &x) in prog.dyn_scalars.iter().zip(scalars) {
+        it.env.insert(v, Val::Index(x as i64));
+    }
     for g in 0..prog.grid {
         if let Some(pid) = prog.pid {
             it.env.insert(pid, Val::Index(g as i64));
@@ -498,6 +532,23 @@ impl Interp<'_> {
                     .collect();
                 Some(Val::Tile(self.fresh(DType::F32, &tq.ty.shape, out)))
             }
+            Op::Dequant4(q, s, m, group, high) => {
+                let (tq, ts) = (self.arg(*q)?, self.arg(*s)?);
+                let tm = m.map(|m| self.arg(m)).transpose()?;
+                let c = tq.ty.shape[1];
+                let out = tq
+                    .data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| {
+                        let byte = (x as i32) & 0xFF;
+                        let nib = if *high { byte >> 4 } else { byte & 0xF };
+                        let g = (i / c) * (c / group) + (i % c) / group;
+                        nib as f32 * ts.data[g] - tm.as_ref().map_or(0.0, |m| m.data[g])
+                    })
+                    .collect();
+                Some(Val::Tile(self.fresh(DType::F32, &tq.ty.shape, out)))
+            }
             Op::Scale(a, s) => {
                 let t = self.arg(*a)?;
                 let out = t.data.iter().map(|x| x * s).collect();
@@ -516,6 +567,24 @@ impl Interp<'_> {
                     })
                     .collect();
                 Some(Val::Tile(self.fresh(t.ty.dtype, &[m], out)))
+            }
+            Op::MaskCols(a, first, limit) => {
+                let t = self.arg(*a)?;
+                let (f, lim) = (self.eval(first)?, self.index(*limit)?);
+                let n = t.ty.shape[1];
+                let out = t
+                    .data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| {
+                        if f + (i % n) as i64 >= lim {
+                            f32::NEG_INFINITY
+                        } else {
+                            x
+                        }
+                    })
+                    .collect();
+                Some(Val::Tile(self.fresh(t.ty.dtype, &t.ty.shape, out)))
             }
             Op::Convert(a, dt) => {
                 let t = self.arg(*a)?;
@@ -638,6 +707,7 @@ impl Interp<'_> {
                 index,
                 start,
                 end,
+                end_dyn,
                 init,
                 params,
                 body,
@@ -645,7 +715,11 @@ impl Interp<'_> {
             } => {
                 let mut carry: Vec<Val> =
                     init.iter().map(|&v| self.take(v)).collect::<Result<_>>()?;
-                for i in *start..*end {
+                let stop = match end_dyn {
+                    Some(d) => (self.index(*d)? as usize).min(*end),
+                    None => *end,
+                };
+                for i in *start..stop {
                     self.env.insert(*index, Val::Index(i as i64));
                     for (&p, v) in params.iter().zip(carry) {
                         self.env.insert(p, v);

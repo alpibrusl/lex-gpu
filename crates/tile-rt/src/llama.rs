@@ -64,7 +64,7 @@ impl QMat {
         }
         let w = match t.ty {
             GgmlType::Q8_0 => split_q8_0(b),
-            GgmlType::Q4_K => split_q4_k(b),
+            GgmlType::Q4_K => split_q4_k(b, t.dims[0], t.dims[0]),
             GgmlType::Q6_K => split_q6_k(b),
             other => {
                 return Err(format!(
@@ -169,6 +169,31 @@ impl Weights {
     }
 }
 
+impl QMat {
+    /// Bytes the kernels read for this matrix: values, scales, mins.
+    pub fn device_bytes(&self) -> usize {
+        self.w.q.len() + 4 * self.w.s.len() + self.w.m.as_ref().map_or(0, |m| 4 * m.len())
+    }
+}
+
+impl Weights {
+    /// Weight bytes one decode step reads (every matrix once; the embedding
+    /// table only for the output head when it is tied).
+    pub fn bytes_per_token(&self) -> usize {
+        let mats: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                [&l.wq, &l.wk, &l.wv, &l.wo, &l.gate, &l.up, &l.down]
+                    .iter()
+                    .map(|m| m.device_bytes())
+                    .sum::<usize>()
+            })
+            .sum();
+        mats + self.out.as_ref().unwrap_or(&self.emb).device_bytes()
+    }
+}
+
 /// Log-softmax in f64, for comparing against reference log-probabilities.
 pub fn log_softmax(logits: &[f32]) -> Vec<f64> {
     let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
@@ -182,12 +207,14 @@ pub use gpu::Runner;
 
 #[cfg(target_os = "macos")]
 mod gpu {
-    use std::collections::HashMap;
+    use std::cell::RefCell;
     use std::collections::hash_map::Entry;
+    use std::collections::{BTreeMap, HashMap};
+    use std::time::Instant;
 
     use half::f16;
     use tile_front::flash::FlashDecode;
-    use tile_front::llama::{QLayout, matvec_q, rmsnorm, rope, rope_tables, silu_mul};
+    use tile_front::llama::{QLayout, kv_append, matvec_q, rmsnorm, rope, rope_tables, silu_mul};
     use tile_front::{Program, check};
     use tile_ir::{DType, Space, Target};
     use tile_metal::{Buffer, Gpu, Pipeline};
@@ -196,8 +223,13 @@ mod gpu {
     use super::{Config, QMat, Weights};
 
     const THREADS: usize = 256;
+    /// KV positions per attention block; the cache capacity is rounded up to
+    /// a whole number of them.
+    const ATTN_BK: usize = 16;
+
+    /// One dispatch of a step: a profiling label, the pipeline, its buffers.
+    type Dispatch<'a> = (&'static str, &'a Pipeline, Vec<&'a Buffer>);
     const BO: usize = 8;
-    const KC: usize = 256;
 
     fn compile(gpu: &Gpu, prog: &Program, threads: usize) -> Result<Pipeline, String> {
         let target: &Target = gpu.target();
@@ -253,6 +285,10 @@ mod gpu {
         rope_q: Pipeline,
         rope_k: Pipeline,
         silu: Pipeline,
+        /// Flash decode over a runtime length: one pipeline for every step.
+        attn: Pipeline,
+        kv_k: Pipeline,
+        kv_v: Pipeline,
     }
 
     /// Activation buffers, reused every step.
@@ -284,10 +320,19 @@ mod gpu {
         out: Option<QBuf>,
         out_norm: Buffer,
         acts: Acts,
-        attention: HashMap<usize, Pipeline>,
+        /// KV cache capacity, in positions (a whole number of blocks).
+        cap: usize,
+        scalars_pos: Buffer,
+        scalars_attn: Buffer,
         pos: usize,
+        /// Dispatch one kernel at a time and time each call site, instead of
+        /// one command buffer per token. For profiling; much slower.
+        pub sync: bool,
         /// Dispatches issued so far.
         pub dispatches: usize,
+        /// Wall time per call site: (calls, seconds). Every dispatch waits
+        /// for completion, so this is GPU time plus submit/wait overhead.
+        prof: RefCell<BTreeMap<&'static str, (usize, f64)>>,
     }
 
     impl<'w> Runner<'w> {
@@ -312,11 +357,31 @@ mod gpu {
             for kk in keys {
                 if let Entry::Vacant(slot) = mv.entry(kk) {
                     let (n_in, n_out, layout, res) = kk;
-                    let p = matvec_q(n_in, n_out, BO, KC, layout, res)?;
+                    // One chunk per row: lazy operands need no registers,
+                    // so each output reduces across its whole row once.
+                    let p = matvec_q(n_in, n_out, BO, n_in, layout, res)?;
                     slot.insert(compile(&gpu, &p, THREADS)?);
                 }
             }
+            let cap = c.max_seq.next_multiple_of(ATTN_BK);
+            let group = c.n_head / c.n_kv;
+            let attn = FlashDecode {
+                q_rows: group,
+                d: c.head_dim,
+                seq: cap,
+                bq: group,
+                bk: ATTN_BK,
+                stages: 1,
+                dtype: DType::F16,
+                kv_space: Space::Threadgroup,
+                consumers: 0,
+                heads: c.n_kv,
+                kv_cap: cap,
+            };
             let k = Kernels {
+                attn: compile(&gpu, &attn.build_dynamic()?, 128)?,
+                kv_k: compile(&gpu, &kv_append(c.n_kv, c.head_dim, cap, DType::F16), 64)?,
+                kv_v: compile(&gpu, &kv_append(c.n_kv, c.head_dim, cap, DType::F32), 64)?,
                 rms: compile(&gpu, &rmsnorm(c.dim, c.eps), THREADS)?,
                 mv,
                 rope_q: compile(&gpu, &rope(c.n_head, c.head_dim, DType::F16), THREADS)?,
@@ -336,8 +401,8 @@ mod gpu {
                     gate: upload_q(&gpu, &l.gate),
                     up: upload_q(&gpu, &l.up),
                     down: upload_q(&gpu, &l.down),
-                    kcache: gpu.zeroed::<f16>(c.n_kv * c.max_seq * c.head_dim),
-                    vcache: gpu.zeroed::<f16>(c.n_kv * c.max_seq * c.head_dim),
+                    kcache: gpu.zeroed::<f16>(c.n_kv * cap * c.head_dim),
+                    vcache: gpu.zeroed::<f16>(c.n_kv * cap * c.head_dim),
                 })
                 .collect();
             let f = |n: usize| gpu.zeroed::<f32>(n);
@@ -358,6 +423,8 @@ mod gpu {
                 sin: f(c.head_dim),
                 logits: f(c.vocab),
             };
+            let gpu_scalars_pos = gpu.zeroed::<u32>(1);
+            let gpu_scalars_attn = gpu.zeroed::<u32>(2);
             Ok(Runner {
                 emb: upload_q(&gpu, &w.emb),
                 out: w.out.as_ref().map(|o| upload_q(&gpu, o)),
@@ -367,9 +434,13 @@ mod gpu {
                 k,
                 layers,
                 acts,
-                attention: HashMap::new(),
+                cap,
+                scalars_pos: gpu_scalars_pos,
+                scalars_attn: gpu_scalars_attn,
                 pos: 0,
+                sync: std::env::var_os("TILE_SYNC").is_some(),
                 dispatches: 0,
+                prof: RefCell::new(BTreeMap::new()),
             })
         }
 
@@ -386,69 +457,73 @@ mod gpu {
             self.pos = 0;
         }
 
-        /// Attention over positions `0..len`, compiled once per length. The
-        /// program is flash decode with the cache's capacity as its per-head
-        /// stride; `bk` is the largest block size that divides `len`.
-        fn attention(&mut self, len: usize) -> Result<(), String> {
-            if self.attention.contains_key(&len) {
-                return Ok(());
-            }
-            let c = &self.w.cfg;
-            let bk = [16, 8, 4, 2, 1]
-                .into_iter()
-                .find(|b| len.is_multiple_of(*b))
-                .unwrap();
-            let group = c.n_head / c.n_kv;
-            let cfg = FlashDecode {
-                q_rows: group,
-                d: c.head_dim,
-                seq: len,
-                bq: group,
-                bk,
-                stages: 1,
-                dtype: DType::F16,
-                kv_space: Space::Threadgroup,
-                consumers: 0,
-                heads: c.n_kv,
-                kv_cap: c.max_seq,
-            };
-            let p = compile(&self.gpu, &cfg.build()?, 128)?;
-            self.attention.insert(len, p);
-            Ok(())
-        }
-
         /// Feed one token at the next position; returns the logits.
         pub fn step(&mut self, token: u32) -> Result<Vec<f32>, String> {
             let c = self.w.cfg.clone();
-            if self.pos >= c.max_seq {
-                return Err(format!("KV cache is full ({} positions)", c.max_seq));
+            if self.pos >= self.cap {
+                return Err(format!("KV cache is full ({} positions)", self.cap));
             }
             let pos = self.pos;
-            let hd = c.head_dim;
-            self.attention(pos + 1)?;
 
-            // Host glue: the embedding row, and this position's RoPE tables.
+            // Everything the CPU contributes happens here, before the token's
+            // command buffer: the embedding row, this position's RoPE tables,
+            // and the runtime scalars (position, live length, block count).
             let x = self.w.emb.row(token as usize);
             self.gpu.write(&self.acts.x, 0, &x);
-            let (cos, sin) = rope_tables(pos, hd, c.rope_base, c.rope_factors.as_deref());
+            let (cos, sin) = rope_tables(pos, c.head_dim, c.rope_base, c.rope_factors.as_deref());
             self.gpu.write(&self.acts.cos, 0, &cos);
             self.gpu.write(&self.acts.sin, 0, &sin);
+            let len = pos + 1;
+            self.gpu.write(&self.scalars_pos, 0, &[pos as u32]);
+            self.gpu.write(
+                &self.scalars_attn,
+                0,
+                &[len as u32, len.div_ceil(ATTN_BK) as u32],
+            );
 
-            self.dispatches += self.layers_and_head(pos, &c);
+            let plan = self.plan();
+            let n = plan.len();
+            if self.sync {
+                for (label, p, bufs) in &plan {
+                    self.timed(label, || self.gpu.run(p, bufs));
+                }
+            } else {
+                let steps: Vec<(&Pipeline, &[&Buffer])> =
+                    plan.iter().map(|(_, p, b)| (*p, b.as_slice())).collect();
+                self.timed("token (one command buffer)", || self.gpu.run_all(&steps));
+            }
+            drop(plan);
+            self.dispatches += n;
             self.pos += 1;
             let mut logits = vec![0.0f32; c.vocab];
             self.gpu.download(&self.acts.logits, &mut logits);
             Ok(logits)
         }
 
-        /// `y = W x (+ r)` with the pipeline for `W`'s shape and layout.
-        fn mv(&self, w: &QBuf, x: &Buffer, r: Option<&Buffer>, y: &Buffer) {
-            let p = &self.k.mv[&(w.cols, w.rows, w.layout, r.is_some())];
-            let mut bufs = vec![x, &w.q, &w.s];
-            bufs.extend(w.m.as_ref());
-            bufs.extend(r);
-            bufs.push(y);
-            self.gpu.run(p, &bufs);
+        fn timed<T>(&self, label: &'static str, f: impl FnOnce() -> T) -> T {
+            let t = Instant::now();
+            let out = f();
+            let mut p = self.prof.borrow_mut();
+            let e = p.entry(label).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += t.elapsed().as_secs_f64();
+            out
+        }
+
+        /// Per-call-site timings so far, slowest first: (label, calls, seconds).
+        pub fn profile(&self) -> Vec<(&'static str, usize, f64)> {
+            let mut v: Vec<_> = self
+                .prof
+                .borrow()
+                .iter()
+                .map(|(k, (n, t))| (*k, *n, *t))
+                .collect();
+            v.sort_by(|a, b| b.2.total_cmp(&a.2));
+            v
+        }
+
+        pub fn clear_profile(&self) {
+            self.prof.borrow_mut().clear();
         }
 
         /// Matvec pipelines compiled for this model.
@@ -456,45 +531,60 @@ mod gpu {
             self.k.mv.len()
         }
 
-        /// One step through every layer and the output head. Returns the
-        /// number of dispatches.
-        fn layers_and_head(&self, pos: usize, c: &Config) -> usize {
-            let hd = c.head_dim;
-            let kvd = c.n_kv * hd;
-            let (gpu, a, k) = (&self.gpu, &self.acts, &self.k);
-            let attn = &self.attention[&(pos + 1)];
+        /// `y = W x (+ r)` with the pipeline for `W`'s shape and layout.
+        fn mv<'a>(
+            &'a self,
+            label: &'static str,
+            w: &'a QBuf,
+            x: &'a Buffer,
+            r: Option<&'a Buffer>,
+            y: &'a Buffer,
+        ) -> Dispatch<'a> {
+            let p = &self.k.mv[&(w.cols, w.rows, w.layout, r.is_some())];
+            let mut bufs = vec![x, &w.q, &w.s];
+            bufs.extend(w.m.as_ref());
+            bufs.extend(r);
+            bufs.push(y);
+            (label, p, bufs)
+        }
+
+        /// Every dispatch of one decode step, in order.
+        fn plan(&self) -> Vec<Dispatch<'_>> {
+            let (a, k) = (&self.acts, &self.k);
+            let mut d: Vec<Dispatch<'_>> = vec![];
             for l in &self.layers {
-                gpu.run(&k.rms, &[&a.x, &l.attn_norm, &a.h]);
-                self.mv(&l.wq, &a.h, None, &a.q32);
-                self.mv(&l.wk, &a.h, None, &a.k32);
-                self.mv(&l.wv, &a.h, None, &a.v32);
-                gpu.run(&k.rope_q, &[&a.q32, &a.cos, &a.sin, &a.q16]);
-                gpu.run(&k.rope_k, &[&a.k32, &a.cos, &a.sin, &a.k16]);
-
-                // Host glue: append this position's K and V to the cache.
-                let mut k16 = vec![f16::ZERO; kvd];
-                gpu.download(&a.k16, &mut k16);
-                let mut v32 = vec![0.0f32; kvd];
-                gpu.download(&a.v32, &mut v32);
-                let v16: Vec<f16> = v32.iter().map(|&v| f16::from_f32(v)).collect();
-                for h in 0..c.n_kv {
-                    let at = (h * c.max_seq + pos) * hd;
-                    gpu.write(&l.kcache, at, &k16[h * hd..(h + 1) * hd]);
-                    gpu.write(&l.vcache, at, &v16[h * hd..(h + 1) * hd]);
-                }
-
-                gpu.run(attn, &[&a.q16, &l.kcache, &l.vcache, &a.o]);
-                self.mv(&l.wo, &a.o, Some(&a.x), &a.x2);
-                gpu.run(&k.rms, &[&a.x2, &l.ffn_norm, &a.h]);
-                self.mv(&l.gate, &a.h, None, &a.g);
-                self.mv(&l.up, &a.h, None, &a.u);
-                gpu.run(&k.silu, &[&a.g, &a.u, &a.a]);
-                self.mv(&l.down, &a.a, Some(&a.x2), &a.x);
+                d.push(("rmsnorm", &k.rms, vec![&a.x, &l.attn_norm, &a.h]));
+                d.push(self.mv("matvec q", &l.wq, &a.h, None, &a.q32));
+                d.push(self.mv("matvec k/v", &l.wk, &a.h, None, &a.k32));
+                d.push(self.mv("matvec k/v", &l.wv, &a.h, None, &a.v32));
+                d.push(("rope", &k.rope_q, vec![&a.q32, &a.cos, &a.sin, &a.q16]));
+                d.push(("rope", &k.rope_k, vec![&a.k32, &a.cos, &a.sin, &a.k16]));
+                d.push((
+                    "kv append",
+                    &k.kv_k,
+                    vec![&a.k16, &l.kcache, &self.scalars_pos],
+                ));
+                d.push((
+                    "kv append",
+                    &k.kv_v,
+                    vec![&a.v32, &l.vcache, &self.scalars_pos],
+                ));
+                d.push((
+                    "attention",
+                    &k.attn,
+                    vec![&a.q16, &l.kcache, &l.vcache, &a.o, &self.scalars_attn],
+                ));
+                d.push(self.mv("matvec o", &l.wo, &a.o, Some(&a.x), &a.x2));
+                d.push(("rmsnorm", &k.rms, vec![&a.x2, &l.ffn_norm, &a.h]));
+                d.push(self.mv("matvec gate/up", &l.gate, &a.h, None, &a.g));
+                d.push(self.mv("matvec gate/up", &l.up, &a.h, None, &a.u));
+                d.push(("silu_mul", &k.silu, vec![&a.g, &a.u, &a.a]));
+                d.push(self.mv("matvec down", &l.down, &a.a, Some(&a.x2), &a.x));
             }
-            gpu.run(&k.rms, &[&a.x, &self.out_norm, &a.h]);
+            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h]));
             let out = self.out.as_ref().unwrap_or(&self.emb);
-            self.mv(out, &a.h, None, &a.logits);
-            self.layers.len() * 13 + 2
+            d.push(self.mv("matvec lm head", out, &a.h, None, &a.logits));
+            d
         }
     }
 }

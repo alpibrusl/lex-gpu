@@ -272,9 +272,19 @@ pub enum Op {
     /// values meet their scales (and, for affine formats such as Q4_K, their
     /// mins). The only way to compute with an `I8` tile.
     Dequant(Arg, Arg, Option<Arg>, usize),
+    /// [`Op::Dequant`] for 4-bit values packed two per byte: the output has
+    /// `q`'s shape and takes, from every byte, the low nibble (`false`) or
+    /// the high one (`true`), unsigned. Which values share a byte is the
+    /// loader's choice; the matvec schedule pairs column `k` of a chunk with
+    /// column `k + chunk/2`, so each nibble half is contiguous and every
+    /// thread unpacks only bytes it owns.
+    Dequant4(Arg, Arg, Option<Arg>, usize, bool),
     Scale(Arg, f32),
     /// `[m,n] -> [m]`.
     RowReduce(Reduce, Arg),
+    /// `a[i, j]`, or `-inf` where `first + j >= limit`: masks the columns of
+    /// a score block that lie past a runtime length.
+    MaskCols(Arg, IdxExpr, Var),
     /// Explicit dtype conversion, the only way to narrow.
     Convert(Arg, DType),
     /// Pack tiles into an array (all consumed).
@@ -305,7 +315,11 @@ pub enum Stmt {
     For {
         index: Var,
         start: usize,
+        /// Static upper bound: the checker proves every iteration up to it.
         end: usize,
+        /// Runtime end, a dynamic scalar `<= end`. The loop stops at
+        /// whichever comes first.
+        end_dyn: Option<Var>,
         init: Vec<Var>,
         params: Vec<Var>,
         body: Block,
@@ -385,6 +399,10 @@ pub struct Program {
     /// `pid` is the instance index, usable in view offsets like a loop index.
     pub grid: usize,
     pub pid: Option<Var>,
+    /// Runtime scalars, in buffer order, with their inclusive upper bounds.
+    /// Usable like loop indices; the bound is what the checker proves
+    /// accesses against.
+    pub dyn_scalars: Vec<(Var, usize)>,
 }
 
 impl Program {
@@ -404,6 +422,7 @@ pub struct Builder {
     stack: Vec<Vec<Stmt>>,
     grid: usize,
     pid: Option<Var>,
+    dyn_scalars: Vec<(Var, usize)>,
 }
 
 impl Builder {
@@ -416,6 +435,7 @@ impl Builder {
             stack: vec![vec![]],
             grid: 1,
             pid: None,
+            dyn_scalars: vec![],
         }
     }
 
@@ -468,6 +488,31 @@ impl Builder {
         self.effect(Op::Drop(v));
     }
 
+    /// A runtime scalar with an inclusive upper bound, read from the
+    /// kernel's scalar buffer in declaration order.
+    pub fn dyn_index(&mut self, name: &str, max: usize) -> Var {
+        let v = self.fresh(name, Some(Ty::Index));
+        self.dyn_scalars.push((v, max));
+        v
+    }
+
+    /// `for i in start..end`, stopping early at the runtime scalar `dyn_end`.
+    pub fn for_range_dyn(
+        &mut self,
+        start: usize,
+        end: usize,
+        dyn_end: Var,
+        init: Vec<Var>,
+        carry: Vec<Ty>,
+        body: impl FnOnce(&mut Builder, Var, &[Var]) -> Vec<Var>,
+    ) -> Vec<Var> {
+        let out = self.for_range(start, end, init, carry, body);
+        if let Some(Stmt::For { end_dyn, .. }) = self.stack.last_mut().and_then(|s| s.last_mut()) {
+            *end_dyn = Some(dyn_end);
+        }
+        out
+    }
+
     /// `for i in start..end`, carrying `init` (moved) with per-iteration types
     /// `carry`. The closure receives the index and the carried values and
     /// returns the values to carry on.
@@ -492,6 +537,7 @@ impl Builder {
             index,
             start,
             end,
+            end_dyn: None,
             init,
             params,
             body: Block { stmts, yields },
@@ -592,6 +638,7 @@ impl Builder {
             declared: self.declared,
             grid: self.grid,
             pid: self.pid,
+            dyn_scalars: self.dyn_scalars,
         }
     }
 }

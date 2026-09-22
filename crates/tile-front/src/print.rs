@@ -18,6 +18,9 @@ pub fn program(p: &Program) -> String {
     if let Some(pid) = p.pid {
         let _ = writeln!(out, "  grid {} in 0..{}", var(p, pid), p.grid);
     }
+    for &(v, max) in &p.dyn_scalars {
+        let _ = writeln!(out, "  scalar {} in 0..={max}", var(p, v));
+    }
     block(p, &p.body, 1, &mut out);
     out.push_str("}\n");
     out
@@ -111,9 +114,14 @@ fn op(p: &Program, o: &Op) -> String {
         Op::Exp(a) => format!("exp {}", arg(p, *a)),
         Op::Unary(u, a) => format!("{} {}", u.name(), arg(p, *a)),
         Op::SwapPairs(a) => format!("swap_pairs {}", arg(p, *a)),
-        Op::Dequant(q, s, m, g) => {
+        Op::Dequant(q, s, m, g) | Op::Dequant4(q, s, m, g, _) => {
             let min = m.map_or(String::new(), |m| format!(", min {}", arg(p, m)));
-            format!("dequant {}, {}{min} group {g}", arg(p, *q), arg(p, *s))
+            let name = match o {
+                Op::Dequant4(.., true) => "dequant4.hi",
+                Op::Dequant4(..) => "dequant4.lo",
+                _ => "dequant",
+            };
+            format!("{name} {}, {}{min} group {g}", arg(p, *q), arg(p, *s))
         }
         Op::Scale(a, s) => format!("scale {}, {s}", arg(p, *a)),
         Op::RowReduce(r, a) => {
@@ -124,6 +132,12 @@ fn op(p: &Program, o: &Op) -> String {
             format!("{n} {}", arg(p, *a))
         }
         Op::Convert(a, dt) => format!("convert {} -> {dt:?}", arg(p, *a)),
+        Op::MaskCols(a, f, l) => format!(
+            "mask_cols {} from {} past {}",
+            arg(p, *a),
+            expr(p, f),
+            var(p, *l)
+        ),
         Op::MakeArray(vs) => format!("array [{}]", vars(p, vs)),
         Op::Acquire(h) => format!("acquire {}", var(p, *h)),
         Op::Commit(h, views, slot) => {
@@ -157,6 +171,7 @@ fn block(p: &Program, b: &Block, depth: usize, out: &mut String) {
                 index,
                 start,
                 end,
+                end_dyn,
                 init,
                 params,
                 body,
@@ -170,7 +185,11 @@ fn block(p: &Program, b: &Block, depth: usize, out: &mut String) {
                         format!("{}: {t} = {}", var(p, q), var(p, i))
                     })
                     .collect();
-                let head = format!("for {} in {start}..{end}", var(p, *index));
+                let stop = match end_dyn {
+                    Some(d) => format!("min({end}, {})", var(p, *d)),
+                    None => end.to_string(),
+                };
+                let head = format!("for {} in {start}..{stop}", var(p, *index));
                 if carry.is_empty() {
                     let _ = writeln!(out, "{pad}{head} {{");
                 } else {

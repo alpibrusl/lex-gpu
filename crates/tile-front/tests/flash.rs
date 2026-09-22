@@ -131,3 +131,41 @@ fn f64_reference_agrees_with_pytorch() {
     let err = max_rel_err(&got, &golden());
     assert!(err < 1e-6, "max rel err {err:e}");
 }
+
+/// One program for every length: the live length and block count are
+/// runtime scalars, the last block is masked. Checked at lengths that end
+/// mid-block, on a block boundary, at 1, and at capacity.
+#[test]
+fn dynamic_length_attention_matches_the_reference_at_every_length() {
+    use tile_front::run_dyn;
+    let cap = 128;
+    let cfg = FlashDecode {
+        seq: cap,
+        kv_cap: cap,
+        bk: 16,
+        stages: 1,
+        ..schedule(8, 16, 1)
+    };
+    let prog = cfg.build_dynamic().unwrap();
+    check(&prog, &Target::apple_m_series()).expect("check");
+    for len in [1usize, 5, 16, 17, 100, cap] {
+        let mut t = vec![
+            input(Q_ROWS, 1),
+            input(cap, 2),
+            input(cap, 3),
+            Tensor::zeros(DType::F32, &[Q_ROWS, D]),
+        ];
+        let nkb = len.div_ceil(16) as u32;
+        run_dyn(&prog, &mut t, &[len as u32, nkb]).expect("interpret");
+        let want = flash::reference(
+            &t[0].data,
+            &t[1].data[..len * D],
+            &t[2].data[..len * D],
+            Q_ROWS,
+            len,
+            D,
+        );
+        let err = max_rel_err(&t[3].data, &want);
+        assert!(err < TOL, "len {len}: max rel err {err:e}");
+    }
+}
