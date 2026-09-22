@@ -1,9 +1,17 @@
 name: CI
 
 on:
+  # Trunk only. Branch pushes are covered by the pull_request trigger, so
+  # listing "**" here would run every PR commit twice -- including a macOS
+  # runner, which is the expensive half.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+
+# A new push supersedes whatever was still running for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
