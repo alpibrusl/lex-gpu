@@ -162,17 +162,13 @@ fn main() -> Result<(), String> {
         })
         .collect();
 
-    for tokens in [1usize, 2, 4] {
+    for tokens in [1usize, 2, 4, 8] {
         let x = gpu.zeroed::<f32>(tokens * n_in);
         let y = gpu.zeroed::<f32>(tokens * n_out);
-        for (bo, kc) in [
-            (8, n_in),
-            (16, n_in),
-            (32, n_in),
-            (16, 1024),
-            (32, 1024),
-            (16, 512),
-        ] {
+        // `bo` is the rows a threadgroup owns, so a simdgroup owns
+        // bo / (threads / 32) of them and re-reads the activations once
+        // per block of those. A larger bo should amortise them.
+        for (bo, kc) in [(16, n_in), (32, n_in), (64, n_in), (128, n_in), (256, n_in)] {
             let Ok(prog) = matmul_q(tokens, n_in, n_out, bo, kc, QLayout::NVFP4, false) else {
                 continue;
             };

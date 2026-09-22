@@ -80,6 +80,43 @@ is **367 GB/s**, and it took a step from 54.9 to 45.9 ms.
 Decoding four values at a time (two bytes into a `float4`) measured 350 —
 slower, not faster.
 
+## What a batch costs, and why speculation does not pay yet
+
+`Runner::forward` runs a batch in one pass over the weights, and a test
+requires a prompt fed as a batch to land where the same prompt lands token
+by token (it does, to 1.9e-5 of scale). The question is what the batch
+costs. On 5120 → 17408, reading the weights once per batch
+(`examples/matvec`, median of five):
+
+| tokens | GB/s | ms/token for a whole pass |
+| --- | --- | --- |
+| 1 (the decode matvec) | 363 | 40 |
+| 2 | 205 | 35 |
+| 4 | 183 | 20 |
+| 8 | 89 | 20 |
+
+Amortisation stops at four tokens. Three explanations were measured and
+only the last survives:
+
+- **Activation traffic.** Replacing the activation loads with a constant
+  doubles throughput, which looked conclusive — but staging them in
+  threadgroup memory made it worse (92 GB/s against 141), and raising the
+  rows a threadgroup owns, which cuts the number of threadgroups and so
+  the traffic, did nothing: every `(bo, threads)` pair that keeps
+  registers sane plateaus at 180–183 GB/s.
+- **Register pressure.** `bo = 256` collapses to 12 GB/s, and `bo = 64` at
+  256 threads is already half speed, because each lane holds one
+  accumulator per (row, token). It bounds how large `bo` can go but does
+  not explain the plateau.
+- **Arithmetic.** At four tokens the loop does one decode and four
+  multiply-adds per weight value, and 183 is almost exactly half of the
+  matvec's 363. The kernel is short of ALU, as the NVFP4 decode is.
+
+That sets what speculation is worth today. A two-token verify costs 1.77
+passes, so drafting one token ahead yields about 1.13 tokens per pass —
+13%, before counting a draft that is refused. Speculation is worth
+building when a verify of `k` costs near one pass, not `k` of them.
+
 ## Matching Ollama, and beating it
 
 Ollama's decode speed on this model tracks how predictable the text is —
@@ -89,16 +126,21 @@ getting **about two tokens per weight pass** from the model's own
 multi-token-prediction head, which ships in the checkpoint (`mtp.*`,
 239 MB — 1.6% of a pass, so drafting is nearly free).
 
-So matching is two pieces of work:
+Ollama's numbers imply its own pass runs at about 480 GB/s and yields two
+tokens. Ours runs at 368 and yields one. So matching is two pieces:
 
-1. **The last of the decode gap.** 367 → ~460 GB/s takes a pass from 40 to
-   31 ms: ~32 tok/s at one token per pass.
-2. **Speculation.** The MTP head drafts, and a batched pass verifies. The
-   kernels for a batch exist for the attention layers (the Llama path's
-   `build_causal` and `matmul_q` already take several rows), but a gated
-   delta layer's recurrence has to scan the batch inside the kernel, and
-   the convolution has to consume several positions. That is the real
-   work.
+1. **The last of the decode gap**, 368 → ~480 GB/s: a pass drops from 40
+   to 30 ms, which is ~33 tok/s on its own.
+2. **Speculation**, which needs a verify of two tokens to cost about one
+   pass rather than the 1.77 it costs now.
+
+Both are the same problem seen twice: these kernels are short of
+arithmetic, not bandwidth. The untried lever for both is half precision
+for the multiply-add — Apple's f16 ALU runs at twice the f32 rate, the
+NVFP4 values are already decoded in half, and MLX and llama.cpp both feed
+their matmuls activations narrower than f32. Everything the batched path
+needs is built and tested; it is the arithmetic per weight value that has
+to come down.
 
 Beating it is the same lever, used harder: acceptance decides how many
 tokens a pass yields. A linear draft of one or two tokens is what MLX
