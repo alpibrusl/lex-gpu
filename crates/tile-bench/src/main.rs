@@ -300,8 +300,6 @@ fn measure(
     args: &Args,
     target: &Target,
 ) -> Result<Vec<Measurement>, String> {
-    use half::f16;
-
     let copy = Kernel::copy(args.dtype, args.copy_elems());
     let norm = Kernel::rmsnorm(args.dtype, args.rows, args.cols, args.eps);
     let copy_plan = plan(&copy, target).map_err(|e| e.to_string())?;
