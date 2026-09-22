@@ -73,6 +73,10 @@ pub struct QLayout {
     /// 6-bit values in two bit planes (see [`Op::Dequant6`]): 0.75 bytes per
     /// value, as the file stores them.
     pub six: bool,
+    /// NVFP4 (see [`Op::DequantFp4`]): 4-bit E2M1 values two per byte, an
+    /// FP8 E4M3 scale per group, and one f32 scale for the whole tensor,
+    /// held per row. 4.5 bits per weight, what Qwen3.5's MLX build uses.
+    pub fp4: bool,
 }
 
 impl QLayout {
@@ -83,6 +87,7 @@ impl QLayout {
         min: false,
         packed4: false,
         six: false,
+        fp4: false,
     };
     /// Q6_K: 16 values per `i8` sub-block scale, 16 sub-blocks per f16 `d`;
     /// 6-bit values in a 4-bit and a 2-bit plane, centred at 0.
@@ -92,6 +97,7 @@ impl QLayout {
         min: false,
         packed4: false,
         six: true,
+        fp4: false,
     };
     /// Q4_K: 32 values per 6-bit scale and min, 8 per f16 `d` and `dmin`:
     /// `d * sc * q - dmin * m`, with the 4-bit values packed two per byte.
@@ -101,6 +107,17 @@ impl QLayout {
         min: true,
         packed4: true,
         six: false,
+        fp4: false,
+    };
+
+    /// NVFP4: 16 values, an FP8 E4M3 scale each, one f32 per tensor.
+    pub const NVFP4: QLayout = QLayout {
+        group: 16,
+        super_groups: None,
+        min: false,
+        packed4: true,
+        six: false,
+        fp4: true,
     };
 
     fn tag(self) -> String {
@@ -112,12 +129,18 @@ impl QLayout {
             if self.packed4 { "p4" } else { "" },
             if self.six { "q6" } else { "" }
         )
+        .replace("g16p4", "nvfp4")
     }
 
     /// Weight parameters after the values, in order, with their dtypes and
     /// widths as a divisor of the row length.
     fn scale_params(self) -> Vec<(&'static str, DType, usize)> {
         let g = self.group;
+        if self.fp4 {
+            // The FP8 scales; the tensor's own f32 scale is a separate
+            // per-row parameter (see `QParams::declare`).
+            return vec![("ws", DType::I8, g)];
+        }
         match self.super_groups {
             None => vec![("ws", DType::F16, g)],
             Some(sub) => {
@@ -153,6 +176,8 @@ struct QParams {
     q: usize,
     qh: Option<usize>,
     scales: Vec<(usize, DType, usize)>,
+    /// NVFP4's per-tensor f32 scale, held once per row: `[n_out]`.
+    gs: Option<usize>,
 }
 
 impl QParams {
@@ -176,7 +201,10 @@ impl QParams {
                 (b.param(&name, dt, &[n_out, n_in / per], false), dt, per)
             })
             .collect();
-        QParams { q, qh, scales }
+        let gs = layout
+            .fp4
+            .then(|| b.param(&format!("{pre}gs"), DType::F32, &[n_out], false));
+        QParams { q, qh, scales, gs }
     }
 
     /// The dequantised `[bo, kc]` tile of rows `rows..rows+bo`, chunk `c`.
@@ -203,6 +231,24 @@ impl QParams {
                 ),
             )
         };
+        if let Some(gs) = self.gs {
+            // NVFP4: E2M1 codes two per byte, an E4M3 scale per 16, and
+            // this row's copy of the tensor's f32 scale.
+            let q = load(b, (self.q, DType::I8, 2));
+            let sc = load(b, (self.scales[0].0, DType::I8, g));
+            let row = b.op(
+                "gs",
+                Op::Load(
+                    View {
+                        param: gs,
+                        offset: vec![rows.clone()],
+                        shape: vec![bo],
+                    },
+                    reg(DType::F32, &[bo]),
+                ),
+            );
+            return b.op("w", Op::DequantFp4(Move(q), Move(sc), Move(row), g));
+        }
         // Per-group scales (and mins): f16 directly, or `sc * d` through
         // `dequant` for the two-level K-quants.
         let (s, m) = match layout.super_groups {
@@ -1124,6 +1170,25 @@ mod tests {
             }
         }
         assert!(max_rel_err(&t[3].data, &want) < 1e-6);
+    }
+
+    #[test]
+    fn nvfp4_codes_and_fp8_scales_decode_to_their_spec() {
+        use crate::interp::{e2m1, e4m3};
+        // E2M1: sign, 2-bit exponent, 1-bit mantissa.
+        let mags = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        for (c, &want) in mags.iter().enumerate() {
+            assert_eq!(e2m1(c as u8), want, "code {c}");
+            assert_eq!(e2m1(c as u8 | 8), -want, "code {c} negated");
+        }
+        // E4M3 (OCP e4m3fn): 1.0, 1.5, the smallest subnormal, the largest
+        // finite value, and the one NaN encoding.
+        assert_eq!(e4m3(0x38), 1.0);
+        assert_eq!(e4m3(0x3C), 1.5);
+        assert_eq!(e4m3(0x01), 2.0f32.powi(-9));
+        assert_eq!(e4m3(0x7E), 448.0);
+        assert_eq!(e4m3(0xB8), -1.0);
+        assert!(e4m3(0x7F).is_nan());
     }
 
     #[test]

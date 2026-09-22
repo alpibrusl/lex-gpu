@@ -29,6 +29,15 @@ fn main() -> Result<(), String> {
         "matrix", "n_in", "n_out", "MB", "us", "GB/s"
     );
     let shapes = [
+        // Qwen3.5-27B (MLX, nvfp4), the decode matvecs by size.
+        ("qwen gate/up (nvfp4)", 5120, 17408, QLayout::NVFP4),
+        ("qwen down (nvfp4)", 17408, 5120, QLayout::NVFP4),
+        ("qwen qkv-in (nvfp4)", 5120, 12288, QLayout::NVFP4),
+        ("qwen lm head (nvfp4)", 5120, 248320, QLayout::NVFP4),
+        // The same shapes in Q4_K, to separate format from shape.
+        ("qwen gate/up (Q4_K)", 5120, 17408, QLayout::Q4_K),
+        ("qwen down (Q4_K)", 17408, 5120, QLayout::Q4_K),
+        // Llama-3 8B (Q4_K_M).
         ("q/o (Q4_K)", 4096, 4096, QLayout::Q4_K),
         ("k (Q4_K)", 4096, 1024, QLayout::Q4_K),
         ("v (Q6_K)", 4096, 1024, QLayout::Q6_K),

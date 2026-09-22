@@ -108,7 +108,118 @@ struct Gen<'a> {
     /// per-group scale and min as separate expressions, so a reduction over
     /// them can evaluate the group terms once per run instead of per value.
     dq: HashMap<Var, Dq>,
+    /// The kernel decodes NVFP4, so the source needs the decode tables.
+    fp4: bool,
 }
+
+/// E2M1 value codes and E4M3 scale bytes as constant tables: an NVFP4
+/// inner loop then decodes both with a load from the constant cache
+/// instead of the shifts, compare and `exp2` the formats spell out.
+const FP4_TABLES: &str = concat!(
+    // Both nibbles of a byte, decoded: one constant-cache load per
+    // byte instead of one per value. E2M1 by arithmetic measured far
+    // slower (203 GB/s against 400) -- the table stays.
+    "constant float2 FP4_P[256] = {\n",
+    "    float2(0.0f, 0.0f), float2(0.5f, 0.0f), float2(1.0f, 0.0f), float2(1.5f, 0.0f),\n",
+    "    float2(2.0f, 0.0f), float2(3.0f, 0.0f), float2(4.0f, 0.0f), float2(6.0f, 0.0f),\n",
+    "    float2(-0.0f, 0.0f), float2(-0.5f, 0.0f), float2(-1.0f, 0.0f), float2(-1.5f, 0.0f),\n",
+    "    float2(-2.0f, 0.0f), float2(-3.0f, 0.0f), float2(-4.0f, 0.0f), float2(-6.0f, 0.0f),\n",
+    "    float2(0.0f, 0.5f), float2(0.5f, 0.5f), float2(1.0f, 0.5f), float2(1.5f, 0.5f),\n",
+    "    float2(2.0f, 0.5f), float2(3.0f, 0.5f), float2(4.0f, 0.5f), float2(6.0f, 0.5f),\n",
+    "    float2(-0.0f, 0.5f), float2(-0.5f, 0.5f), float2(-1.0f, 0.5f), float2(-1.5f, 0.5f),\n",
+    "    float2(-2.0f, 0.5f), float2(-3.0f, 0.5f), float2(-4.0f, 0.5f), float2(-6.0f, 0.5f),\n",
+    "    float2(0.0f, 1.0f), float2(0.5f, 1.0f), float2(1.0f, 1.0f), float2(1.5f, 1.0f),\n",
+    "    float2(2.0f, 1.0f), float2(3.0f, 1.0f), float2(4.0f, 1.0f), float2(6.0f, 1.0f),\n",
+    "    float2(-0.0f, 1.0f), float2(-0.5f, 1.0f), float2(-1.0f, 1.0f), float2(-1.5f, 1.0f),\n",
+    "    float2(-2.0f, 1.0f), float2(-3.0f, 1.0f), float2(-4.0f, 1.0f), float2(-6.0f, 1.0f),\n",
+    "    float2(0.0f, 1.5f), float2(0.5f, 1.5f), float2(1.0f, 1.5f), float2(1.5f, 1.5f),\n",
+    "    float2(2.0f, 1.5f), float2(3.0f, 1.5f), float2(4.0f, 1.5f), float2(6.0f, 1.5f),\n",
+    "    float2(-0.0f, 1.5f), float2(-0.5f, 1.5f), float2(-1.0f, 1.5f), float2(-1.5f, 1.5f),\n",
+    "    float2(-2.0f, 1.5f), float2(-3.0f, 1.5f), float2(-4.0f, 1.5f), float2(-6.0f, 1.5f),\n",
+    "    float2(0.0f, 2.0f), float2(0.5f, 2.0f), float2(1.0f, 2.0f), float2(1.5f, 2.0f),\n",
+    "    float2(2.0f, 2.0f), float2(3.0f, 2.0f), float2(4.0f, 2.0f), float2(6.0f, 2.0f),\n",
+    "    float2(-0.0f, 2.0f), float2(-0.5f, 2.0f), float2(-1.0f, 2.0f), float2(-1.5f, 2.0f),\n",
+    "    float2(-2.0f, 2.0f), float2(-3.0f, 2.0f), float2(-4.0f, 2.0f), float2(-6.0f, 2.0f),\n",
+    "    float2(0.0f, 3.0f), float2(0.5f, 3.0f), float2(1.0f, 3.0f), float2(1.5f, 3.0f),\n",
+    "    float2(2.0f, 3.0f), float2(3.0f, 3.0f), float2(4.0f, 3.0f), float2(6.0f, 3.0f),\n",
+    "    float2(-0.0f, 3.0f), float2(-0.5f, 3.0f), float2(-1.0f, 3.0f), float2(-1.5f, 3.0f),\n",
+    "    float2(-2.0f, 3.0f), float2(-3.0f, 3.0f), float2(-4.0f, 3.0f), float2(-6.0f, 3.0f),\n",
+    "    float2(0.0f, 4.0f), float2(0.5f, 4.0f), float2(1.0f, 4.0f), float2(1.5f, 4.0f),\n",
+    "    float2(2.0f, 4.0f), float2(3.0f, 4.0f), float2(4.0f, 4.0f), float2(6.0f, 4.0f),\n",
+    "    float2(-0.0f, 4.0f), float2(-0.5f, 4.0f), float2(-1.0f, 4.0f), float2(-1.5f, 4.0f),\n",
+    "    float2(-2.0f, 4.0f), float2(-3.0f, 4.0f), float2(-4.0f, 4.0f), float2(-6.0f, 4.0f),\n",
+    "    float2(0.0f, 6.0f), float2(0.5f, 6.0f), float2(1.0f, 6.0f), float2(1.5f, 6.0f),\n",
+    "    float2(2.0f, 6.0f), float2(3.0f, 6.0f), float2(4.0f, 6.0f), float2(6.0f, 6.0f),\n",
+    "    float2(-0.0f, 6.0f), float2(-0.5f, 6.0f), float2(-1.0f, 6.0f), float2(-1.5f, 6.0f),\n",
+    "    float2(-2.0f, 6.0f), float2(-3.0f, 6.0f), float2(-4.0f, 6.0f), float2(-6.0f, 6.0f),\n",
+    "    float2(0.0f, -0.0f), float2(0.5f, -0.0f), float2(1.0f, -0.0f), float2(1.5f, -0.0f),\n",
+    "    float2(2.0f, -0.0f), float2(3.0f, -0.0f), float2(4.0f, -0.0f), float2(6.0f, -0.0f),\n",
+    "    float2(-0.0f, -0.0f), float2(-0.5f, -0.0f), float2(-1.0f, -0.0f), float2(-1.5f, -0.0f),\n",
+    "    float2(-2.0f, -0.0f), float2(-3.0f, -0.0f), float2(-4.0f, -0.0f), float2(-6.0f, -0.0f),\n",
+    "    float2(0.0f, -0.5f), float2(0.5f, -0.5f), float2(1.0f, -0.5f), float2(1.5f, -0.5f),\n",
+    "    float2(2.0f, -0.5f), float2(3.0f, -0.5f), float2(4.0f, -0.5f), float2(6.0f, -0.5f),\n",
+    "    float2(-0.0f, -0.5f), float2(-0.5f, -0.5f), float2(-1.0f, -0.5f), float2(-1.5f, -0.5f),\n",
+    "    float2(-2.0f, -0.5f), float2(-3.0f, -0.5f), float2(-4.0f, -0.5f), float2(-6.0f, -0.5f),\n",
+    "    float2(0.0f, -1.0f), float2(0.5f, -1.0f), float2(1.0f, -1.0f), float2(1.5f, -1.0f),\n",
+    "    float2(2.0f, -1.0f), float2(3.0f, -1.0f), float2(4.0f, -1.0f), float2(6.0f, -1.0f),\n",
+    "    float2(-0.0f, -1.0f), float2(-0.5f, -1.0f), float2(-1.0f, -1.0f), float2(-1.5f, -1.0f),\n",
+    "    float2(-2.0f, -1.0f), float2(-3.0f, -1.0f), float2(-4.0f, -1.0f), float2(-6.0f, -1.0f),\n",
+    "    float2(0.0f, -1.5f), float2(0.5f, -1.5f), float2(1.0f, -1.5f), float2(1.5f, -1.5f),\n",
+    "    float2(2.0f, -1.5f), float2(3.0f, -1.5f), float2(4.0f, -1.5f), float2(6.0f, -1.5f),\n",
+    "    float2(-0.0f, -1.5f), float2(-0.5f, -1.5f), float2(-1.0f, -1.5f), float2(-1.5f, -1.5f),\n",
+    "    float2(-2.0f, -1.5f), float2(-3.0f, -1.5f), float2(-4.0f, -1.5f), float2(-6.0f, -1.5f),\n",
+    "    float2(0.0f, -2.0f), float2(0.5f, -2.0f), float2(1.0f, -2.0f), float2(1.5f, -2.0f),\n",
+    "    float2(2.0f, -2.0f), float2(3.0f, -2.0f), float2(4.0f, -2.0f), float2(6.0f, -2.0f),\n",
+    "    float2(-0.0f, -2.0f), float2(-0.5f, -2.0f), float2(-1.0f, -2.0f), float2(-1.5f, -2.0f),\n",
+    "    float2(-2.0f, -2.0f), float2(-3.0f, -2.0f), float2(-4.0f, -2.0f), float2(-6.0f, -2.0f),\n",
+    "    float2(0.0f, -3.0f), float2(0.5f, -3.0f), float2(1.0f, -3.0f), float2(1.5f, -3.0f),\n",
+    "    float2(2.0f, -3.0f), float2(3.0f, -3.0f), float2(4.0f, -3.0f), float2(6.0f, -3.0f),\n",
+    "    float2(-0.0f, -3.0f), float2(-0.5f, -3.0f), float2(-1.0f, -3.0f), float2(-1.5f, -3.0f),\n",
+    "    float2(-2.0f, -3.0f), float2(-3.0f, -3.0f), float2(-4.0f, -3.0f), float2(-6.0f, -3.0f),\n",
+    "    float2(0.0f, -4.0f), float2(0.5f, -4.0f), float2(1.0f, -4.0f), float2(1.5f, -4.0f),\n",
+    "    float2(2.0f, -4.0f), float2(3.0f, -4.0f), float2(4.0f, -4.0f), float2(6.0f, -4.0f),\n",
+    "    float2(-0.0f, -4.0f), float2(-0.5f, -4.0f), float2(-1.0f, -4.0f), float2(-1.5f, -4.0f),\n",
+    "    float2(-2.0f, -4.0f), float2(-3.0f, -4.0f), float2(-4.0f, -4.0f), float2(-6.0f, -4.0f),\n",
+    "    float2(0.0f, -6.0f), float2(0.5f, -6.0f), float2(1.0f, -6.0f), float2(1.5f, -6.0f),\n",
+    "    float2(2.0f, -6.0f), float2(3.0f, -6.0f), float2(4.0f, -6.0f), float2(6.0f, -6.0f),\n",
+    "    float2(-0.0f, -6.0f), float2(-0.5f, -6.0f), float2(-1.0f, -6.0f), float2(-1.5f, -6.0f),\n",
+    "    float2(-2.0f, -6.0f), float2(-3.0f, -6.0f), float2(-4.0f, -6.0f), float2(-6.0f, -6.0f),\n",
+    "};\n",
+    "constant float FP8_E4M3[256] = {\n",
+    "    0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,\n",
+    "    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,\n",
+    "    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,\n",
+    "    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,\n",
+    "    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,\n",
+    "    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,\n",
+    "    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,\n",
+    "    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,\n",
+    "    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,\n",
+    "    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,\n",
+    "    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,\n",
+    "    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,\n",
+    "    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,\n",
+    "    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,\n",
+    "    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,\n",
+    "    256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, NAN,\n",
+    "    -0.0f, -0.001953125f, -0.00390625f, -0.005859375f, -0.0078125f, -0.009765625f, -0.01171875f, -0.013671875f,\n",
+    "    -0.015625f, -0.017578125f, -0.01953125f, -0.021484375f, -0.0234375f, -0.025390625f, -0.02734375f, -0.029296875f,\n",
+    "    -0.03125f, -0.03515625f, -0.0390625f, -0.04296875f, -0.046875f, -0.05078125f, -0.0546875f, -0.05859375f,\n",
+    "    -0.0625f, -0.0703125f, -0.078125f, -0.0859375f, -0.09375f, -0.1015625f, -0.109375f, -0.1171875f,\n",
+    "    -0.125f, -0.140625f, -0.15625f, -0.171875f, -0.1875f, -0.203125f, -0.21875f, -0.234375f,\n",
+    "    -0.25f, -0.28125f, -0.3125f, -0.34375f, -0.375f, -0.40625f, -0.4375f, -0.46875f,\n",
+    "    -0.5f, -0.5625f, -0.625f, -0.6875f, -0.75f, -0.8125f, -0.875f, -0.9375f,\n",
+    "    -1.0f, -1.125f, -1.25f, -1.375f, -1.5f, -1.625f, -1.75f, -1.875f,\n",
+    "    -2.0f, -2.25f, -2.5f, -2.75f, -3.0f, -3.25f, -3.5f, -3.75f,\n",
+    "    -4.0f, -4.5f, -5.0f, -5.5f, -6.0f, -6.5f, -7.0f, -7.5f,\n",
+    "    -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,\n",
+    "    -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f,\n",
+    "    -32.0f, -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f,\n",
+    "    -64.0f, -72.0f, -80.0f, -88.0f, -96.0f, -104.0f, -112.0f, -120.0f,\n",
+    "    -128.0f, -144.0f, -160.0f, -176.0f, -192.0f, -208.0f, -224.0f, -240.0f,\n",
+    "    -256.0f, -288.0f, -320.0f, -352.0f, -384.0f, -416.0f, -448.0f, NAN,\n",
+    "};\n\n"
+);
 
 /// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
 /// `G = (I / cols) * (cols / group) + (I % cols) / group`.
@@ -117,6 +228,11 @@ struct Dq {
     v: String,
     s: String,
     m: Option<String>,
+    /// A factor that depends only on the row (NVFP4's per-tensor scale),
+    /// templated on the row index. A reduction lifts it out of the run
+    /// loop: the compiler cannot, because a device load may alias the
+    /// kernel's own stores.
+    row: Option<String>,
     cols: usize,
     group: usize,
     /// How values are packed, so a reduction can load each byte once for
@@ -133,6 +249,9 @@ enum Pack {
     /// 6-bit values in a 4-bit plane and a 2-bit plane: each plane's
     /// expression and row length in bytes.
     Six(String, usize, String, usize),
+    /// NVFP4 pairs: the byte tile's expression and row length in bytes.
+    /// Like [`Pack::Pairs`], but a nibble is an E2M1 float code.
+    Fp4(String, usize),
 }
 
 /// Lower `prog` (which must already pass `tile_front::check` for `target`)
@@ -158,6 +277,7 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
         staged: 0,
         barriers: 0,
         dq: HashMap::new(),
+        fp4: false,
     };
     if let Some(pid) = prog.pid {
         g.locs.insert(pid, Loc::Index("gid".into()));
@@ -200,6 +320,9 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
         target.max_threadgroup_bytes
     );
     s.push_str("\n#include <metal_stdlib>\nusing namespace metal;\n\n");
+    if g.fp4 {
+        s.push_str(FP4_TABLES);
+    }
     let _ = writeln!(s, "kernel void {entry}(");
     for (i, p) in prog.params.iter().enumerate() {
         let cv = if p.writable { "" } else { "const " };
@@ -864,6 +987,7 @@ impl Gen<'_> {
                         m: m.map(|m| format!("float({})", self.lazy(m).expect("checked").0)),
                         cols: c,
                         group: *group,
+                        row: None,
                         pack: if pairs {
                             Pack::Pairs(qe.clone(), qc)
                         } else {
@@ -874,6 +998,50 @@ impl Gen<'_> {
                 let e = format!("({qv} * {sv}{mv})");
                 self.locs
                     .insert(x, Loc::Lazy(e, reg(DType::F32, &[tq.shape[0], c])));
+            }
+            Op::DequantFp4(q, sc, gs, group)
+                if [*q, *sc, *gs].iter().all(|a| self.lazy(*a).is_some()) =>
+            {
+                let x = dst.ok_or("op without a result")?;
+                let (qe, tq) = self.lazy(*q).expect("checked");
+                let (se, _) = self.lazy(*sc).expect("checked");
+                let (ge, _) = self.lazy(*gs).expect("checked");
+                let (r, c) = (tq.shape[0], 2 * tq.shape[1]);
+                let per_row = c / group;
+                self.fp4 = true;
+                // Element I: byte I/2 of its row, low nibble for even
+                // columns; scale group I/group; row scale I/c.
+                let byte = at_index(
+                    &qe,
+                    &format!("({AT} / {c}u) * {}u + ({AT} % {c}u) / 2u", tq.shape[1]),
+                );
+                let v = format!(
+                    "((({AT} & 1u) == 0u) ? FP4_P[(uint)(uchar)({byte}) & 0xFFu].x : FP4_P[(uint)(uchar)({byte}) & 0xFFu].y)"
+                );
+                // Inside a reduction the scale is formed once per group, so
+                // the row scale rides along with it: group G is row
+                // `G / per_row`.
+                let s_of_group = format!("FP8_E4M3[(uint)(uchar)({se}) & 0xFFu]");
+                let row_of_group = at_index(&ge, &format!("({AT}) / {per_row}u"));
+                let gidx = format!("({AT} / {c}u) * {per_row}u + ({AT} % {c}u) / {group}u");
+                let e = format!(
+                    "({v} * {} * float({}))",
+                    at_index(&s_of_group, &gidx),
+                    at_index(&row_of_group, &gidx)
+                );
+                self.dq.insert(
+                    x,
+                    Dq {
+                        v,
+                        s: s_of_group,
+                        m: None,
+                        cols: c,
+                        group: *group,
+                        row: Some(ge.clone()),
+                        pack: Pack::Fp4(qe.clone(), tq.shape[1]),
+                    },
+                );
+                self.locs.insert(x, Loc::Lazy(e, reg(DType::F32, &[r, c])));
             }
             Op::Dequant6(lo, hi, sc, group)
                 if [*lo, *hi, *sc].iter().all(|a| self.lazy(*a).is_some()) =>
@@ -900,6 +1068,7 @@ impl Gen<'_> {
                         m: None,
                         cols: c,
                         group: *group,
+                        row: None,
                         pack: Pack::Six(le.clone(), lc, he.clone(), hc),
                     },
                 );
@@ -1026,6 +1195,26 @@ impl Gen<'_> {
                 let name = self.declare_reg(x, &reg(DType::F32, &tq.shape));
                 self.owned(n, &[format!("{name}[k] = {qv} * {sv}{mv};")]);
             }
+            Op::DequantFp4(q, sc, gs, group) => {
+                let x = dst.ok_or("op without a result")?;
+                let tq = self.arg_ty(*q)?;
+                let (r, qc) = (tq.shape[0], tq.shape[1]);
+                let (c, n) = (2 * qc, r * 2 * qc);
+                self.fp4 = true;
+                let ops = self.operands(&[*q, *sc, *gs], &[false, false, false], n)?;
+                let byte = Self::read(&ops[0].0, &format!("(e / {c}u) * {qc}u + (e % {c}u) / 2u"));
+                let at = format!("(e / {c}u) * {}u + (e % {c}u) / {group}u", c / group);
+                let sv = Self::read(&ops[1].0, &at);
+                let gv = Self::read(&ops[2].0, &format!("e / {c}u"));
+                let name = self.declare_reg(x, &reg(DType::F32, &[r, c]));
+                self.owned(
+                    n,
+                    &[format!(
+                        "{name}[k] = (((e & 1u) == 0u) ? FP4_P[(uint)(uchar)({byte}) & 0xFFu].x : FP4_P[(uint)(uchar)({byte}) & 0xFFu].y) \
+                         * FP8_E4M3[(uint)(uchar)({sv}) & 0xFFu] * {gv};"
+                    )],
+                );
+            }
             Op::Dequant4(q, s, m, group, mode) => {
                 let x = dst.ok_or("op without a result")?;
                 let tq = self.arg_ty(*q)?;
@@ -1126,13 +1315,24 @@ impl Gen<'_> {
                             && d.group.is_multiple_of(vec)
                             && match d.pack {
                                 Pack::None => true,
-                                Pack::Pairs(..) => vec.is_multiple_of(2),
+                                Pack::Pairs(..) | Pack::Fp4(..) => vec.is_multiple_of(2),
                                 Pack::Six(..) => vec.is_multiple_of(4),
                             }
                     });
                     if let Some(d) = dq {
                         let g = d.group;
                         let vv = at_index(&d.v, &format!("j * {kd}u + p"));
+                        // Row-only factors are read once, not once per run.
+                        let rs = match &d.row {
+                            Some(r) => {
+                                self.line(&format!(
+                                    "const float rs = float({});",
+                                    at_index(r, "j")
+                                ));
+                                " * rs"
+                            }
+                            None => "",
+                        };
                         self.line(&format!(
                             "for (uint p0 = lane * {vec}u; p0 < {kd}u; p0 += {}u) {{",
                             lanes * vec
@@ -1141,7 +1341,10 @@ impl Gen<'_> {
                             "    const uint grp = j * {}u + p0 / {g}u;",
                             kd / g
                         ));
-                        self.line(&format!("    const float sg = {};", at_index(&d.s, "grp")));
+                        self.line(&format!(
+                            "    const float sg = {}{rs};",
+                            at_index(&d.s, "grp")
+                        ));
                         let mg = match &d.m {
                             Some(m) => {
                                 self.line(&format!("    const float mg = {};", at_index(m, "grp")));
@@ -1169,6 +1372,16 @@ impl Gen<'_> {
                                      + {a1} * (float(int((l0 >> 4u) | (((hh >> 2u) & 3u) << 4u)) - 32) * sg) \
                                      + {a2} * (float(int((l1 & 0xFu) | (((hh >> 4u) & 3u) << 4u)) - 32) * sg) \
                                      + {a3} * (float(int((l1 >> 4u) | (((hh >> 6u) & 3u) << 4u)) - 32) * sg); }}"
+                                ));
+                            }
+                            Pack::Fp4(qe, qc) => {
+                                // One byte, two E2M1 codes: p and p + 1.
+                                let byte = at_index(qe, &format!("j * {qc}u + p0 / 2u + u / 2u"));
+                                let a1 = Self::read(&ops[0].0, &format!("i * {kd}u + p + 1u"));
+                                self.line(&format!(
+                                    "    for (uint u = 0; u < {vec}u; u += 2u) {{ const uint p = p0 + u; \
+                                     const float2 bq = FP4_P[(uint)(uchar)({byte}) & 0xFFu]; \
+                                     s += {av} * (bq.x * sg) + {a1} * (bq.y * sg); }}"
                                 ));
                             }
                             Pack::Pairs(qe, qc) => {
@@ -1390,7 +1603,7 @@ impl Gen<'_> {
                 && d.group.is_multiple_of(vec)
                 && match d.pack {
                     Pack::None => true,
-                    Pack::Pairs(..) => vec.is_multiple_of(2),
+                    Pack::Pairs(..) | Pack::Fp4(..) => vec.is_multiple_of(2),
                     Pack::Six(..) => vec.is_multiple_of(4),
                 }
         });
@@ -1408,6 +1621,14 @@ impl Gen<'_> {
                                 format!("(float(bq & 0xFu) * sgr[rr]{mg})"),
                                 format!("(float(bq >> 4u) * sgr[rr]{mg})"),
                             ],
+                        )
+                    }
+                    Pack::Fp4(qe, qc) => {
+                        let byte = at_index(qe, &format!("j * {qc}u + p0 / 2u + u / 2u"));
+                        (
+                            2,
+                            format!("const float2 bq = FP4_P[(uint)(uchar)({byte}) & 0xFFu]; "),
+                            vec![format!("(bq.x * sgr[rr])"), format!("(bq.y * sgr[rr])")],
                         )
                     }
                     Pack::Six(lo, lc, hi, hc) => {
@@ -1469,7 +1690,12 @@ impl Gen<'_> {
                 n - 1,
                 kd / g
             ));
-            self.line(&format!("    sgr[rr] = {};", at_index(&d.s, "grp")));
+            let rs = match &d.row {
+                // Row-only factor (NVFP4's per-tensor scale).
+                Some(r) => format!(" * float({})", at_index(r, "j")),
+                None => String::new(),
+            };
+            self.line(&format!("    sgr[rr] = {}{rs};", at_index(&d.s, "grp")));
             match &d.m {
                 Some(mm) => self.line(&format!("    mgr[rr] = {};", at_index(mm, "grp"))),
                 None => self.line("    mgr[rr] = 0.0f;"),

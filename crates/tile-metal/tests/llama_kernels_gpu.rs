@@ -409,6 +409,39 @@ fn split_kv_attention_matches_the_interpreter() {
     }
 }
 
+/// NVFP4 (Qwen3.5's MLX weights): E2M1 codes two per byte, an FP8 E4M3
+/// scale per 16, one f32 scale per tensor held per row.
+#[test]
+fn nvfp4_matvec_matches_the_interpreter() {
+    let gpu = Gpu::open().expect("metal device");
+    let (n_in, n_out) = (512, 64);
+    // Scale bytes with a sane exponent (no NaN, no subnormals).
+    let scales: Vec<f32> = pattern(n_out * n_in / 16, 21)
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let e = 4 + (i % 8) as u8;
+            let m = ((v.abs() * 8.0) as u8) & 7;
+            ((e << 3) | m) as i8 as f32
+        })
+        .collect();
+    let codes: Vec<f32> = pattern(n_out * n_in / 2, 22)
+        .iter()
+        .map(|v| ((v + 1.0) * 127.5) as u8 as i8 as f32)
+        .collect();
+    for rows in [1usize, 4] {
+        let t = vec![
+            Tensor::new(DType::F32, &[rows, n_in], &pattern(rows * n_in, 23)),
+            Tensor::new(DType::I8, &[n_out, n_in / 2], &codes),
+            Tensor::new(DType::I8, &[n_out, n_in / 16], &scales),
+            Tensor::new(DType::F32, &[n_out], &vec![0.0125f32; n_out]),
+            Tensor::zeros(DType::F32, &[rows, n_out]),
+        ];
+        let p = matmul_q(rows, n_in, n_out, 8, n_in, QLayout::NVFP4, false).unwrap();
+        same(&gpu, &p, t, &[], 4, 256);
+    }
+}
+
 /// The batched forward pass's kernels (prefill, speculative verify).
 #[test]
 fn batched_kernels_match_the_interpreter() {
