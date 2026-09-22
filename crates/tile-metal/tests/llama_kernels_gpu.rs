@@ -409,6 +409,56 @@ fn split_kv_attention_matches_the_interpreter() {
     }
 }
 
+/// Qwen3.5's gates and its depthwise convolution, at the model's shapes.
+#[test]
+fn delta_gates_and_conv_match_the_interpreter() {
+    use tile_front::qwen::{build_conv_silu, build_gates};
+    let gpu = Gpu::open().expect("metal device");
+    let (hv, dv) = (48usize, 128usize);
+    // `dt_bias` reaches 19 in the real weights: softplus must stay linear
+    // there rather than overflowing through `exp`.
+    let dt: Vec<f32> = (0..hv)
+        .map(|i| -6.0 + 25.0 * (i as f32) / hv as f32)
+        .collect();
+    let gates = vec![
+        Tensor::new(DType::F32, &[hv], &pattern(hv, 40)),
+        Tensor::new(DType::F32, &[hv], &pattern(hv, 41)),
+        Tensor::new(
+            DType::F32,
+            &[hv],
+            &pattern(hv, 42)
+                .iter()
+                .map(|x| 0.5 + x.abs())
+                .collect::<Vec<_>>(),
+        ),
+        Tensor::new(DType::F32, &[hv], &dt),
+        Tensor::zeros(DType::F32, &[hv, dv]),
+        Tensor::zeros(DType::F32, &[hv, dv]),
+    ];
+    for out in [4, 5] {
+        same(&gpu, &build_gates(hv, dv), gates.clone(), &[], out, 64);
+    }
+
+    let (ch, kern) = (10240usize, 4usize);
+    let conv = vec![
+        Tensor::new(DType::F32, &[kern - 1, ch], &pattern((kern - 1) * ch, 43)),
+        Tensor::new(DType::F32, &[1, ch], &pattern(ch, 44)),
+        Tensor::new(DType::F32, &[kern, ch], &pattern(kern * ch, 45)),
+        Tensor::zeros(DType::F32, &[1, ch]),
+    ];
+    // The output, and the window the step leaves behind.
+    for out in [3, 0] {
+        same(
+            &gpu,
+            &build_conv_silu(ch, kern, 256).unwrap(),
+            conv.clone(),
+            &[],
+            out,
+            256,
+        );
+    }
+}
+
 /// Qwen3.5's gated-delta state update, at the model's own shape.
 #[test]
 fn delta_state_matches_the_interpreter() {

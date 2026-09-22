@@ -210,6 +210,10 @@ impl BinOp {
 pub enum UnOp {
     Rsqrt,
     Sigmoid,
+    /// `log(1 + exp(x))`, evaluated as `max(x, 0) + log(1 + exp(-|x|))` so
+    /// a large `x` neither overflows nor loses the linear part. Qwen3.5's
+    /// decay gate is `exp(-A softplus(a + bias))`, and its bias reaches 19.
+    Softplus,
 }
 
 impl UnOp {
@@ -217,6 +221,7 @@ impl UnOp {
         match self {
             UnOp::Rsqrt => 1.0 / x.sqrt(),
             UnOp::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            UnOp::Softplus => x.max(0.0) + (-x.abs()).exp().ln_1p(),
         }
     }
 
@@ -224,6 +229,7 @@ impl UnOp {
         match self {
             UnOp::Rsqrt => "rsqrt",
             UnOp::Sigmoid => "sigmoid",
+            UnOp::Softplus => "softplus",
         }
     }
 }

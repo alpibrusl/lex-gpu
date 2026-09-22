@@ -21,7 +21,7 @@
 
 use tile_ir::{DType, Space};
 
-use crate::ir::{Arg, BinOp, Builder, IdxExpr, Op, Program, Reduce, TileTy, View};
+use crate::ir::{Arg, BinOp, Builder, IdxExpr, Op, Program, Reduce, TileTy, UnOp, View};
 
 fn reg(shape: &[usize]) -> TileTy {
     TileTy::new(DType::F32, shape, Space::Reg)
@@ -144,6 +144,127 @@ impl DeltaNet {
         b.effect(Op::Store(Move(s), state_at));
         Ok(b.finish())
     }
+}
+
+/// The two gates of a linear-attention layer, expanded to one value per
+/// state row so [`DeltaNet::build_step`] can scale a tile of rows by them.
+///
+/// `g = exp(-A softplus(a + dt_bias))` decays the state, `beta =
+/// sigmoid(b)` weights the write. `A` is `exp(A_log)`, folded by the
+/// loader: it is a weight, so the exponential is free.
+///
+/// Parameters: `a`, `b`, `A` and `dt_bias`, each `[v_heads]`, then
+/// `g` and `beta`, each `[v_heads, v_dim]`. One instance per head.
+pub fn build_gates(v_heads: usize, v_dim: usize) -> Program {
+    use Arg::Move;
+    let mut b = Builder::new(&format!("delta_gates_h{v_heads}x{v_dim}"));
+    let pa = b.param("a", DType::F32, &[v_heads], false);
+    let pb = b.param("b", DType::F32, &[v_heads], false);
+    let p_amp = b.param("A", DType::F32, &[v_heads], false);
+    let pdt = b.param("dt_bias", DType::F32, &[v_heads], false);
+    let pg = b.param("g", DType::F32, &[v_heads, v_dim], true);
+    let pbeta = b.param("beta", DType::F32, &[v_heads, v_dim], true);
+    let head = b.grid(v_heads);
+
+    let one = reg(&[1]);
+    let at = |param| View {
+        param,
+        offset: vec![IdxExpr::scaled(head, 1, 0)],
+        shape: vec![1],
+    };
+    let a = b.op("a", Op::Load(at(pa), one.clone()));
+    let dt = b.op("dt", Op::Load(at(pdt), one.clone()));
+    let u = b.op("u", Op::Binary(BinOp::Add, Move(a), Move(dt)));
+    let sp = b.op("sp", Op::Unary(UnOp::Softplus, Move(u)));
+    let a_coef = b.op("A", Op::Load(at(p_amp), one.clone()));
+    let e = b.op("e", Op::Binary(BinOp::Mul, Move(sp), Move(a_coef)));
+    let e = b.op("e", Op::Scale(Move(e), -1.0));
+    let g = b.op("g", Op::Exp(Move(e)));
+    let bb = b.op("b", Op::Load(at(pb), one));
+    let beta = b.op("beta", Op::Unary(UnOp::Sigmoid, Move(bb)));
+
+    // One value per state row: a row of ones scaled by the head's gate.
+    let row = TileTy::new(DType::F32, &[1, v_dim], Space::Reg);
+    let spread = |b: &mut Builder, v, param| {
+        let ones = b.op("ones", Op::Fill(row.clone(), 1.0));
+        let out = b.op("out", Op::Binary(BinOp::Mul, Move(ones), Move(v)));
+        b.effect(Op::Store(
+            Move(out),
+            View {
+                param,
+                offset: vec![IdxExpr::scaled(head, 1, 0), IdxExpr::lit(0)],
+                shape: vec![1, v_dim],
+            },
+        ));
+    };
+    spread(&mut b, g, pg);
+    spread(&mut b, beta, pbeta);
+    b.finish()
+}
+
+/// The depthwise convolution that precedes the delta rule: four taps over
+/// the last four positions of every channel, then SiLU.
+///
+/// Decoding one token, the three previous positions are the layer's
+/// `conv` state; this kernel consumes them with the new row, writes the
+/// output, and leaves the state holding the last three rows again.
+///
+/// Parameters: `state [kernel - 1, channels]` (read and written), `x
+/// [1, channels]`, `w [kernel, channels]` — the file's `[channels, 1,
+/// kernel]` transposed by the loader, so a tap is one contiguous row —
+/// and `y [1, channels]`.
+pub fn build_conv_silu(channels: usize, kernel: usize, chunk: usize) -> Result<Program, String> {
+    use Arg::{Borrow, Move};
+    if kernel < 2 || chunk == 0 || !channels.is_multiple_of(chunk) {
+        return Err(format!(
+            "conv of {channels} channels in chunks of {chunk}, kernel {kernel}"
+        ));
+    }
+    let mut b = Builder::new(&format!("conv_silu_c{channels}k{kernel}_x{chunk}"));
+    let ps = b.param("state", DType::F32, &[kernel - 1, channels], true);
+    let px = b.param("x", DType::F32, &[1, channels], false);
+    let pw = b.param("w", DType::F32, &[kernel, channels], false);
+    let py = b.param("y", DType::F32, &[1, channels], true);
+    let col = b.grid(channels / chunk);
+
+    let tile = TileTy::new(DType::F32, &[1, chunk], Space::Reg);
+    let slice = |param, r: usize| View {
+        param,
+        offset: vec![IdxExpr::lit(r), IdxExpr::scaled(col, chunk, 0)],
+        shape: vec![1, chunk],
+    };
+    // Taps 0..kernel-2 read the state, the last reads the new row.
+    let mut acc = None;
+    for i in 0..kernel {
+        let src = if i + 1 < kernel {
+            slice(ps, i)
+        } else {
+            slice(px, 0)
+        };
+        let v = b.op("v", Op::Load(src, tile.clone()));
+        let wt = b.op("w", Op::Load(slice(pw, i), tile.clone()));
+        let t = b.op("t", Op::Binary(BinOp::Mul, Move(v), Move(wt)));
+        acc = Some(match acc {
+            None => t,
+            Some(a) => b.op("acc", Op::Binary(BinOp::Add, Move(a), Move(t))),
+        });
+    }
+    let acc = acc.expect("kernel >= 2");
+    let sg = b.op("sg", Op::Unary(UnOp::Sigmoid, Borrow(acc)));
+    let y = b.op("y", Op::Binary(BinOp::Mul, Move(acc), Move(sg)));
+    b.effect(Op::Store(Move(y), slice(py, 0)));
+
+    // Shift the window: the state becomes rows 1.. of itself, then `x`.
+    for i in 0..kernel - 1 {
+        let src = if i + 2 < kernel {
+            slice(ps, i + 1)
+        } else {
+            slice(px, 0)
+        };
+        let v = b.op("v", Op::Load(src, tile.clone()));
+        b.effect(Op::Store(Move(v), slice(ps, i)));
+    }
+    Ok(b.finish())
 }
 
 /// The delta rule in f64, for the tests: `state` is `[v_heads * v_dim, k_dim]`

@@ -1118,6 +1118,12 @@ impl Gen<'_> {
                     Op::Unary(UnOp::Sigmoid, _) => {
                         (ty.dtype, format!("1.0f / (1.0f + precise::exp(-{src}))"))
                     }
+                    Op::Unary(UnOp::Softplus, _) => (
+                        ty.dtype,
+                        format!(
+                            "max({src}, 0.0f) + precise::log(1.0f + precise::exp(-fabs({src})))"
+                        ),
+                    ),
                     _ => unreachable!(),
                 };
                 let name = self.declare_reg(x, &reg(dt, &ty.shape));
