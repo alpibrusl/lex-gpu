@@ -267,6 +267,147 @@ pub fn build_conv_silu(channels: usize, kernel: usize, chunk: usize) -> Result<P
     Ok(b.finish())
 }
 
+/// Qwen3.5's attention prologue: normalise each head, rotate the first
+/// `rot` of its dimensions, and (for queries) take the sigmoid of the gate
+/// the projection carries alongside them.
+///
+/// The rotation pairs `i` with `i + rot/2`, not adjacent elements as the
+/// GGUF Llama weights do, and leaves dimensions past `rot` alone — a
+/// quarter of a 256-wide head is rotated. `cos` and `sin` are `rot/2`
+/// wide, the host's tables for this position.
+///
+/// Parameters: `x [heads, 2 * head_dim]` for queries (the gate is the
+/// second half of each head) or `[heads, head_dim]` for keys, the norm
+/// weight `[1, head_dim]` (with Qwen's `1 +` already folded in by the
+/// loader), `cos` and `sin` `[1, rot/2]`, `y [heads, head_dim]` in `out`,
+/// and for queries `gate [heads, head_dim]`.
+pub fn build_qk_rope(
+    heads: usize,
+    head_dim: usize,
+    rot: usize,
+    gate: bool,
+    out: DType,
+    eps: f32,
+) -> Result<Program, String> {
+    use Arg::{Borrow, Move};
+    if rot == 0 || !rot.is_multiple_of(2) || rot > head_dim {
+        return Err(format!(
+            "{rot} rotated dimensions of a {head_dim}-wide head"
+        ));
+    }
+    let half = rot / 2;
+    let width = if gate { 2 * head_dim } else { head_dim };
+    let mut b = Builder::new(&format!(
+        "qk_rope_h{heads}d{head_dim}r{rot}{}",
+        if gate { "_gated" } else { "" }
+    ));
+    let px = b.param("x", DType::F32, &[heads, width], false);
+    let pw = b.param("nw", DType::F32, &[1, head_dim], false);
+    let pc = b.param("cos", DType::F32, &[1, half], false);
+    let psin = b.param("sin", DType::F32, &[1, half], false);
+    let py = b.param("y", out, &[heads, head_dim], true);
+    let pg = gate.then(|| b.param("gate", DType::F32, &[heads, head_dim], true));
+    let head = b.grid(heads);
+
+    let span = |param, col: usize, n: usize, rows: usize| View {
+        param,
+        offset: vec![
+            if rows == 1 {
+                IdxExpr::lit(0)
+            } else {
+                IdxExpr::scaled(head, 1, 0)
+            },
+            IdxExpr::lit(col),
+        ],
+        shape: vec![1, n],
+    };
+    let tile = |n| TileTy::new(DType::F32, &[1, n], Space::Reg);
+
+    // The head's own scale: one pass over its `head_dim` values.
+    let x = b.op("x", Op::Load(span(px, 0, head_dim, heads), tile(head_dim)));
+    let sq = b.op("sq", Op::Binary(BinOp::Mul, Borrow(x), Borrow(x)));
+    b.drop(x);
+    let ss = b.op("ss", Op::RowReduce(Reduce::Sum, Move(sq)));
+    let ms = b.op("ms", Op::Scale(Move(ss), 1.0 / head_dim as f32));
+    let e = b.op(
+        "eps",
+        Op::Fill(TileTy::new(DType::F32, &[1], Space::Reg), eps),
+    );
+    let t = b.op("t", Op::Binary(BinOp::Add, Move(ms), Move(e)));
+    let r = b.op("r", Op::Unary(UnOp::Rsqrt, Move(t)));
+
+    // Column ranges of the same row, each normalised by that scale. A tile
+    // cannot be sliced, so the halves are read from the parameter again.
+    let normed = |b: &mut Builder, col: usize, n: usize| {
+        let v = b.op("v", Op::Load(span(px, col, n, heads), tile(n)));
+        let w = b.op("w", Op::Load(span(pw, col, n, 1), tile(n)));
+        let v = b.op("v", Op::Binary(BinOp::Mul, Move(v), Move(w)));
+        b.op("v", Op::Binary(BinOp::Mul, Move(v), Borrow(r)))
+    };
+    let lo = normed(&mut b, 0, half);
+    let hi = normed(&mut b, half, half);
+    let tail = (rot < head_dim).then(|| normed(&mut b, rot, head_dim - rot));
+
+    // `x cos - y sin`, `y cos + x sin` over the rotated quarter.
+    let c = b.op("cos", Op::Load(span(pc, 0, half, 1), tile(half)));
+    let sn = b.op("sin", Op::Load(span(psin, 0, half, 1), tile(half)));
+    let ac = b.op("ac", Op::Binary(BinOp::Mul, Borrow(lo), Borrow(c)));
+    let bs = b.op("bs", Op::Binary(BinOp::Mul, Borrow(hi), Borrow(sn)));
+    let o1 = b.op("o1", Op::Binary(BinOp::Sub, Move(ac), Move(bs)));
+    let bc = b.op("bc", Op::Binary(BinOp::Mul, Move(hi), Move(c)));
+    let as_ = b.op("as", Op::Binary(BinOp::Mul, Move(lo), Move(sn)));
+    let o2 = b.op("o2", Op::Binary(BinOp::Add, Move(bc), Move(as_)));
+    b.drop(r);
+
+    let put = |b: &mut Builder, v, col: usize, n: usize| {
+        let v = if out == DType::F32 {
+            v
+        } else {
+            b.op("c", Op::Convert(Move(v), out))
+        };
+        b.effect(Op::Store(Move(v), span(py, col, n, heads)));
+    };
+    put(&mut b, o1, 0, half);
+    put(&mut b, o2, half, half);
+    if let Some(tail) = tail {
+        put(&mut b, tail, rot, head_dim - rot);
+    }
+    if let Some(pg) = pg {
+        let g = b.op(
+            "g",
+            Op::Load(span(px, head_dim, head_dim, heads), tile(head_dim)),
+        );
+        let g = b.op("g", Op::Unary(UnOp::Sigmoid, Move(g)));
+        b.effect(Op::Store(Move(g), span(pg, 0, head_dim, heads)));
+    }
+    Ok(b.finish())
+}
+
+/// Elementwise `y = a * b` over `n` values, `chunk` per instance: the
+/// attention output meeting its gate before the output projection.
+pub fn build_mul(n: usize, chunk: usize) -> Result<Program, String> {
+    use Arg::Move;
+    if chunk == 0 || !n.is_multiple_of(chunk) {
+        return Err(format!("{n} values do not split into chunks of {chunk}"));
+    }
+    let mut b = Builder::new(&format!("mul_{n}x{chunk}"));
+    let pa = b.param("a", DType::F32, &[1, n], false);
+    let pb = b.param("b", DType::F32, &[1, n], false);
+    let py = b.param("y", DType::F32, &[1, n], true);
+    let i = b.grid(n / chunk);
+    let span = |param| View {
+        param,
+        offset: vec![IdxExpr::lit(0), IdxExpr::scaled(i, chunk, 0)],
+        shape: vec![1, chunk],
+    };
+    let t = TileTy::new(DType::F32, &[1, chunk], Space::Reg);
+    let a = b.op("a", Op::Load(span(pa), t.clone()));
+    let bb = b.op("b", Op::Load(span(pb), t));
+    let y = b.op("y", Op::Binary(BinOp::Mul, Move(a), Move(bb)));
+    b.effect(Op::Store(Move(y), span(py)));
+    Ok(b.finish())
+}
+
 /// The delta rule in f64, for the tests: `state` is `[v_heads * v_dim, k_dim]`
 /// and is updated in place; returns `y [v_heads, v_dim]`. `q` and `k` have
 /// one row per value head, as [`DeltaNet::build_step`] takes them.
