@@ -1,8 +1,9 @@
 //! Qwen3.5's gated-delta state update, against the rule it implements.
 
 use tile_front::qwen::{
-    DeltaNet, build_conv_silu, build_delta_qk, build_gated_norm, build_gates, build_matvec_dense,
-    build_qk_rope, reference,
+    DeltaNet, build_conv_silu, build_conv_silu_rows, build_delta_qk, build_delta_qk_rows,
+    build_gated_norm, build_gated_norm_rows, build_gates, build_gates_rows, build_matvec_dense,
+    build_qk_rope, build_qk_rope_rows, reference,
 };
 use tile_front::{Tensor, check, run};
 use tile_ir::reference::fill_pattern_f32;
@@ -220,7 +221,7 @@ fn qk_rope_normalises_rotates_and_gates() {
         let cos = pattern(half, 72);
         let sin = pattern(half, 73);
         let mut t = vec![
-            Tensor::new(DType::F32, &[heads, width], &x),
+            Tensor::new(DType::F32, &[1, heads * width], &x),
             Tensor::new(DType::F32, &[1, hd], &nw),
             Tensor::new(DType::F32, &[1, half], &cos),
             Tensor::new(DType::F32, &[1, half], &sin),
@@ -423,4 +424,187 @@ fn a_batch_of_delta_steps_equals_the_same_steps_one_by_one() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(d == 0.0, "the state after the batch differs by {d:e}");
+}
+
+/// Every kernel of a layer, over a batch, against the same tokens fed one
+/// at a time. A speculative verify is only worth anything if the batch
+/// lands exactly where the sequence would have.
+#[test]
+fn every_batched_kernel_equals_the_tokens_one_by_one() {
+    let tokens = 3usize;
+    let same = |name: &str, got: &[f32], want: &[f32]| {
+        let d = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(d == 0.0, "{name}: batch differs from the sequence by {d:e}");
+    };
+
+    // The gates: nothing carries between tokens.
+    let (hv, dv) = (4usize, 8usize);
+    let batch = build_gates_rows(tokens, hv, dv);
+    check(&batch, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+    let a = pattern(tokens * hv, 110);
+    let bb = pattern(tokens * hv, 111);
+    let amp: Vec<f32> = pattern(hv, 112).iter().map(|x| 0.5 + x.abs()).collect();
+    let dt = pattern(hv, 113);
+    let mut bt = vec![
+        Tensor::new(DType::F32, &[tokens * hv], &a),
+        Tensor::new(DType::F32, &[tokens * hv], &bb),
+        Tensor::new(DType::F32, &[hv], &amp),
+        Tensor::new(DType::F32, &[hv], &dt),
+        Tensor::zeros(DType::F32, &[tokens * hv, dv]),
+        Tensor::zeros(DType::F32, &[tokens * hv, dv]),
+    ];
+    run(&batch, &mut bt).expect("gates batch");
+    for t in 0..tokens {
+        let mut st = vec![
+            Tensor::new(DType::F32, &[hv], &a[t * hv..(t + 1) * hv]),
+            Tensor::new(DType::F32, &[hv], &bb[t * hv..(t + 1) * hv]),
+            Tensor::new(DType::F32, &[hv], &amp),
+            Tensor::new(DType::F32, &[hv], &dt),
+            Tensor::zeros(DType::F32, &[hv, dv]),
+            Tensor::zeros(DType::F32, &[hv, dv]),
+        ];
+        run(&build_gates(hv, dv), &mut st).expect("gates step");
+        for (i, out) in [4, 5].into_iter().enumerate() {
+            let n = hv * dv;
+            same(
+                &format!("gates {i} token {t}"),
+                &bt[out].data[t * n..(t + 1) * n],
+                &st[out].data,
+            );
+        }
+    }
+
+    // The convolution: its window slides through the batch.
+    let (ch, kern) = (32usize, 4usize);
+    let batch = build_conv_silu_rows(tokens, ch, kern, 8).unwrap();
+    check(&batch, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+    let w = pattern(kern * ch, 114);
+    let x = pattern(tokens * ch, 115);
+    let start = pattern((kern - 1) * ch, 116);
+    let mut bt = vec![
+        Tensor::new(DType::F32, &[kern - 1, ch], &start),
+        Tensor::new(DType::F32, &[tokens, ch], &x),
+        Tensor::new(DType::F32, &[kern, ch], &w),
+        Tensor::zeros(DType::F32, &[tokens, ch]),
+    ];
+    run(&batch, &mut bt).expect("conv batch");
+    let mut state = start.clone();
+    for t in 0..tokens {
+        let mut st = vec![
+            Tensor::new(DType::F32, &[kern - 1, ch], &state),
+            Tensor::new(DType::F32, &[1, ch], &x[t * ch..(t + 1) * ch]),
+            Tensor::new(DType::F32, &[kern, ch], &w),
+            Tensor::zeros(DType::F32, &[1, ch]),
+        ];
+        run(&build_conv_silu(ch, kern, 8).unwrap(), &mut st).expect("conv step");
+        same(
+            &format!("conv token {t}"),
+            &bt[3].data[t * ch..(t + 1) * ch],
+            &st[3].data,
+        );
+        state = st[0].data.clone();
+    }
+    same("conv window", &bt[0].data, &state);
+
+    // The queries and keys, and the gated norm: independent per token.
+    let (hk, per, dk) = (2usize, 2usize, 16usize);
+    let width = 2 * hk * dk + hk * per * dk;
+    let batch = build_delta_qk_rows(tokens, hk, per, dk, width, 0, 0.5, 1e-6).unwrap();
+    let x = pattern(tokens * width, 117);
+    let mut bt = vec![
+        Tensor::new(DType::F32, &[tokens, width], &x),
+        Tensor::zeros(DType::F32, &[tokens * hk * per, dk]),
+    ];
+    run(&batch, &mut bt).expect("qk batch");
+    for t in 0..tokens {
+        let mut st = vec![
+            Tensor::new(DType::F32, &[1, width], &x[t * width..(t + 1) * width]),
+            Tensor::zeros(DType::F32, &[hk * per, dk]),
+        ];
+        run(
+            &build_delta_qk(hk, per, dk, width, 0, 0.5, 1e-6).unwrap(),
+            &mut st,
+        )
+        .expect("qk step");
+        let n = hk * per * dk;
+        same(
+            &format!("qk token {t}"),
+            &bt[1].data[t * n..(t + 1) * n],
+            &st[1].data,
+        );
+    }
+
+    let batch = build_gated_norm_rows(tokens, hv, dv, 1e-6);
+    let y = pattern(tokens * hv * dv, 118);
+    let z = pattern(tokens * hv * dv, 119);
+    let nw = pattern(dv, 120);
+    let mut bt = vec![
+        Tensor::new(DType::F32, &[tokens * hv, dv], &y),
+        Tensor::new(DType::F32, &[1, dv], &nw),
+        Tensor::new(DType::F32, &[tokens * hv, dv], &z),
+        Tensor::zeros(DType::F32, &[tokens * hv, dv]),
+    ];
+    run(&batch, &mut bt).expect("norm batch");
+    for t in 0..tokens {
+        let n = hv * dv;
+        let mut st = vec![
+            Tensor::new(DType::F32, &[hv, dv], &y[t * n..(t + 1) * n]),
+            Tensor::new(DType::F32, &[1, dv], &nw),
+            Tensor::new(DType::F32, &[hv, dv], &z[t * n..(t + 1) * n]),
+            Tensor::zeros(DType::F32, &[hv, dv]),
+        ];
+        run(&build_gated_norm(hv, dv, 1e-6), &mut st).expect("norm step");
+        same(
+            &format!("gated norm token {t}"),
+            &bt[3].data[t * n..(t + 1) * n],
+            &st[3].data,
+        );
+    }
+
+    // The attention prologue: each token rotates at its own position.
+    let (heads, hd, rot) = (2usize, 16usize, 8usize);
+    let batch = build_qk_rope_rows(tokens, heads, hd, rot, true, DType::F32, 1e-6).unwrap();
+    check(&batch, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+    let x = pattern(tokens * heads * 2 * hd, 121);
+    let nw = pattern(hd, 122);
+    let cos = pattern(tokens * rot / 2, 123);
+    let sin = pattern(tokens * rot / 2, 124);
+    let mut bt = vec![
+        Tensor::new(DType::F32, &[tokens, heads * 2 * hd], &x),
+        Tensor::new(DType::F32, &[1, hd], &nw),
+        Tensor::new(DType::F32, &[tokens, rot / 2], &cos),
+        Tensor::new(DType::F32, &[tokens, rot / 2], &sin),
+        Tensor::zeros(DType::F32, &[tokens * heads, hd]),
+        Tensor::zeros(DType::F32, &[tokens * heads, hd]),
+    ];
+    run(&batch, &mut bt).expect("rope batch");
+    for t in 0..tokens {
+        let row = heads * 2 * hd;
+        let half = rot / 2;
+        let mut st = vec![
+            Tensor::new(DType::F32, &[1, row], &x[t * row..(t + 1) * row]),
+            Tensor::new(DType::F32, &[1, hd], &nw),
+            Tensor::new(DType::F32, &[1, half], &cos[t * half..(t + 1) * half]),
+            Tensor::new(DType::F32, &[1, half], &sin[t * half..(t + 1) * half]),
+            Tensor::zeros(DType::F32, &[heads, hd]),
+            Tensor::zeros(DType::F32, &[heads, hd]),
+        ];
+        run(
+            &build_qk_rope(heads, hd, rot, true, DType::F32, 1e-6).unwrap(),
+            &mut st,
+        )
+        .expect("rope step");
+        let n = heads * hd;
+        for out in [4, 5] {
+            same(
+                &format!("rope {out} token {t}"),
+                &bt[out].data[t * n..(t + 1) * n],
+                &st[out].data,
+            );
+        }
+    }
 }

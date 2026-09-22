@@ -426,7 +426,7 @@ fn qwen_qk_rope_matches_the_interpreter() {
         let width = if gate { 2 * hd } else { hd };
         let prog = build_qk_rope(heads, hd, rot, gate, DType::F16, 1e-6).unwrap();
         let mut t = vec![
-            Tensor::new(DType::F32, &[heads, width], &pattern(heads * width, 50)),
+            Tensor::new(DType::F32, &[1, heads * width], &pattern(heads * width, 50)),
             Tensor::new(
                 DType::F32,
                 &[1, hd],
