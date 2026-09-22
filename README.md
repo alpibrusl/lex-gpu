@@ -17,6 +17,11 @@ flat with context, as Ollama's is. That's 12× and 20× faster than where
 correctness left it. Prefill has a correct batched path, but it's 5–8×
 short of Ollama.
 
+**Qwen3.5-27B** (`qwen3.8:27b-mlx`, NVFP4, the model in daily use here)
+also runs on these kernels now, at 21.8 tok/s against Ollama's 58–76, with
+the same answers. [`docs/qwen.md`](docs/qwen.md) has the shape of the
+model, where the time goes, and what matching Ollama needs.
+
 | Phase | State | Details |
 | --- | --- | --- |
 | **P0** Spine | closed | RMSNorm at 98.1% of the copy ceiling (463.6 GB/s) on an M4 Max, matching the reference. [`docs/P0.md`](docs/P0.md) |
