@@ -338,3 +338,16 @@ Read the diff before committing it.
 
 [`docs/P1.md`](docs/P1.md) lists exactly what the type system does and does not
 cover yet.
+
+## Licence
+
+Copyright © 2026 Alfonso Sastre
+
+Licensed under the EUPL, Version 1.2 — see [`LICENSE`](LICENSE).
+
+The EUPL is copyleft: a derivative work must be released under the EUPL or one
+of the compatible licences in its Appendix (GPL, AGPL, LGPL, MPL-2.0, EPL,
+OSL, CeCILL, LiLiQ). Apache-2.0 and MIT are *not* on that list, so code from
+Apache- or MIT-licensed projects cannot be copied into this one, and this code
+cannot be vendored into an Apache-2.0 project. Everything here is written from
+the published behaviour of other kernels, not from their source.
