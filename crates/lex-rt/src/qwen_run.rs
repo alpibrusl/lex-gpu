@@ -175,6 +175,16 @@ mod gpu {
         }
     }
 
+    /// RMSNorm on the host, for the draft head's two pre-norms: 5120
+    /// values each, against the 239 MB the head then reads.
+    fn rms_into(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
+        let mean = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+        let inv = 1.0 / (mean + eps).sqrt();
+        for ((o, &v), &g) in out.iter_mut().zip(x).zip(w) {
+            *o = v * inv * g;
+        }
+    }
+
     fn floats(gpu: &Gpu, store: &Store, name: &str) -> Result<Buffer, String> {
         let (v, _) = store.floats(name)?;
         Ok(gpu.upload(&v))
@@ -225,6 +235,27 @@ mod gpu {
     struct Layer {
         mixer: Mixer,
         ffn: Ffn,
+    }
+
+    /// The checkpoint's multi-token-prediction head.
+    ///
+    /// One ordinary attention layer over a cache of its own, fed by a
+    /// projection that fuses the model's hidden state at `t` with the
+    /// embedding of the token it just produced. Its output goes through
+    /// the *shared* `lm_head`, so a draft costs the head plus a second
+    /// pass over `lm_head`: 239 + 715 MB, 6.6% of a model pass.
+    ///
+    /// Both of its conventions were settled by measurement rather than by
+    /// documentation, because `mlx_lm` drops every `mtp.` weight before it
+    /// normalises anything (see [`crate::qwen::SHIFTED`]): every norm here
+    /// is a delta from 1, and the **embedding leads** the concatenation.
+    /// Reversed, the head drafts correctly 0.4% of the time instead of 97%.
+    struct Mtp {
+        pre_h: Vec<f32>,
+        pre_e: Vec<f32>,
+        fc: QBuf,
+        layer: Layer,
+        norm: Buffer,
     }
 
     /// Every pipeline a step dispatches.
@@ -314,6 +345,12 @@ mod gpu {
         embed: Vec<f32>,
         out_norm: Buffer,
         lm_head: QBuf,
+        /// The draft head, when the checkpoint ships one.
+        mtp: Option<Mtp>,
+        /// `fc`'s input: the two normalised halves, embedding first.
+        mtp_in: Buffer,
+        /// The draft head's own cache length.
+        mtp_pos: usize,
         acts: Acts,
         /// Activations for a batch, and the kernels for each size seen.
         bacts: Acts,
@@ -351,6 +388,11 @@ mod gpu {
                     want.push((cfg.hidden, cfg.kv_heads * cfg.head_dim, false));
                     want.push((cfg.heads * cfg.head_dim, cfg.hidden, true));
                 }
+            }
+            // `fc` is the only shape the draft head adds; its attention
+            // and feed-forward match the model's own.
+            if store.has("mtp.fc.weight") {
+                want.push((2 * cfg.hidden, cfg.hidden, false));
             }
             for key in want {
                 if let std::collections::hash_map::Entry::Vacant(slot) = mv.entry(key) {
@@ -514,6 +556,44 @@ mod gpu {
                 layers.push(Layer { mixer, ffn });
             }
 
+            // The draft head, when the checkpoint ships one. Its attention
+            // keeps a cache the same length as the model's, because it sees
+            // the same sequence.
+            let mtp = if store.has("mtp.fc.weight") {
+                let a = "mtp.layers.0.self_attn.";
+                Some(Mtp {
+                    pre_h: store.floats("mtp.pre_fc_norm_hidden.weight")?.0,
+                    pre_e: store.floats("mtp.pre_fc_norm_embedding.weight")?.0,
+                    fc: QBuf::load(&gpu, &store, "mtp.fc.weight")?,
+                    layer: Layer {
+                        mixer: Mixer::Attn(Box::new(Attn {
+                            norm: floats(&gpu, &store, "mtp.layers.0.input_layernorm.weight")?,
+                            q: QBuf::load(&gpu, &store, &format!("{a}q_proj.weight"))?,
+                            k: QBuf::load(&gpu, &store, &format!("{a}k_proj.weight"))?,
+                            v: QBuf::load(&gpu, &store, &format!("{a}v_proj.weight"))?,
+                            o: QBuf::load(&gpu, &store, &format!("{a}o_proj.weight"))?,
+                            q_norm: floats(&gpu, &store, &format!("{a}q_norm.weight"))?,
+                            k_norm: floats(&gpu, &store, &format!("{a}k_norm.weight"))?,
+                            kcache: gpu.zeroed::<f16>(cfg.kv_heads * cap * cfg.head_dim),
+                            vcache: gpu.zeroed::<f16>(cfg.kv_heads * cap * cfg.head_dim),
+                        })),
+                        ffn: Ffn {
+                            norm: floats(
+                                &gpu,
+                                &store,
+                                "mtp.layers.0.post_attention_layernorm.weight",
+                            )?,
+                            gate: QBuf::load(&gpu, &store, "mtp.layers.0.mlp.gate_proj.weight")?,
+                            up: QBuf::load(&gpu, &store, "mtp.layers.0.mlp.up_proj.weight")?,
+                            down: QBuf::load(&gpu, &store, "mtp.layers.0.mlp.down_proj.weight")?,
+                        },
+                    },
+                    norm: floats(&gpu, &store, "mtp.norm.weight")?,
+                })
+            } else {
+                None
+            };
+
             let (embed, _) = store.floats("model.language_model.embed_tokens.weight")?;
             let acts_for = |t: usize| {
                 let f = |n: usize| gpu.zeroed::<f32>(t * n);
@@ -554,6 +634,7 @@ mod gpu {
             let bacts = acts_for(MAX_BATCH);
             let out_norm = floats(&gpu, &store, "model.language_model.norm.weight")?;
             let lm_head = QBuf::load(&gpu, &store, "lm_head.weight")?;
+            let mtp_in = gpu.zeroed::<f32>(2 * cfg.hidden);
             Ok(Runner {
                 gpu,
                 cfg,
@@ -562,6 +643,9 @@ mod gpu {
                 embed,
                 out_norm,
                 lm_head,
+                mtp,
+                mtp_in,
+                mtp_pos: 0,
                 acts,
                 bacts,
                 batches: HashMap::new(),
@@ -587,6 +671,133 @@ mod gpu {
         /// it carries its own `pre_fc_norm_hidden`, so it wants the
         /// unnormalised state. Reading it out is how the draft head is
         /// measured without a second forward pass.
+        /// Does this checkpoint carry a draft head?
+        pub fn has_mtp(&self) -> bool {
+            self.mtp.is_some()
+        }
+
+        /// Draft the next `depth` tokens with the checkpoint's own
+        /// multi-token-prediction head, continuing from the last step.
+        ///
+        /// `last` is the token that step produced. Each draft fuses a
+        /// hidden state with the embedding of the token before it, so the
+        /// first uses the model's own hidden state and the rest use the
+        /// head's, which is what lets one head draft more than one token.
+        ///
+        /// A draft is the head plus a pass over `lm_head`, about 6.6% of a
+        /// model pass, so depth is not free: it buys tokens only while
+        /// acceptance holds up.
+        ///
+        /// The head's cache is its own and advances with `mtp_pos`;
+        /// [`Self::reset`] clears it. Nothing here touches the model's
+        /// state, so a rejected draft costs only the time.
+        pub fn draft(&mut self, depth: usize, last: u32) -> Result<Vec<u32>, String> {
+            if self.mtp.is_none() || depth == 0 {
+                return Ok(vec![]);
+            }
+            let c = self.cfg.clone();
+            let mut h = self.hidden();
+            let mut tok = last;
+            let mut out = Vec::with_capacity(depth);
+            for _ in 0..depth {
+                if self.mtp_pos >= self.cap {
+                    break;
+                }
+                // The two halves, normalised on the host: 10240 values
+                // against the 239 MB the head is about to read.
+                let m = self.mtp.as_ref().expect("checked");
+                let row = tok as usize * c.hidden;
+                let mut fused = vec![0.0f32; 2 * c.hidden];
+                rms_into(
+                    &self.embed[row..row + c.hidden],
+                    &m.pre_e,
+                    c.eps,
+                    &mut fused[..c.hidden],
+                );
+                rms_into(&h, &m.pre_h, c.eps, &mut fused[c.hidden..]);
+                self.gpu.write(&self.mtp_in, 0, &fused);
+
+                let (cos, sin) = rope_tables(self.mtp_pos, c.rot, c.theta);
+                self.gpu.write(&self.acts.cos, 0, &cos);
+                self.gpu.write(&self.acts.sin, 0, &sin);
+                self.gpu
+                    .write(&self.acts.scalars_pos, 0, &[self.mtp_pos as u32]);
+                let len = self.mtp_pos + 1;
+                self.gpu.write(
+                    &self.acts.scalars_attn,
+                    0,
+                    &[len as u32, len.div_ceil(ATTN_BK) as u32],
+                );
+
+                let plan = self.mtp_plan();
+                let steps: Vec<Step<'_>> =
+                    plan.iter().map(|(p, b)| (*p, b.as_slice(), None)).collect();
+                self.gpu.run_launches(&steps);
+                drop(plan);
+                self.mtp_pos += 1;
+
+                let mut logits = vec![0.0f32; c.vocab];
+                self.gpu.download(&self.acts.logits, &mut logits);
+                tok = (0..logits.len())
+                    .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+                    .expect("logits") as u32;
+                out.push(tok);
+                // The head's own hidden state carries the next draft.
+                h = self.hidden();
+            }
+            Ok(out)
+        }
+
+        /// The draft head's dispatches: `fc`, then one attention layer and
+        /// its feed-forward, then the shared norm and `lm_head`. The same
+        /// shape as any attention layer in the model, which is why it needs
+        /// no kernels of its own.
+        fn mtp_plan(&self) -> Vec<(&Pipeline, Vec<&Buffer>)> {
+            let (m, a, k) = (
+                self.mtp.as_ref().expect("checked by the caller"),
+                &self.acts,
+                &self.k,
+            );
+            let at = match &m.layer.mixer {
+                Mixer::Attn(at) => at,
+                Mixer::Linear(_) => unreachable!("the draft head is an attention layer"),
+            };
+            let f = &m.layer.ffn;
+            vec![
+                (self.mv(&m.fc, false), m.fc.bind(&self.mtp_in, None, &a.x)),
+                (&k.rms, vec![&a.x, &at.norm, &a.h]),
+                (self.mv(&at.q, false), at.q.bind(&a.h, None, &a.q32)),
+                (self.mv(&at.k, false), at.k.bind(&a.h, None, &a.k32)),
+                (self.mv(&at.v, false), at.v.bind(&a.h, None, &a.v32)),
+                (
+                    &k.rope_q,
+                    vec![&a.q32, &at.q_norm, &a.cos, &a.sin, &a.q16, &a.gate],
+                ),
+                (&k.rope_k, vec![&a.k32, &at.k_norm, &a.cos, &a.sin, &a.k16]),
+                (&k.kv_k, vec![&a.k16, &at.kcache, &a.scalars_pos]),
+                (&k.kv_v, vec![&a.v32, &at.vcache, &a.scalars_pos]),
+                (
+                    &k.attn,
+                    vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
+                ),
+                (&k.mul, vec![&a.attn, &a.gate, &a.gated]),
+                (self.mv(&at.o, true), at.o.bind(&a.gated, Some(&a.x), &a.x2)),
+                (&k.rms, vec![&a.x2, &f.norm, &a.h]),
+                (self.mv(&f.gate, false), f.gate.bind(&a.h, None, &a.ffn_g)),
+                (self.mv(&f.up, false), f.up.bind(&a.h, None, &a.ffn_u)),
+                (&k.silu, vec![&a.ffn_g, &a.ffn_u, &a.ffn_a]),
+                (
+                    self.mv(&f.down, true),
+                    f.down.bind(&a.ffn_a, Some(&a.x2), &a.x),
+                ),
+                (&k.rms, vec![&a.x, &m.norm, &a.h]),
+                (
+                    self.mv(&self.lm_head, false),
+                    self.lm_head.bind(&a.h, None, &a.logits),
+                ),
+            ]
+        }
+
         pub fn hidden(&self) -> Vec<f32> {
             let mut h = vec![0.0f32; self.cfg.hidden];
             self.gpu.download(&self.acts.x, &mut h);
@@ -598,6 +809,7 @@ mod gpu {
         /// layer's cache is simply overwritten as positions are refilled.
         pub fn reset(&mut self) {
             self.pos = 0;
+            self.mtp_pos = 0;
             let (hv, dv, dk) = (self.cfg.v_heads, self.cfg.v_dim, self.cfg.k_dim);
             let zeros = vec![0.0f32; hv * dv * dk];
             let win = vec![0.0f32; (self.cfg.conv_kernel - 1) * self.cfg.conv_channels()];
