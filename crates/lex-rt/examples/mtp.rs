@@ -59,6 +59,14 @@ fn main() -> Result<(), String> {
             .expect("logits") as u32
     };
 
+    // LEX_SKIP=attention leaves that call site out, so the difference
+    // says what it costs at this context. Decode on this model should
+    // barely move with context -- 48 of 64 layers carry a fixed-size
+    // state -- so whatever does move is in the other 16.
+    if let Ok(s) = std::env::var("LEX_SKIP") {
+        rt.skip = s.split(',').map(String::from).collect();
+    }
+
     let mut logits = vec![];
     for &t in &ids {
         logits = rt.step(t)?;
