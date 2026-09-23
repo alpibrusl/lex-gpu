@@ -282,12 +282,13 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
     if arena_bytes > 0 {
         let _ = writeln!(
             s,
-            "    threadgroup float4 arena4[{}];\n    threadgroup uchar* arena = (threadgroup uchar*)arena4;",
-            arena_bytes.div_ceil(16)
+            "    {}\n    {p} arena = ({p})arena4;",
+            g.d.shared_array("float4", "arena4", arena_bytes.div_ceil(16)),
+            p = g.d.shared_ptr("uchar")
         );
     }
     if g.scratch > 0 {
-        let _ = writeln!(s, "    threadgroup float scratch[{}];", g.scratch);
+        let _ = writeln!(s, "    {}", g.d.shared_array("float", "scratch", g.scratch));
     }
     if g.fp4 {
         // The sixteen E2M1 values, one per lane of the simdgroup, read
@@ -471,7 +472,7 @@ impl Gen<'_> {
     fn declare_reg(&mut self, x: Var, ty: &TileTy) -> String {
         let name = v(x);
         let per = self.per(ty.elems());
-        self.line(&format!("{} {name}[{per}];", ty.dtype.msl_scalar()));
+        self.line(&format!("{} {name}[{per}];", self.d.scalar(ty.dtype)));
         self.locs.insert(x, Loc::Reg(name.clone(), ty.clone()));
         name
     }
@@ -480,9 +481,10 @@ impl Gen<'_> {
         let name = v(x);
         let off = self.arena.next_multiple_of(16);
         self.arena = off + ty.bytes();
-        let st = ty.dtype.msl_scalar();
+        let st = self.d.scalar(ty.dtype);
         self.line(&format!(
-            "threadgroup {st}* {name} = (threadgroup {st}*)(arena + {off});"
+            "{p} {name} = ({p})(arena + {off});",
+            p = self.d.shared_ptr(st)
         ));
         self.locs.insert(x, Loc::Tg(name.clone(), ty.clone()));
         name
@@ -612,8 +614,8 @@ impl Gen<'_> {
                         (Loc::Tg(_, t), Loc::Tg(sn, _)) if aliases_other => {
                             let tmp = format!("{}_next", storage(dst));
                             self.line(&format!(
-                                "threadgroup {}* {tmp} = {sn};",
-                                t.dtype.msl_scalar()
+                                "{} {tmp} = {sn};",
+                                self.d.shared_ptr(self.d.scalar(t.dtype))
                             ));
                             staged.push((dst.clone(), Loc::Tg(tmp, t.clone())));
                         }
@@ -664,7 +666,7 @@ impl Gen<'_> {
                         .ok_or("map_each yields more arrays than it walks")?;
                     let name = v(r);
                     let per = self.per(t.elems());
-                    self.line(&format!("{} {name}[{n}][{per}];", t.dtype.msl_scalar()));
+                    self.line(&format!("{} {name}[{n}][{per}];", self.d.scalar(t.dtype)));
                     outs.push((r, name, t));
                 }
                 let iname = v(*index);
@@ -677,7 +679,7 @@ impl Gen<'_> {
                     let pname = v(p);
                     self.line(&format!(
                         "thread {}* {pname} = {name}[{iname}];",
-                        t.dtype.msl_scalar()
+                        self.d.scalar(t.dtype)
                     ));
                     self.locs.insert(p, Loc::Reg(pname, t.clone()));
                 }
@@ -713,12 +715,15 @@ impl Gen<'_> {
             Loc::RegArr(_, t, n) => {
                 let name = v(p);
                 let per = self.per(t.elems());
-                self.line(&format!("{} {name}[{n}][{per}];", t.dtype.msl_scalar()));
+                self.line(&format!("{} {name}[{n}][{per}];", self.d.scalar(t.dtype)));
                 self.locs.insert(p, Loc::RegArr(name, t.clone(), *n));
             }
             Loc::Tg(_, t) => {
                 let name = v(p);
-                self.line(&format!("threadgroup {}* {name};", t.dtype.msl_scalar()));
+                self.line(&format!(
+                    "{} {name};",
+                    self.d.shared_ptr(self.d.scalar(t.dtype))
+                ));
                 self.locs.insert(p, Loc::Tg(name, t.clone()));
             }
             Loc::Lazy(_, t) => {
@@ -764,7 +769,7 @@ impl Gen<'_> {
                     t.elems(),
                     &[format!(
                         "{d}[k] = {}({});",
-                        t.dtype.msl_scalar(),
+                        self.d.scalar(t.dtype),
                         at_index(&e, "e")
                     )],
                 );
@@ -790,7 +795,7 @@ impl Gen<'_> {
             }
             Op::Fill(t, val) => {
                 let x = dst.ok_or("fill without a result")?;
-                let st = t.dtype.msl_scalar();
+                let st = self.d.scalar(t.dtype);
                 match t.space {
                     Space::Threadgroup => {
                         let name = self.declare_tg(x, t);
@@ -806,7 +811,7 @@ impl Gen<'_> {
             }
             Op::Load(view, t) => {
                 let x = dst.ok_or("load without a result")?;
-                let st = t.dtype.msl_scalar();
+                let st = self.d.scalar(t.dtype);
                 let src = self.addr(view, "e")?;
                 match t.space {
                     Space::Threadgroup => {
@@ -846,7 +851,7 @@ impl Gen<'_> {
                 self.locs.insert(x, l);
             }
             Op::Store(a, view) => {
-                let dt = self.prog.params[view.param].dtype.msl_scalar();
+                let dt = self.d.scalar(self.prog.params[view.param].dtype);
                 let n = view.shape.iter().product();
                 let ops = self.operands(&[*a], &[true], n)?;
                 let target = self.addr(view, "e")?;
@@ -879,7 +884,7 @@ impl Gen<'_> {
                     BinOp::Div => format!("({l} / {r})"),
                     BinOp::Max => format!("max({l}, {r})"),
                 };
-                let e = format!("{}({e})", t.dtype.msl_scalar());
+                let e = format!("{}({e})", self.d.scalar(t.dtype));
                 self.locs.insert(x, Loc::Lazy(e, reg(t.dtype, &t.shape)));
             }
             Op::Convert(a, dt) if self.lazy(*a).is_some() => {
@@ -1113,7 +1118,7 @@ impl Gen<'_> {
                     n,
                     &[format!(
                         "{name}[k] = {}(({f} + e % {cols}u) >= {lim} ? -INFINITY : {src});",
-                        ty.dtype.msl_scalar()
+                        self.d.scalar(ty.dtype)
                     )],
                 );
             }
@@ -1126,7 +1131,7 @@ impl Gen<'_> {
                 let name = self.declare_reg(x, &reg(ty.dtype, &ty.shape));
                 self.owned(
                     n,
-                    &[format!("{name}[k] = {}({src});", ty.dtype.msl_scalar())],
+                    &[format!("{name}[k] = {}({src});", self.d.scalar(ty.dtype))],
                 );
             }
             Op::Dequant(q, s, m, group) => {
@@ -1507,7 +1512,7 @@ impl Gen<'_> {
                             let t = t.clone();
                             let n = format!("{}_m", v(e));
                             let per = self.per(t.elems());
-                            self.line(&format!("{} {n}[{per}];", t.dtype.msl_scalar()));
+                            self.line(&format!("{} {n}[{per}];", self.d.scalar(t.dtype)));
                             self.assign(&Loc::Reg(n.clone(), t.clone()), &l)?;
                             (n, t)
                         }
@@ -1520,7 +1525,7 @@ impl Gen<'_> {
                 let per = self.per(t.elems());
                 self.line(&format!(
                     "{} {name}[{}][{per}];",
-                    t.dtype.msl_scalar(),
+                    self.d.scalar(t.dtype),
                     elems.len()
                 ));
                 for (i, (n, _)) in elems.iter().enumerate() {

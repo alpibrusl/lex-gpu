@@ -20,6 +20,8 @@
 //! behind this trait changed nothing: they are byte-identical across the
 //! refactor, or the refactor is wrong.
 
+use lex_ir::DType;
+
 /// How a target spells the primitives the lowering emits.
 ///
 /// Every method returns text rather than writing, so a dialect stays a pure
@@ -41,6 +43,21 @@ pub trait Dialect {
     /// primitive differs in that respect has to say so here rather than let
     /// the lowering assume Metal's.
     fn shuffle_down(&self, value: &str, delta: &str) -> String;
+
+    /// Scalar type name.
+    fn scalar(&self, d: DType) -> &'static str;
+
+    /// A pointer into threadgroup / shared memory.
+    ///
+    /// Metal puts the address space in the *type*, so a pointer to shared
+    /// memory is a different type from a pointer to device memory and the
+    /// compiler enforces it. CUDA puts it on the *declaration* and the
+    /// pointer is plain, so the same mistake compiles. A dialect cannot fix
+    /// that, but the lowering should not have to know which world it is in.
+    fn shared_ptr(&self, ty: &str) -> String;
+
+    /// Declare an array in threadgroup / shared memory.
+    fn shared_array(&self, ty: &str, name: &str, len: usize) -> String;
 }
 
 /// Metal Shading Language.
@@ -58,6 +75,18 @@ impl Dialect for Msl {
 
     fn shuffle_down(&self, value: &str, delta: &str) -> String {
         format!("simd_shuffle_down({value}, {delta})")
+    }
+
+    fn scalar(&self, d: DType) -> &'static str {
+        d.msl_scalar()
+    }
+
+    fn shared_ptr(&self, ty: &str) -> String {
+        format!("threadgroup {ty}*")
+    }
+
+    fn shared_array(&self, ty: &str, name: &str, len: usize) -> String {
+        format!("threadgroup {ty} {name}[{len}];")
     }
 }
 
@@ -84,6 +113,22 @@ impl Dialect for Cuda {
     fn shuffle_down(&self, value: &str, delta: &str) -> String {
         format!("__shfl_down_sync(0xffffffffu, {value}, {delta})")
     }
+
+    fn scalar(&self, d: DType) -> &'static str {
+        match d {
+            DType::F16 => "__half",
+            DType::F32 => "float",
+            DType::I8 => "char",
+        }
+    }
+
+    fn shared_ptr(&self, ty: &str) -> String {
+        format!("{ty}*")
+    }
+
+    fn shared_array(&self, ty: &str, name: &str, len: usize) -> String {
+        format!("__shared__ {ty} {name}[{len}];")
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +144,12 @@ mod tests {
         assert_ne!(m.barrier(), c.barrier());
         assert_ne!(m.shuffle("v", "i"), c.shuffle("v", "i"));
         assert_ne!(m.shuffle_down("v", "d"), c.shuffle_down("v", "d"));
+        assert_ne!(m.scalar(DType::F16), c.scalar(DType::F16));
+        assert_ne!(m.shared_ptr("float"), c.shared_ptr("float"));
+        assert_ne!(
+            m.shared_array("float", "s", 8),
+            c.shared_array("float", "s", 8)
+        );
     }
 
     #[test]
