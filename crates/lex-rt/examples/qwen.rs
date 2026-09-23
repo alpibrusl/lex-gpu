@@ -1,4 +1,4 @@
-//! Decode with Qwen3.5 on lex kernels.
+//! Decode with Qwen3.8 on lex kernels.
 //!
 //! cargo run --release -p lex-rt --example qwen -- --steps 8
 

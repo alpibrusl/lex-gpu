@@ -1,8 +1,14 @@
-# Qwen3.5-27B on lex kernels
+# Qwen3.8-27B on lex kernels
 
-The model in daily use here is `qwen3.8:27b-mlx`: Qwen3.5, 27.8B parameters
+The model in daily use here is `qwen3.8:27b-mlx`: **Qwen3.8**, 27.8B parameters
 dense, NVFP4 weights, served by Ollama's MLX engine. It now runs end to end
 on kernels this compiler generates.
+
+Two names, and they are not the same thing: the *model* is Qwen3.8, and the
+*architecture* it implements is `qwen3_5` — that is what `config.json` says
+(`model_type: qwen3_5`, `Qwen3_5ForConditionalGeneration`) and why
+`mlx_lm/models/qwen3_5.py` is the file to read. Earlier versions of these
+notes used "Qwen3.5" as the model name, which is wrong.
 
 ## Status
 
@@ -30,7 +36,7 @@ not either.
 
 Every layer ends in the same gated feed-forward (5120 → 17408 → 5120).
 
-One thing that is easy to get wrong and silent when you do: Qwen3.5's
+One thing that is easy to get wrong and silent when you do: Qwen3.8's
 RMSNorm is `x * (1 + w)` and the checkpoint stores `w` as a delta from 1,
 for every norm except the gated one inside a linear-attention layer.
 `mlx_lm` patches the weights on load, so its module code multiplies by `w`

@@ -1,4 +1,4 @@
-//! Qwen3.5's gated-delta state update, against the rule it implements.
+//! Qwen3.8's gated-delta state update, against the rule it implements.
 
 use lex_front::qwen::{
     DeltaNet, build_conv_silu, build_conv_silu_rows, build_delta_qk, build_delta_qk_rows,
@@ -19,7 +19,7 @@ fn pattern(n: usize, seed: u32) -> Vec<f32> {
 /// the decay or the rank-one update compounds instead of cancelling.
 #[test]
 fn delta_state_matches_the_rule_over_successive_steps() {
-    // Qwen3.5-27B's shape, shrunk: the same 3:1 value/key head ratio.
+    // Qwen3.8-27B's shape, shrunk: the same 3:1 value/key head ratio.
     let c = DeltaNet::packed(6, 2, 32, 16, 4);
     let prog = c.build_step().unwrap();
     check(&prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));

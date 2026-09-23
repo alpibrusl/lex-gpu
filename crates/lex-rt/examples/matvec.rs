@@ -29,7 +29,7 @@ fn main() -> Result<(), String> {
         "matrix", "n_in", "n_out", "MB", "us", "GB/s"
     );
     let shapes = [
-        // Qwen3.5-27B (MLX, nvfp4), the decode matvecs by size.
+        // Qwen3.8-27B (MLX, nvfp4), the decode matvecs by size.
         ("qwen gate/up (nvfp4)", 5120, 17408, QLayout::NVFP4),
         ("qwen down (nvfp4)", 17408, 5120, QLayout::NVFP4),
         ("qwen qkv-in (nvfp4)", 5120, 12288, QLayout::NVFP4),

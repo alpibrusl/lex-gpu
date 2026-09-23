@@ -217,7 +217,7 @@ pub enum UnOp {
     Rsqrt,
     Sigmoid,
     /// `log(1 + exp(x))`, evaluated as `max(x, 0) + log(1 + exp(-|x|))` so
-    /// a large `x` neither overflows nor loses the linear part. Qwen3.5's
+    /// a large `x` neither overflows nor loses the linear part. Qwen3.8's
     /// decay gate is `exp(-A softplus(a + bias))`, and its bias reaches 19.
     Softplus,
 }

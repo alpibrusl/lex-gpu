@@ -37,6 +37,18 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // Decode speed against context, the way scripts/ollama_bench.py
+    // measures Ollama: fill N positions, then time the tokens after them.
+    // Qwen should barely move -- 48 of its 64 layers carry a fixed-size
+    // state rather than a cache -- and that is a claim worth checking
+    // rather than repeating.
+    let context: usize = std::env::var("LEX_CONTEXT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if context > ids.len() {
+        ids.extend((ids.len()..context).map(|i| 1000 + (i as u32 * 7919) % 200000));
+    }
     let mut rt = Runner::load(&model, ids.len() + steps + depth + 8)?;
     if !rt.has_mtp() {
         return Err(format!("{model} carries no mtp head"));

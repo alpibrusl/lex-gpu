@@ -1,4 +1,4 @@
-//! A Qwen3.5 decode step on the GPU, over tile kernels.
+//! A Qwen3.8 decode step on the GPU, over tile kernels.
 //!
 //! Sixty-four layers, of which every fourth is grouped attention over a
 //! KV cache and the rest are gated-delta layers whose whole memory is a
@@ -370,7 +370,7 @@ mod gpu {
         scalars_attn: Buffer,
     }
 
-    /// A Qwen3.5 model on the GPU.
+    /// A Qwen3.8 model on the GPU.
     pub struct Runner {
         gpu: Gpu,
         pub cfg: Config,

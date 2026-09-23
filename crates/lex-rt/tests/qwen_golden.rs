@@ -1,4 +1,4 @@
-//! Qwen3.5 on the GPU against the f32 reference that agrees with Ollama.
+//! Qwen3.8 on the GPU against the f32 reference that agrees with Ollama.
 //!
 //! The fixture is `qwen35_27b_golden.txt`, written by
 //! `scripts/qwen_ref.py --write-golden`: for each prompt, the token the

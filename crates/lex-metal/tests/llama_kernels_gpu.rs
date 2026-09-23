@@ -415,7 +415,7 @@ fn split_kv_attention_matches_the_interpreter() {
     }
 }
 
-/// Qwen3.5's attention prologue at the model's shape: 24 query heads of
+/// Qwen3.8's attention prologue at the model's shape: 24 query heads of
 /// 256, a rotated quarter, and f16 out for the attention kernel.
 #[test]
 fn qwen_qk_rope_matches_the_interpreter() {
@@ -459,7 +459,7 @@ fn qwen_qk_rope_matches_the_interpreter() {
     );
 }
 
-/// Qwen3.5's gates and its depthwise convolution, at the model's shapes.
+/// Qwen3.8's gates and its depthwise convolution, at the model's shapes.
 #[test]
 fn delta_gates_and_conv_match_the_interpreter() {
     use lex_front::qwen::{build_conv_silu, build_gates};
@@ -509,7 +509,7 @@ fn delta_gates_and_conv_match_the_interpreter() {
     }
 }
 
-/// Qwen3.5's gated-delta state update, at the model's own shape.
+/// Qwen3.8's gated-delta state update, at the model's own shape.
 #[test]
 fn delta_state_matches_the_interpreter() {
     use lex_front::qwen::DeltaNet;
@@ -575,7 +575,7 @@ fn delta_state_matches_the_interpreter() {
     }
 }
 
-/// NVFP4 (Qwen3.5's MLX weights): E2M1 codes two per byte, an FP8 E4M3
+/// NVFP4 (Qwen3.8's MLX weights): E2M1 codes two per byte, an FP8 E4M3
 /// scale per 16, one f32 scale per tensor held per row.
 #[test]
 fn nvfp4_matvec_matches_the_interpreter() {

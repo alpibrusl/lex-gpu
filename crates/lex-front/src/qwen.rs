@@ -1,4 +1,4 @@
-//! Qwen3.5's linear-attention layers, as typed tile programs.
+//! Qwen3.8's linear-attention layers, as typed tile programs.
 //!
 //! Three quarters of the model's 64 layers are "gated delta" layers rather
 //! than attention: instead of a growing KV cache they carry a fixed state
@@ -30,7 +30,7 @@ fn reg(shape: &[usize]) -> TileTy {
 /// Shape of one linear-attention layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeltaNet {
-    /// Value heads (Qwen3.5-27B: 48).
+    /// Value heads (Qwen3.8-27B: 48).
     pub v_heads: usize,
     /// Key heads; each serves `v_heads / k_heads` value heads (16).
     pub k_heads: usize,
@@ -365,7 +365,7 @@ enum Rows {
     PerHead,
 }
 
-/// Qwen3.5's attention prologue: normalise each head, rotate the first
+/// Qwen3.8's attention prologue: normalise each head, rotate the first
 /// `rot` of its dimensions, and (for queries) take the sigmoid of the gate
 /// the projection carries alongside them.
 ///
@@ -608,7 +608,7 @@ pub fn build_delta_qk_rows(
     Ok(b.finish())
 }
 
-/// `y = W x` for a small dense matrix: Qwen3.5's `in_proj_a` and
+/// `y = W x` for a small dense matrix: Qwen3.8's `in_proj_a` and
 /// `in_proj_b` are 48 rows of bf16, too small to be worth quantising and
 /// the only unquantised matrices in a layer.
 pub fn build_matvec_dense(
@@ -679,7 +679,7 @@ pub fn build_matvec_dense_rows(
 /// The gated norm that ends a linear-attention layer: normalise each value
 /// head's output with a weight, then multiply by `silu(z)`.
 ///
-/// This norm is *not* one of the ones Qwen3.5 stores as a delta from 1:
+/// This norm is *not* one of the ones Qwen3.8 stores as a delta from 1:
 /// its weight is used as it comes.
 ///
 /// Parameters: `y [v_heads, v_dim]`, the norm weight `[1, v_dim]`,
