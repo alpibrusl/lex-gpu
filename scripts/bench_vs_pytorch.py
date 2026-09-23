@@ -1,6 +1,6 @@
-"""Benchmark tile's Metal kernels against PyTorch on the same GPU.
+"""Benchmark lex's Metal kernels against PyTorch on the same GPU.
 
-Runs `tile-bench` (release build) and the PyTorch MPS equivalents on the same
+Runs `lex-bench` (release build) and the PyTorch MPS equivalents on the same
 shapes, times both the same way, and prints one table:
 
     python3 scripts/bench_vs_pytorch.py
@@ -10,7 +10,7 @@ shapes, times both the same way, and prints one table:
 Two groups of kernels:
 
 - copy / rmsnorm: P0's hand-planned kernels.
-- flash_decode_f16: a typed tile-front kernel, checked, lowered to MSL. It
+- flash_decode_f16: a typed lex-front kernel, checked, lowered to MSL. It
   uses Llama-3-8B's decode shape (8 KV heads x 4 query heads, head dim 128,
   f16). The main row compares it with SDPA called on the same grouped layout,
   where each KV head's 4 query heads are 4 query rows. The `(gqa)` row calls
@@ -18,9 +18,9 @@ Two groups of kernels:
   P2 lowers it for correctness, not speed. Expect PyTorch to win by a wide
   margin until P3.
 
-Method, matching `tile_metal::Gpu::time`: warm up, then `iters` back-to-back
+Method, matching `lex_metal::Gpu::time`: warm up, then `iters` back-to-back
 calls per timed batch, synchronise, keep the fastest of `repeats` batches.
-GB/s uses the same ideal-bytes accounting as tile (each input read once, each
+GB/s uses the same ideal-bytes accounting as lex (each input read once, each
 output written once), so the numbers are directly comparable.
 
 PyTorch is measured two ways for RMSNorm: `F.rms_norm` (one fused op where the
@@ -90,7 +90,7 @@ def torch_numbers(a):
 
 
 def torch_flash(a):
-    """SDPA on the flash-decode shape, in tile's memory layout."""
+    """SDPA on the flash-decode shape, in lex's memory layout."""
     kvh, group, d = 8, 4, 128
     dev = torch.device("mps")
     g = torch.Generator(device="cpu").manual_seed(0)
@@ -98,10 +98,10 @@ def torch_flash(a):
     k = torch.rand(a.batch, kvh, a.seq, d, generator=g).sub_(0.5).to(dev, torch.float16)
     v = torch.rand(a.batch, kvh, a.seq, d, generator=g).sub_(0.5).to(dev, torch.float16)
     h = a.batch * kvh
-    # Same accounting as tile: q and k/v in f16, o in f32.
+    # Same accounting as lex: q and k/v in f16, o in f32.
     nbytes = h * group * d * 2 + 2 * h * a.seq * d * 2 + h * group * d * 4
     # The same query heads as 4 query rows per KV head: no GQA expansion.
-    # This is the layout tile's kernel uses.
+    # This is the layout lex's kernel uses.
     qg = q.view(a.batch, kvh, group, d)
     gqa = timed(lambda: F.scaled_dot_product_attention(q, k, v, enable_gqa=True), a.iters, a.repeats)
     grouped = timed(lambda: F.scaled_dot_product_attention(qg, k, v), a.iters, a.repeats)
@@ -117,7 +117,7 @@ def torch_flash(a):
 
 def tile_numbers(a, flash=False):
     cmd = [
-        "cargo", "run", "-q", "--release", "-p", "tile-bench", "--",
+        "cargo", "run", "-q", "--release", "-p", "lex-bench", "--",
         "--dtype", a.dtype, "--mib", str(a.mib), "--rows", str(a.rows),
         "--cols", str(a.cols), "--iters", str(a.iters), "--repeats", str(a.repeats),
     ]
@@ -130,7 +130,7 @@ def tile_numbers(a, flash=False):
         if tok and tok[0].startswith(("copy_", "rmsnorm_", "flash_")):
             out[tok[0]] = float(tok[-2])
     if not out:
-        sys.exit(f"tile-bench produced no numbers:\n{p.stdout}{p.stderr}")
+        sys.exit(f"lex-bench produced no numbers:\n{p.stdout}{p.stderr}")
     return out, p.stdout
 
 
@@ -154,15 +154,15 @@ def main():
     tile.update(tile_numbers(a, flash=True)[0])
     ours, err = torch_numbers(a)
     ours.update(torch_flash(a))
-    print(raw.split("\n\n")[0])  # tile-bench's device/target header
+    print(raw.split("\n\n")[0])  # lex-bench's device/target header
     print(
         f"\npytorch {torch.__version__}, mps; rows={a.rows} cols={a.cols} copy={a.mib} MiB; "
         f"flash batch={a.batch} seq={a.seq}\n"
     )
-    print(f"{'kernel':<24} {'tile GB/s':>10} {'torch GB/s':>11} {'tile / torch':>13}")
+    print(f"{'kernel':<24} {'lex GB/s':>10} {'torch GB/s':>11} {'lex / torch':>13}")
     for name, gbs in ours.items():
         base = name.split()[0]
-        t = tile.get(base)
+        t = lex.get(base)
         ratio = f"{t / gbs:12.2f}x" if t else f"{'-':>13}"
         tcol = f"{t:10.1f}" if t else f"{'-':>10}"
         print(f"{name:<24} {tcol} {gbs:11.1f} {ratio}")

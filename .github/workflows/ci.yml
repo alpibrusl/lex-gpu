@@ -33,9 +33,9 @@ jobs:
       - run: cargo clippy --all-targets
       - run: cargo test --workspace
       - name: emitter produces MSL
-        run: cargo run -q -p tile-bench -- --emit
+        run: cargo run -q -p lex-bench -- --emit
 
-  # The only job that compiles tile-metal. It catches metal-rs API drift
+  # The only job that compiles lex-metal. It catches metal-rs API drift
   # without anyone having to be sitting at a Mac.
   metal:
     name: metal backend (macos)
@@ -57,4 +57,4 @@ jobs:
       # reported as a red build.
       - name: kernel smoke test on a GPU (perf numbers not meaningful here)
         continue-on-error: true
-        run: cargo run --release -p tile-bench -- --mib 64 --rows 2048 --iters 20
+        run: cargo run --release -p lex-bench -- --mib 64 --rows 2048 --iters 20

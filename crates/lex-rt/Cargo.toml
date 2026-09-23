@@ -1,0 +1,16 @@
+[package]
+name = "lex-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Inference runtime: GGUF weights, a Llama decode loop over tile kernels."
+
+[dependencies]
+lex-ir = { workspace = true }
+lex-front = { workspace = true }
+lex-msl = { workspace = true }
+half = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+lex-metal = { workspace = true }

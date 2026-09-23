@@ -98,6 +98,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "lex-bench"
+version = "0.0.1"
+dependencies = [
+ "half",
+ "lex-front",
+ "lex-ir",
+ "lex-metal",
+ "lex-msl",
+]
+
+[[package]]
+name = "lex-front"
+version = "0.0.1"
+dependencies = [
+ "half",
+ "lex-ir",
+]
+
+[[package]]
+name = "lex-ir"
+version = "0.0.1"
+dependencies = [
+ "half",
+]
+
+[[package]]
+name = "lex-metal"
+version = "0.0.1"
+dependencies = [
+ "half",
+ "lex-front",
+ "lex-ir",
+ "lex-msl",
+ "metal",
+]
+
+[[package]]
+name = "lex-msl"
+version = "0.0.1"
+dependencies = [
+ "lex-front",
+ "lex-ir",
+]
+
+[[package]]
+name = "lex-rt"
+version = "0.0.1"
+dependencies = [
+ "half",
+ "lex-front",
+ "lex-ir",
+ "lex-metal",
+ "lex-msl",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -186,62 +242,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tile-bench"
-version = "0.0.1"
-dependencies = [
- "half",
- "tile-front",
- "tile-ir",
- "tile-metal",
- "tile-msl",
-]
-
-[[package]]
-name = "tile-front"
-version = "0.0.1"
-dependencies = [
- "half",
- "tile-ir",
-]
-
-[[package]]
-name = "tile-ir"
-version = "0.0.1"
-dependencies = [
- "half",
-]
-
-[[package]]
-name = "tile-metal"
-version = "0.0.1"
-dependencies = [
- "half",
- "metal",
- "tile-front",
- "tile-ir",
- "tile-msl",
-]
-
-[[package]]
-name = "tile-msl"
-version = "0.0.1"
-dependencies = [
- "tile-front",
- "tile-ir",
-]
-
-[[package]]
-name = "tile-rt"
-version = "0.0.1"
-dependencies = [
- "half",
- "tile-front",
- "tile-ir",
- "tile-metal",
- "tile-msl",
 ]
 
 [[package]]

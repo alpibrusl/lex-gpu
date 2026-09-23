@@ -17,7 +17,7 @@ GCP_PROJECT=<project> GPU=a100 SPOT=1 scripts/gcp/nvidia_test.sh
 1. `nvidia-smi`, the CPU, and the CUDA and Rust versions (`machine.txt`).
 2. `cargo test --release --workspace`: the IR, checker, interpreter and
    emitters. This is the same suite CI runs on Linux.
-3. `cargo test -p tile-cuda`, once the CUDA backend exists. Until then the
+3. `cargo test -p lex-cuda`, once the CUDA backend exists. Until then the
    step is skipped, and the log says so.
 4. Ollama's decode and prefill speeds on that GPU, for
    `llama3.2:1b` and `llama3.1:8b`, at 0, 512 and 1,440 positions

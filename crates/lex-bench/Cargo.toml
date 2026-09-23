@@ -1,0 +1,18 @@
+[package]
+name = "lex-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "P0 bandwidth harness: emit, verify, and time the lex kernels."
+
+[[bin]]
+name = "lex-bench"
+path = "src/main.rs"
+
+[dependencies]
+lex-ir = { workspace = true }
+lex-msl = { workspace = true }
+lex-front = { workspace = true }
+lex-metal = { workspace = true }
+half = { workspace = true }

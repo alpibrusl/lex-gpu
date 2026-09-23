@@ -1,4 +1,4 @@
-# Qwen3.5-27B on tile kernels
+# Qwen3.5-27B on lex kernels
 
 The model in daily use here is `qwen3.8:27b-mlx`: Qwen3.5, 27.8B parameters
 dense, NVFP4 weights, served by Ollama's MLX engine. It now runs end to end
@@ -6,7 +6,7 @@ on kernels this compiler generates.
 
 ## Status
 
-| | tile | Ollama (MLX) |
+| | lex | Ollama (MLX) |
 | --- | --- | --- |
 | decode | **26.5 tok/s** | 58 (hard text) – 76 (predictable) |
 | a 2-token verify | **1.05 passes** | ~1.20 (implied) |
@@ -39,7 +39,7 @@ every weight statistic looks perfectly ordinary.
 
 ## Where the time goes
 
-38 ms a token, per call site (`examples/qwen`, `TILE_SYNC`):
+38 ms a token, per call site (`examples/qwen`, `LEX_SYNC`):
 
 | call site | ms/token | share |
 | --- | --- | --- |

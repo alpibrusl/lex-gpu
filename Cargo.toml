@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/tile-ir",
-    "crates/tile-front",
-    "crates/tile-msl",
-    "crates/tile-metal",
-    "crates/tile-bench",
-    "crates/tile-rt",
+    "crates/lex-ir",
+    "crates/lex-front",
+    "crates/lex-msl",
+    "crates/lex-metal",
+    "crates/lex-bench",
+    "crates/lex-rt",
 ]
 
 [workspace.package]
@@ -16,11 +16,11 @@ license = "EUPL-1.2"
 repository = "https://github.com/alpibrusl/lex-gpu"
 
 [workspace.dependencies]
-tile-ir = { path = "crates/tile-ir" }
-tile-front = { path = "crates/tile-front" }
-tile-msl = { path = "crates/tile-msl" }
-tile-metal = { path = "crates/tile-metal" }
-tile-rt = { path = "crates/tile-rt" }
+lex-ir = { path = "crates/lex-ir" }
+lex-front = { path = "crates/lex-front" }
+lex-msl = { path = "crates/lex-msl" }
+lex-metal = { path = "crates/lex-metal" }
+lex-rt = { path = "crates/lex-rt" }
 half = "2"
 
 [profile.release]
