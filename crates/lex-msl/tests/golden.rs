@@ -179,3 +179,30 @@ fn a_narrowing_store_lowered_to_cuda() {
     );
     compare_ext("rmsnorm_4x4096_f16_cuda", &l.source, "cu");
 }
+
+/// The kernel that is 94% of a decode step, lowered to CUDA: an NVFP4
+/// dequantisation fused into a matvec.
+///
+/// The decode itself is target-independent and has to be. Dropping an E2M1
+/// code's magnitude bits at the bottom of half's exponent field returns the
+/// value exactly, times 2^-14, subnormals included — a property of IEEE
+/// half, not of Metal. Only the spelling of the reinterpretation differs:
+/// `as_type<half2>` against a four-byte `memcpy`, which is the portable
+/// one, since a pointer cast between same-sized types is undefined
+/// behaviour that nvcc may miscompile.
+#[test]
+fn nvfp4_matvec_lowered_to_cuda() {
+    use lex_front::llama::{QLayout, matvec_q};
+    use lex_msl::dialect::Cuda;
+    let prog = matvec_q(5120, 17408, 8, 5120, QLayout::NVFP4, false).expect("program");
+    let target = Target::nvidia_ada();
+    let l = lex_msl::program::lower_with(&prog, &target, 256, &Cuda).expect("lower");
+    // The fast arithmetic decode, not the lane-table gather.
+    assert!(l.source.contains("fp4_pair"), "no NVFP4 decode emitted");
+    assert!(
+        l.source.contains("__half22float2"),
+        "the decode did not reach CUDA spelling:\n{}",
+        l.source
+    );
+    compare_ext("matvec_nvfp4_17408x5120_cuda", &l.source, "cu");
+}

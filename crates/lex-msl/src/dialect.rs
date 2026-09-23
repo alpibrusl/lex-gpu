@@ -97,6 +97,17 @@ pub trait Dialect {
     /// emitted body assumes.
     fn includes(&self) -> String;
 
+    /// The NVFP4 decode helpers, when a kernel dequantises four-bit
+    /// weights.
+    ///
+    /// The bit trick inside `fp4_pair` is the same on both targets and has
+    /// to be: dropping an E2M1 code's magnitude bits at the bottom of
+    /// half's exponent field gives back the value exactly, times 2^-14,
+    /// subnormals included, because the two formats' denormal boundaries
+    /// coincide there. That is a property of IEEE half, not of Metal. Only
+    /// the spelling of the reinterpretation differs.
+    fn fp4_preamble(&self) -> String;
+
     /// The entry point, from its name through the opening brace and the
     /// declarations that tell the body where this thread is.
     ///
@@ -166,6 +177,10 @@ impl Dialect for Msl {
 
     fn includes(&self) -> String {
         "\n#include <metal_stdlib>\nusing namespace metal;\n\n".to_string()
+    }
+
+    fn fp4_preamble(&self) -> String {
+        FP4_TABLES_MSL.to_string()
     }
 
     fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool) -> String {
@@ -267,6 +282,10 @@ impl Dialect for Cuda {
             .to_string()
     }
 
+    fn fp4_preamble(&self) -> String {
+        FP4_TABLES_CUDA.to_string()
+    }
+
     fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool) -> String {
         let mut s = format!("extern \"C\" __global__ void {name}(\n");
         for p in params {
@@ -288,6 +307,60 @@ impl Dialect for Cuda {
         s
     }
 }
+
+const FP4_TABLES_MSL: &str = concat!(
+    "constant float FP4_V[16] = {\n",
+    "    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,\n",
+    "    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};\n",
+    "inline float2 fp4_pair(uint b) {\n",
+    "    const uint w = b | (b << 12u);\n",
+    "    return float2(as_type<half2>(((w & 0x00070007u) << 9u)\n",
+    "                               | ((w & 0x00080008u) << 12u)));\n",
+    "}\n",
+    "inline float fp8_e4m3(uint b) {\n",
+    "    const uint e = (b >> 3u) & 0xFu, m = b & 7u;\n",
+    "    const uint bits = select(((e + 120u) << 23u) | (m << 20u),\n",
+    "                             as_type<uint>(float(m) * 0.001953125f), e == 0u);\n",
+    "    return as_type<float>(bits | ((b & 0x80u) << 24u));\n",
+    "}\n\n"
+);
+
+/// The same decode in CUDA.
+///
+/// `as_type` has no CUDA spelling, and a pointer cast between types of the
+/// same size is undefined behaviour that nvcc is entitled to miscompile.
+/// `memcpy` of four bytes is the portable reinterpretation and lowers to
+/// nothing; this repository has a measurement habit and `ptxas -v` reports
+/// no extra registers for it.
+///
+/// MSL's `select(a, b, c)` is `c ? b : a` -- the condition is *last* and
+/// the arms read backwards from a C ternary. Transcribing it in order is a
+/// mistake that produces plausible-looking weights, so the ternary here is
+/// written out rather than mirrored.
+const FP4_TABLES_CUDA: &str = concat!(
+    "__constant__ float FP4_V[16] = {\n",
+    "    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,\n",
+    "    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};\n",
+    "__device__ __forceinline__ float2 fp4_pair(uint b) {\n",
+    "    const uint w = b | (b << 12u);\n",
+    "    const uint bits = ((w & 0x00070007u) << 9u)\n",
+    "                    | ((w & 0x00080008u) << 12u);\n",
+    "    __half2 h;\n",
+    "    memcpy(&h, &bits, sizeof(h));\n",
+    "    return __half22float2(h);\n",
+    "}\n",
+    "__device__ __forceinline__ float fp8_e4m3(uint b) {\n",
+    "    const uint e = (b >> 3u) & 0xFu, m = b & 7u;\n",
+    "    const float sub = float(m) * 0.001953125f;\n",
+    "    uint subbits;\n",
+    "    memcpy(&subbits, &sub, sizeof(subbits));\n",
+    "    const uint bits = (e == 0u) ? subbits : (((e + 120u) << 23u) | (m << 20u));\n",
+    "    const uint out = bits | ((b & 0x80u) << 24u);\n",
+    "    float r;\n",
+    "    memcpy(&r, &out, sizeof(r));\n",
+    "    return r;\n",
+    "}\n\n"
+);
 
 #[cfg(test)]
 mod tests {

@@ -117,45 +117,6 @@ struct Gen<'a> {
     fp4: bool,
 }
 
-/// Decoding NVFP4's two formats. The reductions that carry the weight of
-/// a model use [`fp4_pair`], which is pure bit layout; `FP4_V` remains for
-/// the paths that read a single code out of place, where a `simd_shuffle`
-/// off a lane-held table is easier than extracting one nibble.
-const FP4_TABLES: &str = concat!(
-    // The sixteen E2M1 values. Each lane keeps one (see `fp4_lane`), so
-    // decoding a code is `simd_shuffle`, not a memory read.
-    "constant float FP4_V[16] = {\n",
-    "    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,\n",
-    "    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};\n",
-    // FP8 E4M3 straight into IEEE bits: exponent e - 7 + 127, the
-    // mantissa in the top three bits, and a subnormal below that. A table
-    // costs a data-dependent gather per group, and real weights scatter.
-    // Both E2M1 codes of a byte, as half bits, with no arithmetic at all.
-    //
-    // Drop the code's three magnitude bits at the *bottom* of half's
-    // exponent field and half reads back exactly the E2M1 value times
-    // 2^-14 — including the two subnormals, because half's denormal
-    // boundary sits where E2M1's does once the exponent is at the bottom
-    // of the field. So there is no bias to add and no subnormal to
-    // correct: two shifts, two masks and an or for two values, and the
-    // caller folds the 2^14 into the group's scale for free.
-    //
-    // The two codes must be 16 bits apart to share a shift, which is what
-    // `b | (b << 12)` arranges; the low nibble's copy at bits 12..15 falls
-    // outside both masks.
-    "inline float2 fp4_pair(uint b) {\n",
-    "    const uint w = b | (b << 12u);\n",
-    "    return float2(as_type<half2>(((w & 0x00070007u) << 9u)\n",
-    "                               | ((w & 0x00080008u) << 12u)));\n",
-    "}\n",
-    "inline float fp8_e4m3(uint b) {\n",
-    "    const uint e = (b >> 3u) & 0xFu, m = b & 7u;\n",
-    "    const uint bits = select(((e + 120u) << 23u) | (m << 20u),\n",
-    "                             as_type<uint>(float(m) * 0.001953125f), e == 0u);\n",
-    "    return as_type<float>(bits | ((b & 0x80u) << 24u));\n",
-    "}\n\n"
-);
-
 /// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
 /// `G = (I / cols) * (cols / group) + (I % cols) / group`.
 #[derive(Clone, Debug)]
@@ -273,7 +234,7 @@ pub fn lower_with(
     );
     s.push_str(&g.d.includes());
     if g.fp4 {
-        s.push_str(FP4_TABLES);
+        s.push_str(&g.d.fp4_preamble());
     }
     let names: Vec<String> = prog
         .params
