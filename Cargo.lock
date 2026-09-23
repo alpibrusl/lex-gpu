@@ -112,7 +112,10 @@ dependencies = [
 name = "lex-cuda"
 version = "0.0.1"
 dependencies = [
+ "half",
+ "lex-front",
  "lex-ir",
+ "lex-msl",
 ]
 
 [[package]]

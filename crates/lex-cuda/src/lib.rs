@@ -30,6 +30,12 @@
 //!   Hopper's 227 and Apple's 32. A schedule that fits one may not fit
 //!   another, which is what the target table is for.
 
+// Only on Linux: macOS has no libcuda to link against, and gating the
+// module rather than the calls is what lets the emitter and every golden
+// test build on a Mac.
+#[cfg(target_os = "linux")]
+pub mod device;
+
 use std::fmt::Write as _;
 
 use lex_ir::{DType, Kernel, Op, Plan, Target};
