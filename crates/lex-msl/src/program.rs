@@ -207,6 +207,18 @@ pub fn lower_with(
     let scratch_bytes = g.scratch * 4;
     let arena_bytes = g.arena;
     let threadgroup_bytes = arena_bytes + scratch_bytes;
+    // What the backend can declare, before what the machine can hold: a
+    // static `__shared__` array is capped well below the hardware limit,
+    // and exceeding it fails at module load rather than at assembly.
+    if threadgroup_bytes > dialect.max_static_shared() {
+        return Err(format!(
+            "lowering needs {threadgroup_bytes} B of threadgroup memory; this backend \
+             emits it as a static declaration, which is capped at {} B (the target \
+             allows {}, but reaching it needs dynamic shared memory)",
+            dialect.max_static_shared(),
+            target.max_threadgroup_bytes
+        ));
+    }
     if threadgroup_bytes > target.max_threadgroup_bytes {
         return Err(format!(
             "lowering needs {threadgroup_bytes} B of threadgroup memory ({arena_bytes} B of tiles \

@@ -170,8 +170,15 @@ impl Target {
         }
     }
 
-    /// NVIDIA H100 (sm_90). 227 KiB is the largest dynamic shared-memory
+    /// NVIDIA H100 (sm_90). 227 KiB is the largest shared-memory
     /// allocation one block can opt into (228 KiB per SM, 1 KiB reserved).
+    ///
+    /// This is what the *machine* allows. Reaching past 48 KiB of it needs
+    /// dynamic shared memory and a host-side opt-in, which the CUDA
+    /// backend does not emit — but that is the backend's limit, not the
+    /// target's, and [`lex_msl::dialect::Dialect::max_static_shared`] is
+    /// where it belongs. A Hopper schedule with 192 KiB of tiles is a real
+    /// thing that should keep type-checking here.
     pub const fn nvidia_hopper() -> Target {
         Target {
             name: "nvidia-hopper",
@@ -184,8 +191,9 @@ impl Target {
         }
     }
 
-    /// NVIDIA L4 (Ada, sm_89). 99 KiB is the largest dynamic shared-memory
-    /// allocation one block can opt into on Ada, against Hopper's 227.
+    /// NVIDIA L4 (Ada, sm_89). 99 KiB of shared memory per block, against
+    /// Hopper's 227 — again what the machine allows, not what the CUDA
+    /// backend currently emits.
     ///
     /// `async_copy` is true because Ampere onwards has `cp.async`, but it is
     /// a weaker thing than Hopper's TMA: a per-thread copy with a commit and

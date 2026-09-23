@@ -257,3 +257,55 @@ fn nothing_is_declared_unused_or_used_undeclared() {
         }
     }
 }
+
+/// The CUDA backend must refuse a schedule it cannot actually declare.
+///
+/// NVIDIA's larger shared-memory figures — 99 KiB on Ada, 227 on Hopper —
+/// are *dynamic* shared memory behind a host-side opt-in this runtime does
+/// not make. A `__shared__` array in the source is capped at 48 KiB
+/// however much the hardware has.
+///
+/// `ptxas` does not enforce it: a 99 KiB static declaration assembles
+/// without complaint and fails at module load, on a real device. So this
+/// is a class of bug nothing local can *detect*, and the backend refuses
+/// to emit it instead — while the target table keeps the machine's real
+/// figure, because a Hopper schedule with 192 KiB of tiles is a legitimate
+/// thing that should still type-check.
+#[test]
+fn cuda_refuses_a_schedule_it_cannot_declare() {
+    use lex_front::flash::FlashDecode;
+    use lex_ir::Space;
+    use lex_msl::dialect::{Cuda, Dialect, Msl};
+    use lex_msl::program::lower_with;
+
+    // A Hopper-sized schedule: more tiles than a static declaration holds.
+    let cfg = FlashDecode {
+        q_rows: 16,
+        d: 128,
+        seq: 1024,
+        bq: 16,
+        bk: 128,
+        stages: 3,
+        dtype: DType::F16,
+        kv_space: Space::Threadgroup,
+        consumers: 0,
+        heads: 2,
+        kv_cap: 0,
+    };
+    let prog = cfg.build().expect("build");
+    let hopper = Target::nvidia_hopper();
+
+    // The machine allows it, so the checker does.
+    lex_front::check(&prog, &hopper).expect("a Hopper schedule should type-check on Hopper");
+
+    let err = lower_with(&prog, &hopper, 128, &Cuda)
+        .expect_err("the CUDA backend cannot declare this statically");
+    assert!(
+        err.contains("static"),
+        "the refusal should say why, got: {err}"
+    );
+
+    // And the limit is the backend's, not the target's.
+    assert_eq!(Cuda.max_static_shared(), 48 * 1024);
+    assert!(Msl.max_static_shared() > hopper.max_threadgroup_bytes);
+}

@@ -97,6 +97,23 @@ pub trait Dialect {
     /// emitted body assumes.
     fn includes(&self) -> String;
 
+    /// The most threadgroup memory this backend can actually declare.
+    ///
+    /// Not a property of the machine — the target table has that — but of
+    /// what the backend emits. This one emits a `__shared__` array in the
+    /// source, and CUDA caps a *static* declaration at 48 KiB however much
+    /// the hardware has; Ada's 99 KiB and Hopper's 227 are dynamic shared
+    /// memory behind a host-side `cuFuncSetAttribute` this runtime never
+    /// makes.
+    ///
+    /// It is checked rather than trusted because `ptxas` does not enforce
+    /// it: a 99 KiB static declaration assembles without complaint and
+    /// fails later, at module load, on a real device. Nothing local can
+    /// detect that, so nothing local should be able to emit it.
+    fn max_static_shared(&self) -> usize {
+        usize::MAX
+    }
+
     /// The NVFP4 decode helpers, when a kernel dequantises four-bit
     /// weights.
     ///
@@ -286,6 +303,10 @@ impl Dialect for Cuda {
     fn includes(&self) -> String {
         "\n#include <cuda_fp16.h>\n\ntypedef unsigned int uint;\ntypedef unsigned char uchar;\n\n"
             .to_string()
+    }
+
+    fn max_static_shared(&self) -> usize {
+        48 * 1024
     }
 
     fn fp4_preamble(&self) -> String {
