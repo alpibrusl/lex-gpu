@@ -38,6 +38,8 @@ use lex_front::ir::{
 };
 use lex_ir::{DType, Space, Target};
 
+use crate::dialect::{Dialect, Msl, Param};
+
 /// A lowered kernel and everything needed to launch it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lowered {
@@ -95,6 +97,9 @@ enum Access {
 
 struct Gen<'a> {
     prog: &'a Program,
+    /// How this target spells barriers and lane shuffles. See
+    /// [`crate::dialect`] for why this is a seam and not a second file.
+    d: &'a dyn Dialect,
     threads: usize,
     body: String,
     depth: usize,
@@ -111,45 +116,6 @@ struct Gen<'a> {
     /// The kernel decodes NVFP4, so the source needs the decode tables.
     fp4: bool,
 }
-
-/// Decoding NVFP4's two formats. The reductions that carry the weight of
-/// a model use [`fp4_pair`], which is pure bit layout; `FP4_V` remains for
-/// the paths that read a single code out of place, where a `simd_shuffle`
-/// off a lane-held table is easier than extracting one nibble.
-const FP4_TABLES: &str = concat!(
-    // The sixteen E2M1 values. Each lane keeps one (see `fp4_lane`), so
-    // decoding a code is `simd_shuffle`, not a memory read.
-    "constant float FP4_V[16] = {\n",
-    "    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,\n",
-    "    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};\n",
-    // FP8 E4M3 straight into IEEE bits: exponent e - 7 + 127, the
-    // mantissa in the top three bits, and a subnormal below that. A table
-    // costs a data-dependent gather per group, and real weights scatter.
-    // Both E2M1 codes of a byte, as half bits, with no arithmetic at all.
-    //
-    // Drop the code's three magnitude bits at the *bottom* of half's
-    // exponent field and half reads back exactly the E2M1 value times
-    // 2^-14 — including the two subnormals, because half's denormal
-    // boundary sits where E2M1's does once the exponent is at the bottom
-    // of the field. So there is no bias to add and no subnormal to
-    // correct: two shifts, two masks and an or for two values, and the
-    // caller folds the 2^14 into the group's scale for free.
-    //
-    // The two codes must be 16 bits apart to share a shift, which is what
-    // `b | (b << 12)` arranges; the low nibble's copy at bits 12..15 falls
-    // outside both masks.
-    "inline float2 fp4_pair(uint b) {\n",
-    "    const uint w = b | (b << 12u);\n",
-    "    return float2(as_type<half2>(((w & 0x00070007u) << 9u)\n",
-    "                               | ((w & 0x00080008u) << 12u)));\n",
-    "}\n",
-    "inline float fp8_e4m3(uint b) {\n",
-    "    const uint e = (b >> 3u) & 0xFu, m = b & 7u;\n",
-    "    const uint bits = select(((e + 120u) << 23u) | (m << 20u),\n",
-    "                             as_type<uint>(float(m) * 0.001953125f), e == 0u);\n",
-    "    return as_type<float>(bits | ((b & 0x80u) << 24u));\n",
-    "}\n\n"
-);
 
 /// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
 /// `G = (I / cols) * (cols / group) + (I % cols) / group`.
@@ -187,6 +153,22 @@ enum Pack {
 /// Lower `prog` (which must already pass `lex_front::check` for `target`)
 /// with `threads` threads per threadgroup.
 pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered, String> {
+    lower_with(prog, target, threads, &Msl)
+}
+
+/// Lower for a dialect other than Metal.
+///
+/// The whole point of the seam: the same 1,800 lines below decide what to
+/// emit, and the dialect decides how to spell it. What is *not* yet behind
+/// the seam is the NVFP4 decode preamble, so a program that dequantises
+/// four-bit weights still emits Metal helpers and will not compile
+/// elsewhere. Everything else does.
+pub fn lower_with(
+    prog: &Program,
+    target: &Target,
+    threads: usize,
+    dialect: &dyn Dialect,
+) -> Result<Lowered, String> {
     if threads == 0
         || !threads.is_multiple_of(target.simd_width)
         || threads > target.max_threads_per_threadgroup
@@ -198,6 +180,7 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
     }
     let mut g = Gen {
         prog,
+        d: dialect,
         threads,
         body: String::new(),
         depth: 1,
@@ -224,6 +207,18 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
     let scratch_bytes = g.scratch * 4;
     let arena_bytes = g.arena;
     let threadgroup_bytes = arena_bytes + scratch_bytes;
+    // What the backend can declare, before what the machine can hold: a
+    // static `__shared__` array is capped well below the hardware limit,
+    // and exceeding it fails at module load rather than at assembly.
+    if threadgroup_bytes > dialect.max_static_shared() {
+        return Err(format!(
+            "lowering needs {threadgroup_bytes} B of threadgroup memory; this backend \
+             emits it as a static declaration, which is capped at {} B (the target \
+             allows {}, but reaching it needs dynamic shared memory)",
+            dialect.max_static_shared(),
+            target.max_threadgroup_bytes
+        ));
+    }
     if threadgroup_bytes > target.max_threadgroup_bytes {
         return Err(format!(
             "lowering needs {threadgroup_bytes} B of threadgroup memory ({arena_bytes} B of tiles \
@@ -249,45 +244,56 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
         "// tg mem : {arena_bytes} B tiles + {scratch_bytes} B scratch of {} B",
         target.max_threadgroup_bytes
     );
-    s.push_str("\n#include <metal_stdlib>\nusing namespace metal;\n\n");
+    s.push_str(&g.d.includes());
     if g.fp4 {
-        s.push_str(FP4_TABLES);
+        s.push_str(&g.d.fp4_preamble());
     }
-    let _ = writeln!(s, "kernel void {entry}(");
-    for (i, p) in prog.params.iter().enumerate() {
-        let cv = if p.writable { "" } else { "const " };
-        let _ = writeln!(
-            s,
-            "    device {cv}{}* {} [[buffer({i})]],",
-            p.dtype.msl_scalar(),
-            param_ident(i, &p.name)
-        );
-    }
-    if !prog.dyn_scalars.is_empty() {
-        let _ = writeln!(
-            s,
-            "    constant uint* scalars [[buffer({})]],",
-            prog.params.len()
-        );
-    }
-    s.push_str("    uint tid [[thread_index_in_threadgroup]],\n");
-    s.push_str("    uint3 tgpos [[threadgroup_position_in_grid]])\n{\n");
-    s.push_str("    const uint gid = tgpos.x, gid2 = tgpos.y;\n");
+    let names: Vec<String> = prog
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| param_ident(i, &p.name))
+        .collect();
+    let params: Vec<Param<'_>> = prog
+        .params
+        .iter()
+        .zip(&names)
+        .map(|(p, name)| Param {
+            ty: g.d.scalar(p.dtype),
+            name,
+            writable: p.writable,
+        })
+        .collect();
+    s.push_str(&g.d.entry(
+        &entry,
+        &params,
+        !prog.dyn_scalars.is_empty(),
+        g.body.contains("gid2"),
+    ));
     if arena_bytes > 0 {
         let _ = writeln!(
             s,
-            "    threadgroup float4 arena4[{}];\n    threadgroup uchar* arena = (threadgroup uchar*)arena4;",
-            arena_bytes.div_ceil(16)
+            "    {}\n    {p} arena = ({p})arena4;",
+            g.d.shared_array("float4", "arena4", arena_bytes.div_ceil(16)),
+            p = g.d.shared_ptr("uchar")
         );
     }
     if g.scratch > 0 {
-        let _ = writeln!(s, "    threadgroup float scratch[{}];", g.scratch);
+        let _ = writeln!(s, "    {}", g.d.shared_array("float", "scratch", g.scratch));
     }
-    if g.fp4 {
-        // The sixteen E2M1 values, one per lane of the simdgroup, read
-        // once. A code then costs a shuffle instead of a load: with real
-        // weights the indices scatter, and a constant-memory gather runs
-        // at about half the bandwidth an arithmetic decode does.
+    // The sixteen E2M1 values, one per lane of the simdgroup, read once. A
+    // code then costs a shuffle instead of a load: with real weights the
+    // indices scatter, and a constant-memory gather runs at about half the
+    // bandwidth an arithmetic decode does.
+    //
+    // Only some NVFP4 kernels want it. `Dequant4` builds a lane gather as a
+    // *lazy* expression, and a reduction that consumes it may supersede it
+    // with the arithmetic `fp4_pair` and never emit the gather at all -- as
+    // the quantised matvec does. So the test is whether the name reached
+    // the body, not whether the op that could have produced it ran. Metal
+    // dropped the dead constant silently; nvcc warned, which is how this
+    // was noticed at all.
+    if g.fp4 && g.body.contains("fp4_lane") {
         s.push_str("    const float fp4_lane = FP4_V[tid & 15u];\n");
     }
     s.push_str(&g.body);
@@ -370,7 +376,8 @@ impl Gen<'_> {
 
     fn barrier(&mut self) {
         self.barriers += 1;
-        self.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        let text = self.d.barrier();
+        self.line(&text);
     }
 
     fn per(&self, n: usize) -> usize {
@@ -464,7 +471,7 @@ impl Gen<'_> {
     fn declare_reg(&mut self, x: Var, ty: &TileTy) -> String {
         let name = v(x);
         let per = self.per(ty.elems());
-        self.line(&format!("{} {name}[{per}];", ty.dtype.msl_scalar()));
+        self.line(&format!("{} {name}[{per}];", self.d.scalar(ty.dtype)));
         self.locs.insert(x, Loc::Reg(name.clone(), ty.clone()));
         name
     }
@@ -473,9 +480,10 @@ impl Gen<'_> {
         let name = v(x);
         let off = self.arena.next_multiple_of(16);
         self.arena = off + ty.bytes();
-        let st = ty.dtype.msl_scalar();
+        let st = self.d.scalar(ty.dtype);
         self.line(&format!(
-            "threadgroup {st}* {name} = (threadgroup {st}*)(arena + {off});"
+            "{p} {name} = ({p})(arena + {off});",
+            p = self.d.shared_ptr(st)
         ));
         self.locs.insert(x, Loc::Tg(name.clone(), ty.clone()));
         name
@@ -605,8 +613,8 @@ impl Gen<'_> {
                         (Loc::Tg(_, t), Loc::Tg(sn, _)) if aliases_other => {
                             let tmp = format!("{}_next", storage(dst));
                             self.line(&format!(
-                                "threadgroup {}* {tmp} = {sn};",
-                                t.dtype.msl_scalar()
+                                "{} {tmp} = {sn};",
+                                self.d.shared_ptr(self.d.scalar(t.dtype))
                             ));
                             staged.push((dst.clone(), Loc::Tg(tmp, t.clone())));
                         }
@@ -657,7 +665,7 @@ impl Gen<'_> {
                         .ok_or("map_each yields more arrays than it walks")?;
                     let name = v(r);
                     let per = self.per(t.elems());
-                    self.line(&format!("{} {name}[{n}][{per}];", t.dtype.msl_scalar()));
+                    self.line(&format!("{} {name}[{n}][{per}];", self.d.scalar(t.dtype)));
                     outs.push((r, name, t));
                 }
                 let iname = v(*index);
@@ -670,7 +678,7 @@ impl Gen<'_> {
                     let pname = v(p);
                     self.line(&format!(
                         "thread {}* {pname} = {name}[{iname}];",
-                        t.dtype.msl_scalar()
+                        self.d.scalar(t.dtype)
                     ));
                     self.locs.insert(p, Loc::Reg(pname, t.clone()));
                 }
@@ -706,12 +714,15 @@ impl Gen<'_> {
             Loc::RegArr(_, t, n) => {
                 let name = v(p);
                 let per = self.per(t.elems());
-                self.line(&format!("{} {name}[{n}][{per}];", t.dtype.msl_scalar()));
+                self.line(&format!("{} {name}[{n}][{per}];", self.d.scalar(t.dtype)));
                 self.locs.insert(p, Loc::RegArr(name, t.clone(), *n));
             }
             Loc::Tg(_, t) => {
                 let name = v(p);
-                self.line(&format!("threadgroup {}* {name};", t.dtype.msl_scalar()));
+                self.line(&format!(
+                    "{} {name};",
+                    self.d.shared_ptr(self.d.scalar(t.dtype))
+                ));
                 self.locs.insert(p, Loc::Tg(name, t.clone()));
             }
             Loc::Lazy(_, t) => {
@@ -757,7 +768,7 @@ impl Gen<'_> {
                     t.elems(),
                     &[format!(
                         "{d}[k] = {}({});",
-                        t.dtype.msl_scalar(),
+                        self.d.scalar(t.dtype),
                         at_index(&e, "e")
                     )],
                 );
@@ -783,7 +794,7 @@ impl Gen<'_> {
             }
             Op::Fill(t, val) => {
                 let x = dst.ok_or("fill without a result")?;
-                let st = t.dtype.msl_scalar();
+                let st = self.d.scalar(t.dtype);
                 match t.space {
                     Space::Threadgroup => {
                         let name = self.declare_tg(x, t);
@@ -799,7 +810,7 @@ impl Gen<'_> {
             }
             Op::Load(view, t) => {
                 let x = dst.ok_or("load without a result")?;
-                let st = t.dtype.msl_scalar();
+                let st = self.d.scalar(t.dtype);
                 let src = self.addr(view, "e")?;
                 match t.space {
                     Space::Threadgroup => {
@@ -839,7 +850,7 @@ impl Gen<'_> {
                 self.locs.insert(x, l);
             }
             Op::Store(a, view) => {
-                let dt = self.prog.params[view.param].dtype.msl_scalar();
+                let dt = self.d.scalar(self.prog.params[view.param].dtype);
                 let n = view.shape.iter().product();
                 let ops = self.operands(&[*a], &[true], n)?;
                 let target = self.addr(view, "e")?;
@@ -872,13 +883,13 @@ impl Gen<'_> {
                     BinOp::Div => format!("({l} / {r})"),
                     BinOp::Max => format!("max({l}, {r})"),
                 };
-                let e = format!("{}({e})", t.dtype.msl_scalar());
+                let e = format!("{}({e})", self.d.scalar(t.dtype));
                 self.locs.insert(x, Loc::Lazy(e, reg(t.dtype, &t.shape)));
             }
             Op::Convert(a, dt) if self.lazy(*a).is_some() => {
                 let x = dst.ok_or("op without a result")?;
                 let (e, t) = self.lazy(*a).expect("checked");
-                let e = format!("{}(float({e}))", dt.msl_scalar());
+                let e = self.d.convert(*dt, &format!("float({e})"));
                 self.locs.insert(x, Loc::Lazy(e, reg(*dt, &t.shape)));
             }
             Op::Dequant(q, s, m, group) | Op::Dequant4(q, s, m, group, _)
@@ -952,8 +963,9 @@ impl Gen<'_> {
                     &qe,
                     &format!("({AT} / {c}u) * {}u + ({AT} % {c}u) / 2u", tq.shape[1]),
                 );
-                let v = format!(
-                    "simd_shuffle(fp4_lane, ((uint)(uchar)({byte}) >> (({AT} & 1u) * 4u)) & 0xFu)"
+                let v = self.d.shuffle(
+                    "fp4_lane",
+                    &format!("((uint)(uchar)({byte}) >> (({AT} & 1u) * 4u)) & 0xFu"),
                 );
                 // Inside a reduction the scale is formed once per group, so
                 // the row scale rides along with it: group G is row
@@ -1048,23 +1060,30 @@ impl Gen<'_> {
                 let src = Self::read(&ops[0].0, "e");
                 let (dt, expr) = match op {
                     Op::Dup(_) => (ty.dtype, src),
-                    Op::Exp(_) => (ty.dtype, format!("precise::exp({src})")),
+                    Op::Exp(_) => (ty.dtype, self.d.exp(&src)),
                     Op::Scale(_, f) => (ty.dtype, format!("{src} * {}", lit(*f))),
                     Op::Convert(_, d) => (*d, src),
-                    Op::Unary(UnOp::Rsqrt, _) => (ty.dtype, format!("precise::rsqrt({src})")),
-                    Op::Unary(UnOp::Sigmoid, _) => {
-                        (ty.dtype, format!("1.0f / (1.0f + precise::exp(-{src}))"))
-                    }
+                    Op::Unary(UnOp::Rsqrt, _) => (ty.dtype, self.d.rsqrt(&src)),
+                    Op::Unary(UnOp::Sigmoid, _) => (
+                        ty.dtype,
+                        format!("1.0f / (1.0f + {})", self.d.exp(&format!("-{src}"))),
+                    ),
                     Op::Unary(UnOp::Softplus, _) => (
                         ty.dtype,
                         format!(
-                            "max({src}, 0.0f) + precise::log(1.0f + precise::exp(-fabs({src})))"
+                            "{} + {}",
+                            self.d.fmax(&src, "0.0f"),
+                            self.d.log(&format!(
+                                "1.0f + {}",
+                                self.d.exp(&format!("-{}", self.d.fabs(&src)))
+                            ))
                         ),
                     ),
                     _ => unreachable!(),
                 };
                 let name = self.declare_reg(x, &reg(dt, &ty.shape));
-                self.owned(n, &[format!("{name}[k] = {}({expr});", dt.msl_scalar())]);
+                let cv = self.d.convert(dt, &expr);
+                self.owned(n, &[format!("{name}[k] = {cv};")]);
             }
             Op::Binary(bop, a, b) => {
                 let x = dst.ok_or("op without a result")?;
@@ -1090,7 +1109,8 @@ impl Gen<'_> {
                 };
                 let dt = ta.dtype;
                 let name = self.declare_reg(x, &reg(dt, &ta.shape));
-                self.owned(n, &[format!("{name}[k] = {}({expr});", dt.msl_scalar())]);
+                let cv = self.d.convert(dt, &expr);
+                self.owned(n, &[format!("{name}[k] = {cv};")]);
             }
             Op::MaskCols(a, first, limit) => {
                 let x = dst.ok_or("op without a result")?;
@@ -1105,7 +1125,7 @@ impl Gen<'_> {
                     n,
                     &[format!(
                         "{name}[k] = {}(({f} + e % {cols}u) >= {lim} ? -INFINITY : {src});",
-                        ty.dtype.msl_scalar()
+                        self.d.scalar(ty.dtype)
                     )],
                 );
             }
@@ -1118,7 +1138,7 @@ impl Gen<'_> {
                 let name = self.declare_reg(x, &reg(ty.dtype, &ty.shape));
                 self.owned(
                     n,
-                    &[format!("{name}[k] = {}({src});", ty.dtype.msl_scalar())],
+                    &[format!("{name}[k] = {}({src});", self.d.scalar(ty.dtype))],
                 );
             }
             Op::Dequant(q, s, m, group) => {
@@ -1153,8 +1173,12 @@ impl Gen<'_> {
                 self.owned(
                     n,
                     &[format!(
-                        "{name}[k] = simd_shuffle(fp4_lane, ((uint)(uchar)({byte}) >> ((e & 1u) * 4u)) & 0xFu) \
-                         * fp8_e4m3((uint)(uchar)({sv}) & 0xFFu) * {gv};"
+                        "{name}[k] = {} \
+                         * fp8_e4m3((uint)(uchar)({sv}) & 0xFFu) * {gv};",
+                        self.d.shuffle(
+                            "fp4_lane",
+                            &format!("((uint)(uchar)({byte}) >> ((e & 1u) * 4u)) & 0xFu")
+                        )
                     )],
                 );
             }
@@ -1372,8 +1396,9 @@ impl Gen<'_> {
                     self.depth -= 1;
                     self.line("}");
                     self.line(&format!(
-                        "for (uint d = {}u; d > 0; d /= 2) s += simd_shuffle_down(s, d);",
-                        lanes / 2
+                        "for (uint d = {}u; d > 0; d /= 2) s += {};",
+                        lanes / 2,
+                        self.d.shuffle_down("s", "d")
                     ));
                     self.line(&format!(
                         "if (o < {outs}u && lane == 0) scratch[{res} + o] = s;"
@@ -1385,8 +1410,8 @@ impl Gen<'_> {
                     self.owned(
                         outs,
                         &[format!(
-                            "{name}[k] = {}(scratch[{res} + e]);",
-                            acc.msl_scalar()
+                            "{name}[k] = {};",
+                            self.d.convert(*acc, &format!("scratch[{res} + e]"))
                         )],
                     );
                 } else {
@@ -1397,7 +1422,7 @@ impl Gen<'_> {
                             format!("const uint i = e / {n}u, j = e % {n}u;"),
                             "float s = 0.0f;".into(),
                             format!("for (uint p = 0; p < {kd}u; ++p) s += {av} * {bv};"),
-                            format!("{name}[k] = {}(s);", acc.msl_scalar()),
+                            format!("{name}[k] = {};", self.d.convert(*acc, "s")),
                         ],
                     );
                 }
@@ -1448,7 +1473,7 @@ impl Gen<'_> {
                     self.line(&format!(
                         "for (uint d = {}u; d > 0; d /= 2) s = {};",
                         lanes.min(32) / 2,
-                        join("s", "simd_shuffle_down(s, d)")
+                        join("s", &self.d.shuffle_down("s", "d"))
                     ));
                     self.line(&format!(
                         "if (o < {m}u && lane % 32u == 0) scratch[{res} + o * {sgs}u + lane / 32u] = s;"
@@ -1465,7 +1490,7 @@ impl Gen<'_> {
                                 "for (uint q = 0; q < {sgs}u; ++q) s = {};",
                                 join("s", &format!("scratch[{res} + e * {sgs}u + q]"))
                             ),
-                            format!("{name}[k] = {}(s);", dt.msl_scalar()),
+                            format!("{name}[k] = {};", self.d.convert(dt, "s")),
                         ],
                     );
                     return Ok(());
@@ -1479,7 +1504,7 @@ impl Gen<'_> {
                     &[
                         format!("float s = {init};"),
                         format!("for (uint j = 0; j < {n}u; ++j) {step}"),
-                        format!("{name}[k] = {}(s);", dt.msl_scalar()),
+                        format!("{name}[k] = {};", self.d.convert(dt, "s")),
                     ],
                 );
             }
@@ -1494,7 +1519,7 @@ impl Gen<'_> {
                             let t = t.clone();
                             let n = format!("{}_m", v(e));
                             let per = self.per(t.elems());
-                            self.line(&format!("{} {n}[{per}];", t.dtype.msl_scalar()));
+                            self.line(&format!("{} {n}[{per}];", self.d.scalar(t.dtype)));
                             self.assign(&Loc::Reg(n.clone(), t.clone()), &l)?;
                             (n, t)
                         }
@@ -1507,7 +1532,7 @@ impl Gen<'_> {
                 let per = self.per(t.elems());
                 self.line(&format!(
                     "{} {name}[{}][{per}];",
-                    t.dtype.msl_scalar(),
+                    self.d.scalar(t.dtype),
                     elems.len()
                 ));
                 for (i, (n, _)) in elems.iter().enumerate() {
@@ -1779,8 +1804,9 @@ impl Gen<'_> {
                 for i in 0..m {
                     self.line(&format!(
                         "for (uint d = {}u; d > 0; d /= 2) \
-                         s[{rr}][{i}] += simd_shuffle_down(s[{rr}][{i}], d);",
-                        lanes / 2
+                         s[{rr}][{i}] += {};",
+                        lanes / 2,
+                        self.d.shuffle_down(&format!("s[{rr}][{i}]"), "d")
                     ));
                 }
             }
@@ -1800,8 +1826,9 @@ impl Gen<'_> {
         } else {
             self.line(&format!(
                 "for (uint rr = 0; rr < {r}u; ++rr) for (uint i = 0; i < {m}u; ++i) \
-                 for (uint d = {}u; d > 0; d /= 2) s[rr][i] += simd_shuffle_down(s[rr][i], d);",
-                lanes / 2
+                 for (uint d = {}u; d > 0; d /= 2) s[rr][i] += {};",
+                lanes / 2,
+                self.d.shuffle_down("s[rr][i]", "d")
             ));
             self.line(&format!(
                 "if (lane == 0) for (uint rr = 0; rr < {r}u; ++rr) {{ const uint j = sgid * {r}u + rr; \
@@ -1815,8 +1842,8 @@ impl Gen<'_> {
         self.owned(
             m * n,
             &[format!(
-                "{name}[k] = {}(scratch[{res} + e]);",
-                acc.msl_scalar()
+                "{name}[k] = {};",
+                self.d.convert(acc, &format!("scratch[{res} + e]"))
             )],
         );
         Ok(())

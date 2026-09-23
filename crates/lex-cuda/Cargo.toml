@@ -8,3 +8,12 @@ description = "CUDA C emitter for the lex IR."
 
 [dependencies]
 lex-ir = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The runtime opens libcuda and libnvrtc with dlopen, so nothing is linked
+# against CUDA and this builds on a machine that has never seen it.
+lex-msl = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+lex-front = { workspace = true }
+half = "2"

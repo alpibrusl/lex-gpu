@@ -53,8 +53,12 @@ fn flash_decode_lowered() {
 }
 
 fn compare(case: &str, got: &str) {
+    compare_ext(case, got, "metal")
+}
+
+fn compare_ext(case: &str, got: &str, ext: &str) {
     let got = got.to_string();
-    let path = golden_dir().join(format!("{case}.metal"));
+    let path = golden_dir().join(format!("{case}.{ext}"));
 
     if std::env::var_os("LEX_BLESS").is_some() {
         std::fs::create_dir_all(golden_dir()).unwrap();
@@ -73,7 +77,7 @@ fn compare(case: &str, got: &str) {
         // Line-oriented, because a 60-line shader diffed as one string is
         // unreadable in test output.
         let mut report = format!(
-            "emitted MSL for `{case}` does not match {}\n",
+            "emitted source for `{case}` does not match {}\n",
             path.display()
         );
         for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
@@ -138,4 +142,170 @@ fn rmsnorm_f32_narrow() {
         "rmsnorm_f32_narrow",
         &Kernel::rmsnorm(DType::F32, 8, 128, 1e-5),
     );
+}
+
+/// The same typed program, lowered through the same `lower_with`, to CUDA.
+///
+/// This is the claim the whole design rests on, reduced to a file someone
+/// can read: one program, two targets, no per-target kernel rewrite. The
+/// Metal goldens beside it come from the identical lowering.
+///
+/// `scripts/cuda_check.sh crates/lex-msl/tests/golden/*.cu` compiles these
+/// with nvcc and assembles them for sm_89 — no GPU, and not in CI, because
+/// CI has no container runtime. The golden is what CI can check.
+#[test]
+fn rmsnorm_rows_lowered_to_cuda() {
+    use lex_msl::dialect::Cuda;
+    let prog = lex_front::llama::rmsnorm_rows(4, 4096, 1e-5, None, DType::F32);
+    let target = Target::nvidia_ada();
+    let l = lex_msl::program::lower_with(&prog, &target, 256, &Cuda).expect("lower");
+    compare_ext("rmsnorm_4x4096_f32_cuda", &l.source, "cu");
+}
+
+/// Narrowing to f16 is where the two languages stop agreeing on grammar:
+/// Metal casts with `half(x)`, CUDA calls `__float2half(x)`. A dialect that
+/// was copied and not read would emit a cast CUDA silently accepts as
+/// something else.
+#[test]
+fn a_narrowing_store_lowered_to_cuda() {
+    use lex_msl::dialect::Cuda;
+    let prog = lex_front::llama::rmsnorm_rows(4, 4096, 1e-5, None, DType::F16);
+    let target = Target::nvidia_ada();
+    let l = lex_msl::program::lower_with(&prog, &target, 256, &Cuda).expect("lower");
+    assert!(
+        l.source.contains("__float2half"),
+        "no CUDA narrowing in:\n{}",
+        l.source
+    );
+    compare_ext("rmsnorm_4x4096_f16_cuda", &l.source, "cu");
+}
+
+/// The kernel that is 94% of a decode step, lowered to CUDA: an NVFP4
+/// dequantisation fused into a matvec.
+///
+/// The decode itself is target-independent and has to be. Dropping an E2M1
+/// code's magnitude bits at the bottom of half's exponent field returns the
+/// value exactly, times 2^-14, subnormals included — a property of IEEE
+/// half, not of Metal. Only the spelling of the reinterpretation differs:
+/// `as_type<half2>` against a four-byte `memcpy`, which is the portable
+/// one, since a pointer cast between same-sized types is undefined
+/// behaviour that nvcc may miscompile.
+#[test]
+fn nvfp4_matvec_lowered_to_cuda() {
+    use lex_front::llama::{QLayout, matvec_q};
+    use lex_msl::dialect::Cuda;
+    let prog = matvec_q(5120, 17408, 8, 5120, QLayout::NVFP4, false).expect("program");
+    let target = Target::nvidia_ada();
+    let l = lex_msl::program::lower_with(&prog, &target, 256, &Cuda).expect("lower");
+    // The fast arithmetic decode, not the lane-table gather.
+    assert!(l.source.contains("fp4_pair"), "no NVFP4 decode emitted");
+    assert!(
+        l.source.contains("__half22float2"),
+        "the decode did not reach CUDA spelling:\n{}",
+        l.source
+    );
+    compare_ext("matvec_nvfp4_17408x5120_cuda", &l.source, "cu");
+}
+
+/// Nothing the lowering emits may be declared and unused, or used and
+/// undeclared.
+///
+/// This exists because a change that gated `fp4_lane` on whether the body
+/// actually used it removed the *declaration* as well, and every test in
+/// this repository still passed: the fused path never uses it, and the
+/// path that does is reached only with `LEX_NO_LAZY=1`, which nothing
+/// exercises. The bug was visible solely as an nvcc warning about an
+/// unused variable in a CUDA golden.
+///
+/// So the invariant is written down rather than left to a warning on one
+/// of the two backends.
+#[test]
+fn nothing_is_declared_unused_or_used_undeclared() {
+    use lex_front::llama::{QLayout, matmul_q, matvec_q};
+    use lex_msl::dialect::Cuda;
+    use lex_msl::program::lower_with;
+
+    let progs = [
+        matvec_q(5120, 17408, 8, 5120, QLayout::NVFP4, false).expect("matvec"),
+        matvec_q(5120, 17408, 8, 5120, QLayout::NVFP4, true).expect("matvec res"),
+        matmul_q(4, 5120, 17408, 32, 5120, QLayout::NVFP4, false).expect("matmul"),
+        matvec_q(4096, 4096, 8, 4096, QLayout::Q4_K, false).expect("q4k"),
+    ];
+    let targets = [Target::apple_m_series(), Target::nvidia_ada()];
+    for p in &progs {
+        for t in &targets {
+            for (dialect, name) in [
+                (
+                    &lex_msl::dialect::Msl as &dyn lex_msl::dialect::Dialect,
+                    "msl",
+                ),
+                (&Cuda as &dyn lex_msl::dialect::Dialect, "cuda"),
+            ] {
+                let l = lower_with(p, t, 256, dialect).expect("lower");
+                for var in ["fp4_lane", "gid2", "scratch", "arena"] {
+                    let declared = l.source.contains(&format!("{var} ="))
+                        || l.source.contains(&format!("{var}["));
+                    let mentions = l.source.matches(var).count();
+                    assert!(
+                        mentions == 0 || declared,
+                        "`{var}` used but never declared in {} for {name}/{}",
+                        p.name,
+                        t.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The CUDA backend must refuse a schedule it cannot actually declare.
+///
+/// NVIDIA's larger shared-memory figures — 99 KiB on Ada, 227 on Hopper —
+/// are *dynamic* shared memory behind a host-side opt-in this runtime does
+/// not make. A `__shared__` array in the source is capped at 48 KiB
+/// however much the hardware has.
+///
+/// `ptxas` does not enforce it: a 99 KiB static declaration assembles
+/// without complaint and fails at module load, on a real device. So this
+/// is a class of bug nothing local can *detect*, and the backend refuses
+/// to emit it instead — while the target table keeps the machine's real
+/// figure, because a Hopper schedule with 192 KiB of tiles is a legitimate
+/// thing that should still type-check.
+#[test]
+fn cuda_refuses_a_schedule_it_cannot_declare() {
+    use lex_front::flash::FlashDecode;
+    use lex_ir::Space;
+    use lex_msl::dialect::{Cuda, Dialect, Msl};
+    use lex_msl::program::lower_with;
+
+    // A Hopper-sized schedule: more tiles than a static declaration holds.
+    let cfg = FlashDecode {
+        q_rows: 16,
+        d: 128,
+        seq: 1024,
+        bq: 16,
+        bk: 128,
+        stages: 3,
+        dtype: DType::F16,
+        kv_space: Space::Threadgroup,
+        consumers: 0,
+        heads: 2,
+        kv_cap: 0,
+    };
+    let prog = cfg.build().expect("build");
+    let hopper = Target::nvidia_hopper();
+
+    // The machine allows it, so the checker does.
+    lex_front::check(&prog, &hopper).expect("a Hopper schedule should type-check on Hopper");
+
+    let err = lower_with(&prog, &hopper, 128, &Cuda)
+        .expect_err("the CUDA backend cannot declare this statically");
+    assert!(
+        err.contains("static"),
+        "the refusal should say why, got: {err}"
+    );
+
+    // And the limit is the backend's, not the target's.
+    assert_eq!(Cuda.max_static_shared(), 48 * 1024);
+    assert!(Msl.max_static_shared() > hopper.max_threadgroup_bytes);
 }
