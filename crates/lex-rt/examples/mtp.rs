@@ -90,6 +90,22 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // What it is all for: the same tokens, in less time.
+    rt.reset();
+    let mut logits = vec![];
+    for &t in &ids {
+        logits = rt.step(t)?;
+    }
+    let mut got = 0usize;
+    let mut next = argmax(&logits);
+    let t = Instant::now();
+    while got < steps {
+        let (committed, after) = rt.speculate(next, depth)?;
+        got += committed.len();
+        next = after;
+    }
+    let spec_s = t.elapsed().as_secs_f64();
+
     let n = steps as f64;
     println!("{model} on {}", rt.device());
     // The expected length of an accepted run, which is what a pass buys.
@@ -111,6 +127,12 @@ fn main() -> Result<(), String> {
         "  a draft : {:.2} ms ({:.1}% of a step) x depth {depth}",
         draft_ms / n / depth as f64,
         100.0 * (draft_ms / depth as f64) / step_ms
+    );
+    println!("  plain   : {:.1} tok/s", 1000.0 / (step_ms / n));
+    println!(
+        "  spec    : {:.1} tok/s  ({:.2}x) at depth {depth}",
+        got as f64 / spec_s,
+        (got as f64 / spec_s) / (1000.0 / (step_ms / n))
     );
     Ok(())
 }

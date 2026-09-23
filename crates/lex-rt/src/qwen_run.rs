@@ -119,7 +119,7 @@ mod gpu {
         build_gates_rows, build_matvec_dense_rows, build_mul, build_qk_rope_rows,
     };
     use lex_front::{Program, check};
-    use lex_ir::{DType, Space, Target};
+    use lex_ir::{DType, Kernel, Space, Target, plan};
     use lex_metal::{Buffer, Gpu, Pipeline, Step};
     use lex_msl::program::lower;
 
@@ -185,6 +185,12 @@ mod gpu {
         }
     }
 
+    fn argmax(v: &[f32]) -> u32 {
+        (0..v.len())
+            .max_by(|&a, &b| v[a].total_cmp(&v[b]))
+            .unwrap_or(0) as u32
+    }
+
     fn floats(gpu: &Gpu, store: &Store, name: &str) -> Result<Buffer, String> {
         let (v, _) = store.floats(name)?;
         Ok(gpu.upload(&v))
@@ -235,6 +241,23 @@ mod gpu {
     struct Layer {
         mixer: Mixer,
         ffn: Ffn,
+    }
+
+    /// A copy of every gated-delta layer's memory, so a rejected draft can
+    /// be undone.
+    ///
+    /// Attention layers need nothing kept: their cache is overwritten as
+    /// positions are refilled, so rolling one back is just moving `pos`. A
+    /// gated-delta layer has no such luxury -- its whole memory is a state
+    /// updated in place, and a verify that feeds four tokens updates it
+    /// four times. 48 layers x 3.1 MB, copied on the GPU at roughly 0.6 ms
+    /// a round, under 2% of a pass.
+    struct Snapshot {
+        state: Vec<Buffer>,
+        conv: Vec<Buffer>,
+        copy_state: Pipeline,
+        copy_conv: Pipeline,
+        pos: usize,
     }
 
     /// The checkpoint's multi-token-prediction head.
@@ -351,6 +374,9 @@ mod gpu {
         mtp_in: Buffer,
         /// The draft head's own cache length.
         mtp_pos: usize,
+        snap: Option<Snapshot>,
+        /// The hidden state a verify left, for the next draft.
+        spec_h: Option<Vec<f32>>,
         acts: Acts,
         /// Activations for a batch, and the kernels for each size seen.
         bacts: Acts,
@@ -635,6 +661,29 @@ mod gpu {
             let out_norm = floats(&gpu, &store, "model.language_model.norm.weight")?;
             let lm_head = QBuf::load(&gpu, &store, "lm_head.weight")?;
             let mtp_in = gpu.zeroed::<f32>(2 * cfg.hidden);
+
+            // Only a checkpoint with a draft head can reject anything.
+            let snap = if mtp.is_some() {
+                let (sn, cn) = (hv * dv * dk, (cfg.conv_kernel - 1) * ch);
+                let build = |n: usize| -> Result<Pipeline, String> {
+                    let kern = Kernel::copy(DType::F32, n);
+                    let pl = plan(&kern, gpu.target()).map_err(|e| e.to_string())?;
+                    gpu.build(&kern, &pl)
+                };
+                let delta = layers
+                    .iter()
+                    .filter(|l| matches!(l.mixer, Mixer::Linear(_)))
+                    .count();
+                Some(Snapshot {
+                    state: (0..delta).map(|_| gpu.zeroed::<f32>(sn)).collect(),
+                    conv: (0..delta).map(|_| gpu.zeroed::<f32>(cn)).collect(),
+                    copy_state: build(sn)?,
+                    copy_conv: build(cn)?,
+                    pos: 0,
+                })
+            } else {
+                None
+            };
             Ok(Runner {
                 gpu,
                 cfg,
@@ -646,6 +695,8 @@ mod gpu {
                 mtp,
                 mtp_in,
                 mtp_pos: 0,
+                snap,
+                spec_h: None,
                 acts,
                 bacts,
                 batches: HashMap::new(),
@@ -671,6 +722,129 @@ mod gpu {
         /// it carries its own `pre_fc_norm_hidden`, so it wants the
         /// unnormalised state. Reading it out is how the draft head is
         /// measured without a second forward pass.
+        /// Copy every gated-delta layer's memory aside, with the position
+        /// it belongs to.
+        fn save(&mut self) {
+            let Some(s) = &self.snap else { return };
+            let mut steps: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
+            let mut i = 0;
+            for l in &self.layers {
+                if let Mixer::Linear(d) = &l.mixer {
+                    steps.push((&s.copy_state, vec![&d.state, &s.state[i]]));
+                    steps.push((&s.copy_conv, vec![&d.conv_state, &s.conv[i]]));
+                    i += 1;
+                }
+            }
+            let launches: Vec<Step<'_>> = steps
+                .iter()
+                .map(|(p, b)| (*p, b.as_slice(), None))
+                .collect();
+            self.gpu.run_launches(&launches);
+            drop(launches);
+            drop(steps);
+            let pos = self.pos;
+            if let Some(s) = &mut self.snap {
+                s.pos = pos;
+            }
+        }
+
+        /// Put it back, and with it the position. An attention layer needs
+        /// nothing: its cache is overwritten as positions are refilled.
+        fn restore(&mut self) {
+            let Some(s) = &self.snap else { return };
+            let mut steps: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
+            let mut i = 0;
+            for l in &self.layers {
+                if let Mixer::Linear(d) = &l.mixer {
+                    steps.push((&s.copy_state, vec![&s.state[i], &d.state]));
+                    steps.push((&s.copy_conv, vec![&s.conv[i], &d.conv_state]));
+                    i += 1;
+                }
+            }
+            let launches: Vec<Step<'_>> = steps
+                .iter()
+                .map(|(p, b)| (*p, b.as_slice(), None))
+                .collect();
+            self.gpu.run_launches(&launches);
+            drop(launches);
+            drop(steps);
+            self.pos = s.pos;
+        }
+
+        /// One speculative round, greedy.
+        ///
+        /// `last` is the token to be fed next; it is not yet in the state.
+        /// The head drafts `depth` tokens after it, and all `depth + 1` are
+        /// fed in a single pass over the weights. A draft is kept while
+        /// every draft before it was right, because the pass only tells us
+        /// what the model would have said *given* that prefix.
+        ///
+        /// Returns the tokens now committed, and the token to feed next --
+        /// which this pass produced for free, so a round always yields at
+        /// least one token more than it drafted correctly.
+        ///
+        /// On a full acceptance the state is already right and nothing is
+        /// undone. Otherwise the gated-delta layers are restored and the
+        /// accepted prefix replayed, which costs a second pass; at the
+        /// acceptance this head reaches that is rare enough to be worth it.
+        pub fn speculate(&mut self, last: u32, depth: usize) -> Result<(Vec<u32>, u32), String> {
+            if self.mtp.is_none() || depth == 0 {
+                let logits = self.step(last)?;
+                return Ok((vec![last], argmax(&logits)));
+            }
+            let trace = std::env::var_os("LEX_SPEC_TRACE").is_some();
+            let mark = std::time::Instant::now();
+            let drafts = self.draft(depth, last)?;
+            let t_draft = mark.elapsed().as_secs_f64() * 1e3;
+            if drafts.is_empty() {
+                let logits = self.step(last)?;
+                return Ok((vec![last], argmax(&logits)));
+            }
+
+            let mark = std::time::Instant::now();
+            self.save();
+            let t_save = mark.elapsed().as_secs_f64() * 1e3;
+            let mut fed = vec![last];
+            fed.extend(&drafts);
+            let mark = std::time::Instant::now();
+            let logits = self.forward(&fed, true)?;
+            let t_verify = mark.elapsed().as_secs_f64() * 1e3;
+
+            // How many drafts the model agrees with, longest prefix only.
+            let mut kept = 0;
+            while kept < drafts.len() && drafts[kept] == argmax(&logits[kept]) {
+                kept += 1;
+            }
+            let next = argmax(&logits[kept]);
+            let committed = fed[..=kept].to_vec();
+            // Row `kept` of the verify is the state after exactly the tokens
+            // being committed, so it is the right input for the next draft
+            // whether or not the rest of the pass is undone. Without this the
+            // next draft reads whatever the last single step left behind, and
+            // guesses from a state the model was never in.
+            let carry = self.batch_hidden(kept);
+
+            if kept < drafts.len() {
+                // The pass ran further than the model agreed with, so the
+                // delta states carry tokens that were never really said.
+                self.restore();
+                if kept > 0 {
+                    self.forward(&committed, false)?;
+                } else {
+                    self.step(last)?;
+                }
+            }
+            self.spec_h = Some(carry);
+            if trace {
+                eprintln!(
+                    "draft {t_draft:.1}  save {t_save:.1}  verify {t_verify:.1}  \
+                     undo {:.1}  kept {kept}",
+                    mark.elapsed().as_secs_f64() * 1e3 - t_verify
+                );
+            }
+            Ok((committed, next))
+        }
+
         /// Does this checkpoint carry a draft head?
         pub fn has_mtp(&self) -> bool {
             self.mtp.is_some()
@@ -696,7 +870,7 @@ mod gpu {
                 return Ok(vec![]);
             }
             let c = self.cfg.clone();
-            let mut h = self.hidden();
+            let mut h = self.spec_h.take().unwrap_or_else(|| self.hidden());
             let mut tok = last;
             let mut out = Vec::with_capacity(depth);
             for _ in 0..depth {
@@ -798,6 +972,14 @@ mod gpu {
             ]
         }
 
+        /// The hidden state a batched pass left for its `i`-th token.
+        fn batch_hidden(&self, i: usize) -> Vec<f32> {
+            let n = self.cfg.hidden;
+            let mut all = vec![0.0f32; (i + 1) * n];
+            self.gpu.download(&self.bacts.x, &mut all);
+            all[i * n..(i + 1) * n].to_vec()
+        }
+
         pub fn hidden(&self) -> Vec<f32> {
             let mut h = vec![0.0f32; self.cfg.hidden];
             self.gpu.download(&self.acts.x, &mut h);
@@ -823,6 +1005,7 @@ mod gpu {
 
         /// Feed one token at the next position; returns its logits.
         pub fn step(&mut self, token: u32) -> Result<Vec<f32>, String> {
+            self.spec_h = None;
             let c = self.cfg.clone();
             if self.pos >= self.cap {
                 return Err(format!("the cache is full ({} positions)", self.cap));

@@ -171,3 +171,67 @@ fn a_batch_lands_where_the_same_tokens_land_one_by_one() {
     eprintln!("batch vs sequence: worst logit difference {worst:e} of scale");
     assert!(worst < 1e-3, "batch differs from the sequence by {worst:e}");
 }
+
+/// Speculation must be invisible in the output: the same tokens as greedy
+/// decoding, in the same order, whatever the draft head guesses.
+///
+/// That is the whole contract. A draft is only ever a guess about what the
+/// model was going to say, and a verify that accepts a token the model
+/// would not have produced is a wrong answer delivered faster.
+#[test]
+fn speculation_lands_exactly_where_greedy_lands() {
+    let golden = include_str!("data/qwen35_27b_golden.txt");
+    let (model, cases) = parse(golden);
+    let prompt = &cases[0].prompt;
+    const STEPS: usize = 12;
+    let mut rt = match Runner::load(&model, prompt.len() + STEPS + 8) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+    if !rt.has_mtp() {
+        eprintln!("SKIPPED: {model} carries no draft head");
+        return;
+    }
+    let top = |v: &[f32]| {
+        (0..v.len())
+            .max_by(|&a, &b| v[a].total_cmp(&v[b]))
+            .expect("logits") as u32
+    };
+
+    // Greedy, one token at a time.
+    rt.reset();
+    let mut logits = vec![];
+    for &t in prompt {
+        logits = rt.step(t).expect("step");
+    }
+    let mut plain = vec![];
+    for _ in 0..STEPS {
+        let t = top(&logits);
+        plain.push(t);
+        logits = rt.step(t).expect("step");
+    }
+
+    // The same, but drafting two tokens ahead every round.
+    rt.reset();
+    let mut logits = vec![];
+    for &t in prompt {
+        logits = rt.step(t).expect("step");
+    }
+    let mut spec = vec![];
+    let mut next = top(&logits);
+    while spec.len() < STEPS {
+        let (committed, after) = rt.speculate(next, 2).expect("speculate");
+        spec.extend(committed);
+        next = after;
+    }
+    spec.truncate(STEPS);
+
+    assert_eq!(
+        spec, plain,
+        "speculation changed the output: {spec:?} against {plain:?}"
+    );
+    eprintln!("{STEPS} tokens identical with a draft depth of 2");
+}

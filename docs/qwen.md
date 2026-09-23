@@ -8,7 +8,7 @@ on kernels this compiler generates.
 
 | | lex | Ollama (MLX) |
 | --- | --- | --- |
-| decode | **26.5 tok/s** | 58 (hard text) – 76 (predictable) |
+| decode | **26.5 tok/s**, or **39.7–42.7** speculating | 58 (hard text) – 76 (predictable) |
 | a 2-token verify | **1.05 passes** | ~1.20 (implied) |
 | answers | ` Paris` `.` `\n` `The` … | the same tokens |
 
@@ -147,6 +147,89 @@ A whole forward pass, end to end (`examples/qwen`):
 A two-token verify costs 1.05 passes, where it cost 1.77. That is the
 condition this document set for speculation being worth building, and it
 is met.
+
+## Matching Ollama, and beating it
+
+Ollama's decode speed on this model tracks how predictable the text is —
+76 tok/s counting, 58 on random words. With 14.5 GB a pass and a roof of
+about 507 GB/s (a read-only stream; copy benchmarks land near 460 because
+they pay write-allocate), one token per pass cannot exceed ~35 tok/s. So
+Ollama is getting **about two tokens per weight pass** from the model's
+own multi-token-prediction head.
+
+Ollama's numbers imply its own pass runs at about 480 GB/s and yields two
+tokens. Ours now runs at 455 on the shapes that matter and still yields
+one. Both halves of the matching problem were the same bug — the decode —
+and the first half is essentially closed: 21.8 → 26.5 tok/s, with the
+remainder of the gap in the small shapes (`k` at 4096 → 1024 reaches 251
+GB/s) rather than in the format.
+
+What is left is tokens per pass, and the head that provides them ships in
+the checkpoint: `mtp.*`, 239 MB of NVFP4 in the same three-entry blobs as
+the rest, holding one full-attention layer, a fusing `fc`, and four norms.
+
+**Its acceptance is now measured here rather than borrowed.**
+`examples/mtp_trace` dumps the model's own hidden state and chosen token
+for 256 steps; `scripts/mtp_accept.py` runs the head over that trace in
+f32 and counts how often its draft is what the model went on to pick:
+
+| text | acceptance |
+| --- | --- |
+| prose (`The capital of France is`) | **96.9%** |
+| code (`def quicksort(arr):`) | 96.1% |
+| ten unrelated rare words | **82.4%** |
+
+That range is the same shape as Ollama's 58–76 tok/s on the same kinds of
+text, which is the strongest evidence yet that its speed is this head.
+
+Two things about the head are inferred, because `mlx_lm` drops every
+`mtp.` weight in `sanitize()` before it shifts anything and so documents
+neither. Both were settled by measurement, and neither is marginal — the
+wrong choice accepts **0.4%**, not 80%:
+
+- **Every one of its norms is stored as a delta from 1**, including the
+  three (`mtp.norm`, `mtp.pre_fc_norm_hidden`, `mtp.pre_fc_norm_embedding`)
+  that match none of `mlx_lm`'s suffixes. Unshifted, `pre_fc_norm_embedding`
+  runs −0.75 to −0.19 — entirely negative, which no RMSNorm gain is.
+- **The embedding comes first** in the concatenation into `fc`:
+  `fc(concat(norm_emb(embed(x_{t+1})), norm_hidden(h_t)))`. The other
+  order is the one the obvious reading of the architecture suggests, and
+  it accepts nothing at all.
+
+Drafting is not as free as this document previously claimed. A draft is
+the head *and* a pass over `lm_head` to turn its hidden state into a
+token: 239 + 715 MB, **6.6% of a pass per drafted token**, not 1.6%.
+
+**Speculation runs**, and `tests/qwen_golden.rs` requires it to be
+invisible: the same tokens as greedy decoding, in the same order. That is
+the whole contract — a verify that accepts a token the model would not
+have produced is a wrong answer delivered faster.
+
+| draft depth | tokens a verify accepts | decode |
+| --- | --- | --- |
+| none | 1 of 1 | 26.5 tok/s |
+| **1** | 1.94 of 2 | **39.7–42.7 tok/s (1.5–1.57x)** |
+| 2 | 2.54 of 3 | 33.4 (1.25x) |
+| 3 | 2.73 of 4 | 24.4 (**0.91x** — worse than not speculating) |
+
+One token is the depth the head was built for, and the 1.57x matches what
+`mlx-lm` reports for it. Deeper loses on three fronts at once: the verify
+costs more (1.27 and 1.57 passes), the second draft is right only 64% of
+the time, and each draft is another 6.6% of a pass.
+
+The rollback is cheaper than feared. An attention layer needs none — its
+cache is overwritten as positions are refilled, so undoing is moving
+`pos`. The 48 gated-delta layers do, because their whole memory is a
+state updated in place, but copying 48 x 3.1 MB on the GPU costs **0.8 ms**,
+2% of a pass, and only a rejected round pays the replay.
+
+The bug worth recording: the draft after a verify read `acts.x`, which a
+batched pass never writes — it uses `bacts`. So every second round drafted
+from the state the *previous* single step left, and guessed from a state
+the model had never been in. Acceptance measured 94.5% in isolation while
+the loop accepted every other round, and speculation came out **slower**
+than not speculating (0.89x). The tell was `kept` alternating 1, 0, 1, 0;
+the fix is to carry row `kept` of the verify into the next draft.
 
 ## Matching Ollama, and beating it
 
