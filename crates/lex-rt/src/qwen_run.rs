@@ -1106,11 +1106,25 @@ mod gpu {
             );
 
             let plan = self.batch_plan(t);
-            let steps: Vec<Step<'_>> = plan
-                .iter()
-                .map(|(_, p, b)| (*p, b.as_slice(), None))
-                .collect();
-            self.gpu.run_launches(&steps);
+            // Same as `step`: with LEX_SYNC, dispatch one at a time and
+            // record where the time went. Without it prefill can only be
+            // measured in total, which is enough to see a chunk size cost
+            // more than the one below it and not enough to say why.
+            if self.sync {
+                for (label, p, b) in &plan {
+                    let (_, ms) = self.gpu.run_launches(&[(p, b.as_slice(), None)]);
+                    let mut prof = self.prof.borrow_mut();
+                    let e = prof.entry(label).or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 += ms;
+                }
+            } else {
+                let steps: Vec<Step<'_>> = plan
+                    .iter()
+                    .map(|(_, p, b)| (*p, b.as_slice(), None))
+                    .collect();
+                self.gpu.run_launches(&steps);
+            }
             drop(plan);
             self.pos += t;
 
@@ -1138,7 +1152,20 @@ mod gpu {
             // Rows per threadgroup, measured on the 5120 -> 17408 shape
             // (`examples/matvec`): 16 is best from two tokens up, and a
             // single-token batch is better served by the decode path.
-            let bo = if t == 1 { 32 } else { 16 };
+            // Rows of the output one threadgroup owns. It sets how many
+            // threadgroups there are, and every one of them re-reads every
+            // token's activations -- so the wider the input and the more
+            // tokens, the more `bo` is worth. LEX_BATCH_BO to sweep it.
+            let bo = match std::env::var("LEX_BATCH_BO")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                Some(v) if t > 1 => v,
+                // 32 beats 16 at every batch size measured, and 64 is
+                // worse than either: past 32 the accumulators per (row,
+                // token) stop fitting.
+                _ => 32,
+            };
             let mut mv = HashMap::new();
             let mut want: Vec<(usize, usize, bool)> = vec![(c.hidden, c.vocab, false)];
             for l in 0..c.layers {

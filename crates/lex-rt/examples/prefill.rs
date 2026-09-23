@@ -44,6 +44,15 @@ fn main() -> Result<(), String> {
 
     let mut chunk = 1;
     while chunk <= MAX_BATCH {
+        // Larger chunks amortise the weights over more tokens, until the
+        // accumulators per (row, token) stop fitting in registers.
+        // Compile this chunk size's kernels *before* timing. `forward`
+        // builds them on first use and caches them, and a 16-token kernel
+        // is a lot of unrolled source -- left inside the loop it is the
+        // measurement, not the thing measured.
+        rt.reset();
+        rt.forward(&prompt[..chunk], false)?;
+
         rt.reset();
         let t = Instant::now();
         for part in prompt.chunks(chunk) {
@@ -55,6 +64,18 @@ fn main() -> Result<(), String> {
             tokens as f64 / (ms / 1e3),
             ms / prompt.chunks(chunk).count() as f64
         );
+        // With LEX_SYNC, say *which* kernel the time went to. A chunk size
+        // that costs more than the one below it is either a kernel that
+        // does not scale or one that is wrong, and the per-call-site
+        // breakdown is the only thing that tells them apart.
+        if std::env::var_os("LEX_SYNC").is_some() {
+            let mut prof = rt.profile();
+            prof.sort_by(|a, b| b.2.total_cmp(&a.2));
+            for (site, calls, ms) in prof.iter().take(6) {
+                println!("          {site:<22} {calls:>5} calls {ms:>8.2} ms");
+            }
+            rt.clear_profile();
+        }
         chunk *= 2;
     }
     Ok(())
