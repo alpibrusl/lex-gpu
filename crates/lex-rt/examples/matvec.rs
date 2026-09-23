@@ -167,7 +167,21 @@ fn main() -> Result<(), String> {
         // Half activations halve what the batch reads and let the
         // multiply-add run on the f16 ALU; `bo` is the rows a threadgroup
         // owns, and past 32 each lane's accumulators start to spill.
-        for (bo, xh) in [(16, false), (32, false), (16, true), (32, true)] {
+        // Each lane reloads every token's activation for each weight row it
+        // owns, so the loads-per-weight ratio is `2 * tokens / rows per
+        // simdgroup` — and rows per simdgroup is `bo / (threads / 32)`.
+        // Sweep `bo` against `THREADS` to move it. Every earlier conclusion
+        // about this pair was measured through the 32-cycle shuffle decode
+        // and is void.
+        for (bo, xh) in [
+            (16, false),
+            (32, false),
+            (64, false),
+            (128, false),
+            (32, true),
+            (64, true),
+            (128, true),
+        ] {
             let (kc, xt) = (n_in, if xh { DType::F16 } else { DType::F32 });
             let x = gpu.zeroed::<u8>(tokens * n_in * if xh { 2 } else { 4 });
             let Ok(prog) = matmul_q_x(tokens, n_in, n_out, bo, kc, QLayout::NVFP4, false, xt)

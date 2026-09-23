@@ -1628,10 +1628,29 @@ impl Gen<'_> {
         self.line(&format!(
             "const uint sgid = tid / {simd}u, lane = tid % {simd}u;"
         ));
+        // `xa`, `s`, `sgr` and `mgr` are register tiles. Metal keeps them in
+        // registers only while every index is a compile-time constant:
+        // indexed by a loop variable they go to the stack instead, and a
+        // spilled accumulator costs more than the weight reuse it exists for.
+        // One loop-variable index anywhere is enough to spill the whole tile,
+        // so every touch below is emitted with a literal. `r`, `m` and `step`
+        // are all known here.
+        let unroll = r * m * step <= 128;
         self.line(&format!("float s[{r}][{m}];"));
-        self.line(&format!(
-            "for (uint rr = 0; rr < {r}u; ++rr) for (uint i = 0; i < {m}u; ++i) s[rr][i] = 0.0f;"
-        ));
+        if unroll {
+            for rr in 0..r {
+                self.line(
+                    &(0..m)
+                        .map(|i| format!("s[{rr}][{i}] = 0.0f;"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+        } else {
+            self.line(&format!(
+                "for (uint rr = 0; rr < {r}u; ++rr) for (uint i = 0; i < {m}u; ++i) s[rr][i] = 0.0f;"
+            ));
+        }
         self.line(&format!(
             "for (uint p0 = lane * {v}u; p0 < {kd}u; p0 += {}u) {{",
             lanes * v
@@ -1640,12 +1659,6 @@ impl Gen<'_> {
         if let Some(d) = &dq {
             let g = d.group;
             self.line(&format!("float sgr[{r}], mgr[{r}];"));
-            self.line(&format!("for (uint rr = 0; rr < {r}u; ++rr) {{"));
-            self.line(&format!(
-                "    const uint j = min(sgid * {r}u + rr, {}u); const uint grp = j * {}u + p0 / {g}u;",
-                n - 1,
-                kd / g
-            ));
             let rs = match &d.row {
                 // Row-only factor (NVFP4's per-tensor scale).
                 Some(r) => format!(" * float({})", at_index(r, "j")),
@@ -1657,61 +1670,144 @@ impl Gen<'_> {
                 Pack::Fp4(..) => format!("{rs} * 16384.0f"),
                 _ => rs,
             };
-            self.line(&format!("    sgr[rr] = {}{rs};", at_index(&d.s, "grp")));
-            match &d.m {
-                Some(mm) => self.line(&format!("    mgr[rr] = {};", at_index(mm, "grp"))),
-                None => self.line("    mgr[rr] = 0.0f;"),
+            let row = |rr: &str, idx: &str| {
+                let mg = match &d.m {
+                    Some(mm) => format!("mgr[{idx}] = {};", at_index(mm, "grp")),
+                    None => format!("mgr[{idx}] = 0.0f;"),
+                };
+                format!(
+                    "{{ const uint j = min(sgid * {r}u + {rr}, {}u); \
+                     const uint grp = j * {}u + p0 / {g}u; \
+                     sgr[{idx}] = {}{rs}; {mg} }}",
+                    n - 1,
+                    kd / g,
+                    at_index(&d.s, "grp"),
+                )
+            };
+            if unroll {
+                for rr in 0..r {
+                    self.line(&row(&format!("{rr}u"), &rr.to_string()));
+                }
+            } else {
+                self.line(&format!(
+                    "for (uint rr = 0; rr < {r}u; ++rr) {}",
+                    row("rr", "rr")
+                ));
             }
-            self.line("}");
         }
         self.line(&format!("for (uint u = 0; u < {v}u; u += {step}u) {{"));
         self.depth += 1;
         self.line("const uint p = p0 + u;");
-        // Each token's activations for this step, loaded once.
-        self.line(&format!("float xa[{m}][{step}];"));
-        for k in 0..step {
-            self.line(&format!(
-                "for (uint i = 0; i < {m}u; ++i) xa[i][{k}] = {};",
-                Self::read(&ops[0].0, &format!("i * {kd}u + p + {k}u"))
-            ));
-        }
-        self.line(&format!("for (uint rr = 0; rr < {r}u; ++rr) {{"));
-        self.depth += 1;
-        self.line(&format!(
-            "const uint j = min(sgid * {r}u + rr, {}u);",
-            n - 1
-        ));
         let names: Vec<String> = (0..weights.len()).map(|k| format!("w{k}")).collect();
         let decl: Vec<String> = weights
             .iter()
             .zip(&names)
             .map(|(w, nm)| format!("const float {nm} = {w};"))
             .collect();
-        let terms: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(k, nm)| format!("xa[i][{k}] * {nm}"))
-            .collect();
-        self.line(&format!("{pre}{}", decl.join(" ")));
-        self.line(&format!(
-            "for (uint i = 0; i < {m}u; ++i) s[rr][i] += {};",
-            terms.join(" + ")
-        ));
+        // Each token's activations for this step, loaded once and reused by
+        // every weight row below: that reuse is the whole point of a batch.
+        self.line(&format!("float xa[{m}][{step}];"));
+        for k in 0..step {
+            if unroll {
+                for i in 0..m {
+                    self.line(&format!(
+                        "xa[{i}][{k}] = {};",
+                        Self::read(&ops[0].0, &format!("p + {}u", i * kd + k))
+                    ));
+                }
+            } else {
+                self.line(&format!(
+                    "for (uint i = 0; i < {m}u; ++i) xa[i][{k}] = {};",
+                    Self::read(&ops[0].0, &format!("i * {kd}u + p + {k}u"))
+                ));
+            }
+        }
+        let terms = |i: &str| -> String {
+            names
+                .iter()
+                .enumerate()
+                .map(|(k, nm)| format!("xa[{i}][{k}] * {nm}"))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        if unroll {
+            for rr in 0..r {
+                // Braces per row: `pre` declares names of its own.
+                self.line("{");
+                self.depth += 1;
+                self.line(&format!(
+                    "const uint j = min(sgid * {r}u + {rr}u, {}u);",
+                    n - 1
+                ));
+                // `sgr`/`mgr` are register tiles too, so their row index has
+                // to be a literal for the same reason.
+                let lit = |s: &str| s.replace("[rr]", &format!("[{rr}]"));
+                self.line(&format!(
+                    "{}{}",
+                    lit(&pre),
+                    decl.iter().map(|d| lit(d)).collect::<Vec<_>>().join(" ")
+                ));
+                for i in 0..m {
+                    self.line(&format!("s[{rr}][{i}] += {};", terms(&i.to_string())));
+                }
+                self.depth -= 1;
+                self.line("}");
+            }
+        } else {
+            self.line(&format!("for (uint rr = 0; rr < {r}u; ++rr) {{"));
+            self.depth += 1;
+            self.line(&format!(
+                "const uint j = min(sgid * {r}u + rr, {}u);",
+                n - 1
+            ));
+            self.line(&format!("{pre}{}", decl.join(" ")));
+            self.line(&format!(
+                "for (uint i = 0; i < {m}u; ++i) s[rr][i] += {};",
+                terms("i")
+            ));
+            self.depth -= 1;
+            self.line("}");
+        }
         self.depth -= 1;
         self.line("}");
         self.depth -= 1;
         self.line("}");
-        self.depth -= 1;
-        self.line("}");
-        self.line(&format!(
-            "for (uint rr = 0; rr < {r}u; ++rr) for (uint i = 0; i < {m}u; ++i) \
-             for (uint d = {}u; d > 0; d /= 2) s[rr][i] += simd_shuffle_down(s[rr][i], d);",
-            lanes / 2
-        ));
-        self.line(&format!(
-            "if (lane == 0) for (uint rr = 0; rr < {r}u; ++rr) {{ const uint j = sgid * {r}u + rr; \
-             if (j < {n}u) for (uint i = 0; i < {m}u; ++i) scratch[{res} + i * {n}u + j] = s[rr][i]; }}"
-        ));
+        // The reduction and the store index `s` too, and one loop-variable
+        // index anywhere is enough to put the whole tile on the stack.
+        if unroll {
+            for rr in 0..r {
+                for i in 0..m {
+                    self.line(&format!(
+                        "for (uint d = {}u; d > 0; d /= 2) \
+                         s[{rr}][{i}] += simd_shuffle_down(s[{rr}][{i}], d);",
+                        lanes / 2
+                    ));
+                }
+            }
+            self.line("if (lane == 0) {");
+            self.depth += 1;
+            for rr in 0..r {
+                self.line(&format!(
+                    "{{ const uint j = sgid * {r}u + {rr}u; if (j < {n}u) {{ {} }} }}",
+                    (0..m)
+                        .map(|i| format!("scratch[{res} + {}u + j] = s[{rr}][{i}];", i * n))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+            self.depth -= 1;
+            self.line("}");
+        } else {
+            self.line(&format!(
+                "for (uint rr = 0; rr < {r}u; ++rr) for (uint i = 0; i < {m}u; ++i) \
+                 for (uint d = {}u; d > 0; d /= 2) s[rr][i] += simd_shuffle_down(s[rr][i], d);",
+                lanes / 2
+            ));
+            self.line(&format!(
+                "if (lane == 0) for (uint rr = 0; rr < {r}u; ++rr) {{ const uint j = sgid * {r}u + rr; \
+                 if (j < {n}u) for (uint i = 0; i < {m}u; ++i) scratch[{res} + i * {n}u + j] = s[rr][i]; }}"
+            ));
+        }
         self.depth -= 1;
         self.line("}");
         self.barrier();
