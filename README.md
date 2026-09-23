@@ -40,8 +40,9 @@ correctness left it. Prefill has a correct batched path, but it's 5–8×
 short of Ollama.
 
 **Qwen3.5-27B** (`qwen3.8:27b-mlx`, NVFP4, the model in daily use here)
-also runs on these kernels now, at 26.5 tok/s against Ollama's 58–76, with
-the same answers. [`docs/qwen.md`](docs/qwen.md) has the shape of the
+also runs on these kernels now, at 26.5 tok/s, or **42.7 speculating with
+the checkpoint's own draft head** — against Ollama's 58–76, with the same
+answers either way. [`docs/qwen.md`](docs/qwen.md) has the shape of the
 model, where the time goes, and what matching Ollama needs.
 
 | Phase | State | Details |
