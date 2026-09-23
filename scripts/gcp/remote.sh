@@ -23,6 +23,14 @@ nvidia-smi | tee "$R/nvidia-smi.txt" || { echo "no NVIDIA driver after 15 min"; 
 { lscpu | head -20; nvcc --version 2>/dev/null || ls /usr/local | grep -i cuda; } > "$R/machine.txt"
 
 step "Rust toolchain"
+# The Deep Learning VM image ships CUDA and Python but no C compiler, and
+# rustc needs one to link. Without this every build dies at `linker `cc`
+# not found`, long after the image has convinced you it is a build machine.
+if ! command -v cc >/dev/null; then
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential
+fi
+cc --version | head -1 | tee -a "$R/machine.txt"
 if ! command -v cargo >/dev/null; then
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
 fi
