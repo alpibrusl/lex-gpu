@@ -1,0 +1,10 @@
+[package]
+name = "lex-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CUDA C emitter for the lex IR."
+
+[dependencies]
+lex-ir = { workspace = true }

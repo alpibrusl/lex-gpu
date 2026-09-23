@@ -4,7 +4,7 @@
     python3 scripts/qwen_ref.py --prompt "The capital of France is" --compare
 
 What `llama_ref.py` is for the Llama models: an independent implementation
-that owns no kernels, so a disagreement with tile points at tile, and a
+that owns no kernels, so a disagreement with lex points at lex, and a
 disagreement with Ollama points at quantised rounding. It follows the
 published architecture (`mlx_lm/models/qwen3_5.py`, `qwen3_next.py`,
 `gated_delta.py`), in f32 numpy.
@@ -312,7 +312,7 @@ def main():
     ap.add_argument(
         "--write-golden",
         nargs="?",
-        const="crates/tile-rt/tests/data/qwen35_27b_golden.txt",
+        const="crates/lex-rt/tests/data/qwen35_27b_golden.txt",
         help="write the fixture the Rust tests read (several prompts)",
     )
     ap.add_argument("--tol", type=float, default=0.15)

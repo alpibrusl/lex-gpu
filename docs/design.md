@@ -117,6 +117,20 @@ Each target instantiates the levels it has, with sizes and capabilities:
 
 A schedule that asks for `Cluster` on a target without it is rejected; a schedule that asks for async copy on Metal lowers to a software-pipelined synchronous copy with a cost-model warning.
 
+### Source files
+
+Source files are **`.lx`**. `.lex` belongs to `lex-lang`, the sibling
+project; the two are separate languages in one family, so they take
+separate extensions rather than one being a dialect of the other.
+
+Nothing reads a `.lx` file yet. There is no lexer and no parser: programs
+are built through the Rust IR API, and the syntax below is a design. It
+stays unbuilt deliberately until a second backend exists, because the
+parts worth arguing about — how schedules are written, what an autotuner's
+`?` binds to, how layouts and MMA fragments appear in types — are exactly
+the parts a second target would rewrite. A surface designed against one
+backend is a surface designed twice.
+
 ### Algorithm / schedule split
 
 ```
@@ -214,14 +228,14 @@ Rust frontend, MLIR middle, vendor back ends; one crate per stage so the pieces 
 
 | Stage | Crate | Responsibility | Depends on |
 | --- | --- | --- | --- |
-| Parse + typecheck | `tile-front` | Tile/Layout/Space types, linearity, effect checking, schedule validation against the target table | none |
-| Tile IR | `tile-ir` | SSA IR over tiles; canonical form for fusion and scheduling | tile-front |
-| Graph compiler | `tile-graph` | Shape inference, quant propagation, kernel partitioning by cost model, persistent-kernel emission | tile-ir |
-| Scheduler + autotuner | `tile-sched` | Fill open schedule params; roofline cost model; benchmark top-k; tuning cache | tile-ir, backends |
-| MLIR bridge | `tile-mlir` | Lower tile IR to linalg/gpu dialects via melior (Rust MLIR bindings) | tile-ir |
-| Backends | `tile-nv`, `tile-amd`, `tile-metal` | Target table, intrinsics, final lowering, driver loading | tile-mlir |
-| Runtime | `tile-rt` | Paged KV, ragged batch, weight loading (safetensors), sampling loop, per-target driver glue | backends |
-| Python | `tile-py` | pyo3 binding: load model, generate | tile-rt |
+| Parse + typecheck | `lex-front` | Tile/Layout/Space types, linearity, effect checking, schedule validation against the target table | none |
+| Tile IR | `lex-ir` | SSA IR over tiles; canonical form for fusion and scheduling | lex-front |
+| Graph compiler | `lex-graph` | Shape inference, quant propagation, kernel partitioning by cost model, persistent-kernel emission | lex-ir |
+| Scheduler + autotuner | `lex-sched` | Fill open schedule params; roofline cost model; benchmark top-k; tuning cache | lex-ir, backends |
+| MLIR bridge | `lex-mlir` | Lower tile IR to linalg/gpu dialects via melior (Rust MLIR bindings) | lex-ir |
+| Backends | `lex-nv`, `lex-amd`, `lex-metal` | Target table, intrinsics, final lowering, driver loading | lex-mlir |
+| Runtime | `lex-rt` | Paged KV, ragged batch, weight loading (safetensors), sampling loop, per-target driver glue | backends |
+| Python | `lex-py` | pyo3 binding: load model, generate | lex-rt |
 
 Testing is layered the same way. Each tile op has a reference interpreter in the frontend; every backend must match it bit-for-bit for integer paths and within declared ULP for float paths. A 12-layer toy transformer is the CI model; Llama-3-8B is the nightly.
 
@@ -234,9 +248,9 @@ Each milestone ends with a model running, not a feature list; the first target i
 | # | Milestone | Deliverable | Exit test | Est. |
 | --- | --- | --- | --- | --- |
 | M0 | Type system on paper | Tile/Layout/Space/effect rules, target table format, 5 worked kernels typed by hand | Peer review; no code | 3 wk |
-| M1 | Frontend + interpreter | `tile-front`, `tile-ir`, reference interpreter | 12-layer toy transformer runs on CPU interpreter, matches PyTorch | 6 wk |
+| M1 | Frontend + interpreter | `lex-front`, `lex-ir`, reference interpreter | 12-layer toy transformer runs on CPU interpreter, matches PyTorch | 6 wk |
 | M2 | First backend, correct | Metal backend, MSL emission, no scheduling | Llama-3-8B int4 decodes correct tokens on an M-series Mac at any speed | 8 wk |
-| M3 | Scheduling + fusion | `tile-sched`, `tile-graph`, one fused decode layer | 8B decode ≥ 70% of llama.cpp Metal tok/s | 8 wk |
+| M3 | Scheduling + fusion | `lex-sched`, `lex-graph`, one fused decode layer | 8B decode ≥ 70% of llama.cpp Metal tok/s | 8 wk |
 | M4 | Second backend | NVIDIA via MLIR NVVM, TMA + wgmma intrinsics | 8B decode correct on H100; ≥ 60% of vLLM | 8 wk |
 | M5 | NVIDIA to roofline | Warp specialisation, persistent kernel, autotune cache | ≥ 85% of vLLM / FA3 at batch 1 and 32 | 8 wk |
 | M6 | Third backend | AMD via ROCDL, MFMA atoms, LDS pipelining | 8B decode correct on MI300; ≥ 70% of aiter | 8 wk |

@@ -1,0 +1,11 @@
+[package]
+name = "lex-front"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Typed tile programs: linearity and effect checking, and a reference interpreter."
+
+[dependencies]
+lex-ir = { workspace = true }
+half = { workspace = true }

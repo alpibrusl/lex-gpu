@@ -55,21 +55,32 @@ FAMILY="$(gcloud compute images list --project deeplearning-platform-release \
 echo "image family: deeplearning-platform-release/$FAMILY"
 
 ZONE=""
+# Every zone we have asked for a VM in, recorded *before* the request, because
+# an interrupt during create leaves a machine that $ZONE does not know about
+# yet. A GPU left running is the expensive mistake here, so the sweep is over
+# everything we might have started, not just the one we settled on.
+ATTEMPTED=()
 cleanup() {
-  if [ -n "$ZONE" ] && [ "$KEEP" != 1 ]; then
-    echo "deleting $NAME in $ZONE"
-    gc compute instances delete "$NAME" --zone "$ZONE" || true
-  elif [ -n "$ZONE" ]; then
+  if [ "$KEEP" = 1 ] && [ -n "$ZONE" ]; then
     echo "KEEP=1: $NAME is still running in $ZONE. Delete it with:"
     echo "  gcloud --project $GCP_PROJECT compute instances delete $NAME --zone $ZONE"
+    return
   fi
+  local z
+  for z in ${ZONE:+$ZONE} ${ATTEMPTED[@]+"${ATTEMPTED[@]}"}; do
+    if gc compute instances delete "$NAME" --zone "$z" >/dev/null 2>&1; then
+      echo "deleted $NAME in $z"
+    fi
+  done
 }
-trap cleanup EXIT
+# EXIT alone does not fire when the shell is killed by a signal.
+trap cleanup EXIT INT TERM HUP
 
 spot_flags=()
 [ "$SPOT" = 1 ] && spot_flags=(--provisioning-model=SPOT)
 for z in $ZONES; do
   echo "trying $MACHINE in $z"
+  ATTEMPTED+=("$z")
   if gc compute instances create "$NAME" --zone "$z" \
       --machine-type "$MACHINE" \
       --maintenance-policy TERMINATE ${spot_flags[@]+"${spot_flags[@]}"} \

@@ -17,12 +17,79 @@ GCP_PROJECT=<project> GPU=a100 SPOT=1 scripts/gcp/nvidia_test.sh
 1. `nvidia-smi`, the CPU, and the CUDA and Rust versions (`machine.txt`).
 2. `cargo test --release --workspace`: the IR, checker, interpreter and
    emitters. This is the same suite CI runs on Linux.
-3. `cargo test -p tile-cuda`, once the CUDA backend exists. Until then the
+3. `cargo test -p lex-cuda`, once the CUDA backend exists. Until then the
    step is skipped, and the log says so.
 4. Ollama's decode and prefill speeds on that GPU, for
    `llama3.2:1b` and `llama3.1:8b`, at 0, 512 and 1,440 positions
    (`scripts/ollama_bench.py`, the same script used on the Mac). That's the
    bar the CUDA backend has to meet.
+
+## Most of it does not need the cloud
+
+`nvcc` needs a GPU to *run* a kernel, not to compile one, and NVIDIA ships
+CUDA for arm64 — so both it and `ptxas` run natively on an Apple Silicon
+Mac in a container. `scripts/cuda_check.sh` does that:
+
+```sh
+scripts/cuda_check.sh out/*.cu        # ARCH=sm_89 by default, which is an L4
+```
+
+That puts three of the four test layers on the laptop:
+
+| layer | catches | needs |
+| --- | --- | --- |
+| golden files | the emitted text, diffed | nothing |
+| the interpreter | that the program is correct | nothing |
+| `cuda_check.sh` | that it compiles and assembles | docker |
+| an L4 | races, numerics, speed | the cloud |
+
+The third layer is worth more here than the equivalent is on Metal.
+`ptxas -v` reports register count and spill bytes **directly**:
+
+```
+0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+Used 12 registers, used 0 barriers, 380 bytes cmem[0]
+```
+
+On Metal that has to be inferred from throughput cliffs, and this repo
+misdiagnosed it twice doing so — the `bo = 256` collapse and the 8-token
+f32 cliff were both register pressure, reached by guessing. Here the
+assembler simply says, before the code has ever run.
+
+One macOS trap, because it fails silently: Docker shares `/Users` but not
+`/private/tmp`, and a bind mount of an unshared path comes up **empty
+rather than erroring**. The script stages through `$HOME/.cache`.
+
+## The first run: what an L4 actually is
+
+2026-09-23, `g2-standard-8` Spot in europe-west4-b, driver 580.173.02,
+CUDA 13.0. The 91 target-independent tests — IR, checker, interpreter,
+MSL emitter goldens — pass on x86 Linux exactly as they do on the Mac.
+The Mac runs 108; the other 17 are Metal-gated.
+
+Ollama on that L4, which is the bar a CUDA backend has to meet:
+
+| model | decode tok/s | prefill tok/s (0 / 512 / 1440) |
+| --- | --- | --- |
+| `llama3.2:1b` | 158–164 | 317 / 16,068 / 19,167 |
+| `llama3.1:8b` | 48–50 | 98 / 3,106 / 2,935 |
+
+**Read that next to the M4 Max, because they are opposite machines.** The
+8B decodes at 48–50 here against 83–87 on the Mac, and prefills at 2,935
+against ~900. An L4 has roughly half the memory bandwidth and several
+times the arithmetic throughput.
+
+Every choice in `lex-msl` was made against a bandwidth-bound machine: the
+NVFP4 bit-layout decode, split-KV attention, the activation-traffic work
+in the batched matmul. On an L4 the binding constraint is the other one,
+so a backend that inherits Metal's schedule will be wrong here in a
+specific and predictable direction. That is exactly the claim the
+algorithm/schedule split makes — same algorithm, different schedule — and
+it is now testable rather than asserted.
+
+It also moves the target. On this hardware the interesting number is not
+decode but **prefill**, where Metal is 5–8x short and an L4 has compute
+to spare.
 
 ## GPUs and regions
 

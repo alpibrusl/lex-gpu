@@ -3,7 +3,7 @@
 This is the oracle chain for P2's exit test:
 
     Ollama (llama.cpp, black box)  <-- this script checks -->  PyTorch reference
-    PyTorch reference              <-- Rust tests check   -->  tile on the GPU
+    PyTorch reference              <-- Rust tests check   -->  lex on the GPU
 
 The reference reads the *same GGUF file* Ollama serves, dequantises it with
 `gguf.py`, and runs a plain float32 Llama forward pass in PyTorch. It asks
@@ -36,7 +36,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from gguf import GGUF, ollama_model  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DATA = ROOT / "crates/tile-rt/tests/data"
+DATA = ROOT / "crates/lex-rt/tests/data"
 
 
 def golden_path(model):
@@ -175,7 +175,7 @@ def compare(model, lm, tk, prompt, steps, top, bos, tol):
         same = mine == want
         ok &= same and d <= tol
         print(
-            f"  {step:2d}  ollama {o['token']!r:14} tile-ref {tk.decode([mine])!r:14} "
+            f"  {step:2d}  ollama {o['token']!r:14} lex-ref {tk.decode([mine])!r:14} "
             f"{'same' if same else 'DIFF'}   max |dlogprob| over top-{top} {d:.4f}"
         )
         topk = torch.topk(lp, top)

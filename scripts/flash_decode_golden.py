@@ -1,7 +1,7 @@
 """Golden output for the P1 flash-attention decode test, computed by PyTorch.
 
 Inputs are not stored: they are regenerated bit-for-bit from the same xorshift32
-pattern as `tile_ir::reference::fill_pattern_f32`, rounded to f16 storage. Only
+pattern as `lex_ir::reference::fill_pattern_f32`, rounded to f16 storage. Only
 PyTorch's output is checked in, so the Rust test compares against an
 independent implementation without CI needing torch.
 
@@ -18,11 +18,11 @@ import torch
 import torch.nn.functional as F
 
 Q_ROWS, D, SEQ = 32, 128, 512
-OUT = pathlib.Path(__file__).resolve().parent.parent / "crates/tile-front/tests/data/flash_decode_f16_q32_d128_s512.f32"
+OUT = pathlib.Path(__file__).resolve().parent.parent / "crates/lex-front/tests/data/flash_decode_f16_q32_d128_s512.f32"
 
 
 def fill_pattern(n: int, seed: int) -> np.ndarray:
-    """Mirror of tile_ir::reference::fill_pattern_f32 (xorshift32)."""
+    """Mirror of lex_ir::reference::fill_pattern_f32 (xorshift32)."""
     s = (seed | 1) & 0xFFFFFFFF
     out = np.empty(n, dtype=np.float32)
     for i in range(n):

@@ -4,8 +4,8 @@
 #
 # 1. The machine: nvidia-smi, CPU, driver and CUDA versions.
 # 2. The workspace tests: IR, checker, interpreter, emitters. The same suite
-#    CI runs on Linux; tile-metal compiles to nothing off macOS.
-# 3. The CUDA backend's tests, once a `tile-cuda` crate exists: skipped
+#    CI runs on Linux; lex-metal compiles to nothing off macOS.
+# 3. The CUDA backend's tests, once a `lex-cuda` crate exists: skipped
 #    (and said so) until then.
 # 4. The baseline: Ollama's decode and prefill speed on this GPU for $MODELS,
 #    at the same contexts as on the Mac (scripts/ollama_bench.py).
@@ -23,6 +23,14 @@ nvidia-smi | tee "$R/nvidia-smi.txt" || { echo "no NVIDIA driver after 15 min"; 
 { lscpu | head -20; nvcc --version 2>/dev/null || ls /usr/local | grep -i cuda; } > "$R/machine.txt"
 
 step "Rust toolchain"
+# The Deep Learning VM image ships CUDA and Python but no C compiler, and
+# rustc needs one to link. Without this every build dies at `linker `cc`
+# not found`, long after the image has convinced you it is a build machine.
+if ! command -v cc >/dev/null; then
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential
+fi
+cc --version | head -1 | tee -a "$R/machine.txt"
 if ! command -v cargo >/dev/null; then
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
 fi
@@ -34,11 +42,11 @@ cargo test --release --workspace 2>&1 | tee "$R/cargo-test.log" | grep -E "test 
 [ "${PIPESTATUS[0]}" = 0 ] || fail=1
 
 step "CUDA backend"
-if [ -d crates/tile-cuda ]; then
-  cargo test --release -p tile-cuda 2>&1 | tee "$R/cuda-test.log" | grep -E "test result|FAILED|panicked"
+if [ -d crates/lex-cuda ]; then
+  cargo test --release -p lex-cuda 2>&1 | tee "$R/cuda-test.log" | grep -E "test result|FAILED|panicked"
   [ "${PIPESTATUS[0]}" = 0 ] || fail=1
 else
-  echo "no crates/tile-cuda yet: skipped" | tee "$R/cuda-test.log"
+  echo "no crates/lex-cuda yet: skipped" | tee "$R/cuda-test.log"
 fi
 
 step "Ollama baseline"
