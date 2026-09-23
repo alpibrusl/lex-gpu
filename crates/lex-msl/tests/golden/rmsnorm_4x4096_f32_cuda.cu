@@ -16,7 +16,7 @@ extern "C" __global__ void rmsnorm_4x4096_f32(
 )
 {
     const uint tid = threadIdx.x;
-    const uint gid = blockIdx.x, gid2 = blockIdx.y;
+    const uint gid = blockIdx.x;
     __shared__ float scratch[8];
     __syncthreads();
     {

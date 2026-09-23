@@ -252,7 +252,12 @@ pub fn lower_with(
             writable: p.writable,
         })
         .collect();
-    s.push_str(&g.d.entry(&entry, &params, !prog.dyn_scalars.is_empty()));
+    s.push_str(&g.d.entry(
+        &entry,
+        &params,
+        !prog.dyn_scalars.is_empty(),
+        g.body.contains("gid2"),
+    ));
     if arena_bytes > 0 {
         let _ = writeln!(
             s,
@@ -264,11 +269,19 @@ pub fn lower_with(
     if g.scratch > 0 {
         let _ = writeln!(s, "    {}", g.d.shared_array("float", "scratch", g.scratch));
     }
-    if g.fp4 {
-        // The sixteen E2M1 values, one per lane of the simdgroup, read
-        // once. A code then costs a shuffle instead of a load: with real
-        // weights the indices scatter, and a constant-memory gather runs
-        // at about half the bandwidth an arithmetic decode does.
+    // The sixteen E2M1 values, one per lane of the simdgroup, read once. A
+    // code then costs a shuffle instead of a load: with real weights the
+    // indices scatter, and a constant-memory gather runs at about half the
+    // bandwidth an arithmetic decode does.
+    //
+    // Only some NVFP4 kernels want it. `Dequant4` builds a lane gather as a
+    // *lazy* expression, and a reduction that consumes it may supersede it
+    // with the arithmetic `fp4_pair` and never emit the gather at all -- as
+    // the quantised matvec does. So the test is whether the name reached
+    // the body, not whether the op that could have produced it ran. Metal
+    // dropped the dead constant silently; nvcc warned, which is how this
+    // was noticed at all.
+    if g.fp4 && g.body.contains("fp4_lane") {
         s.push_str("    const float fp4_lane = FP4_V[tid & 15u];\n");
     }
     s.push_str(&g.body);

@@ -206,3 +206,54 @@ fn nvfp4_matvec_lowered_to_cuda() {
     );
     compare_ext("matvec_nvfp4_17408x5120_cuda", &l.source, "cu");
 }
+
+/// Nothing the lowering emits may be declared and unused, or used and
+/// undeclared.
+///
+/// This exists because a change that gated `fp4_lane` on whether the body
+/// actually used it removed the *declaration* as well, and every test in
+/// this repository still passed: the fused path never uses it, and the
+/// path that does is reached only with `LEX_NO_LAZY=1`, which nothing
+/// exercises. The bug was visible solely as an nvcc warning about an
+/// unused variable in a CUDA golden.
+///
+/// So the invariant is written down rather than left to a warning on one
+/// of the two backends.
+#[test]
+fn nothing_is_declared_unused_or_used_undeclared() {
+    use lex_front::llama::{QLayout, matmul_q, matvec_q};
+    use lex_msl::dialect::Cuda;
+    use lex_msl::program::lower_with;
+
+    let progs = [
+        matvec_q(5120, 17408, 8, 5120, QLayout::NVFP4, false).expect("matvec"),
+        matvec_q(5120, 17408, 8, 5120, QLayout::NVFP4, true).expect("matvec res"),
+        matmul_q(4, 5120, 17408, 32, 5120, QLayout::NVFP4, false).expect("matmul"),
+        matvec_q(4096, 4096, 8, 4096, QLayout::Q4_K, false).expect("q4k"),
+    ];
+    let targets = [Target::apple_m_series(), Target::nvidia_ada()];
+    for p in &progs {
+        for t in &targets {
+            for (dialect, name) in [
+                (
+                    &lex_msl::dialect::Msl as &dyn lex_msl::dialect::Dialect,
+                    "msl",
+                ),
+                (&Cuda as &dyn lex_msl::dialect::Dialect, "cuda"),
+            ] {
+                let l = lower_with(p, t, 256, dialect).expect("lower");
+                for var in ["fp4_lane", "gid2", "scratch", "arena"] {
+                    let declared = l.source.contains(&format!("{var} ="))
+                        || l.source.contains(&format!("{var}["));
+                    let mentions = l.source.matches(var).count();
+                    assert!(
+                        mentions == 0 || declared,
+                        "`{var}` used but never declared in {} for {name}/{}",
+                        p.name,
+                        t.name
+                    );
+                }
+            }
+        }
+    }
+}

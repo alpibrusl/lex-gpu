@@ -15,7 +15,7 @@ kernel void flash_decode_f16_bq4_bk16_s2(
     uint tid [[thread_index_in_threadgroup]],
     uint3 tgpos [[threadgroup_position_in_grid]])
 {
-    const uint gid = tgpos.x, gid2 = tgpos.y;
+    const uint gid = tgpos.x;
     threadgroup float4 arena4[512];
     threadgroup uchar* arena = (threadgroup uchar*)arena4;
     threadgroup float scratch[320];

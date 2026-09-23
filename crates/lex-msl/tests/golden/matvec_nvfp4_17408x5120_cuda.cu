@@ -41,9 +41,8 @@ extern "C" __global__ void matvec_nvfp4_17408x5120(
 )
 {
     const uint tid = threadIdx.x;
-    const uint gid = blockIdx.x, gid2 = blockIdx.y;
+    const uint gid = blockIdx.x;
     __shared__ float scratch[8];
-    const float fp4_lane = FP4_V[tid & 15u];
     float v1[1];
     for (uint k = 0; k < 1u; ++k) {
         const uint e = k * 256u + tid;

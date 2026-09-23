@@ -119,7 +119,9 @@ pub trait Dialect {
     /// to get wrong, and equally none to get right -- and reads the indices
     /// from builtins inside the body. The body that follows is identical
     /// either way, which is the point.
-    fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool) -> String;
+    /// `gid2` is only declared when the body uses it: most kernels have one
+    /// grid dimension, and an unused declaration is dead code in the output.
+    fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool, gid2: bool) -> String;
 }
 
 /// Metal Shading Language.
@@ -183,7 +185,7 @@ impl Dialect for Msl {
         FP4_TABLES_MSL.to_string()
     }
 
-    fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool) -> String {
+    fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool, gid2: bool) -> String {
         let mut s = format!("kernel void {name}(\n");
         for (i, p) in params.iter().enumerate() {
             let cv = if p.writable { "" } else { "const " };
@@ -200,7 +202,11 @@ impl Dialect for Msl {
         }
         s.push_str("    uint tid [[thread_index_in_threadgroup]],\n");
         s.push_str("    uint3 tgpos [[threadgroup_position_in_grid]])\n{\n");
-        s.push_str("    const uint gid = tgpos.x, gid2 = tgpos.y;\n");
+        s.push_str(if gid2 {
+            "    const uint gid = tgpos.x, gid2 = tgpos.y;\n"
+        } else {
+            "    const uint gid = tgpos.x;\n"
+        });
         s
     }
 }
@@ -286,7 +292,7 @@ impl Dialect for Cuda {
         FP4_TABLES_CUDA.to_string()
     }
 
-    fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool) -> String {
+    fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool, gid2: bool) -> String {
         let mut s = format!("extern \"C\" __global__ void {name}(\n");
         for p in params {
             let cv = if p.writable { "" } else { "const " };
@@ -303,7 +309,11 @@ impl Dialect for Cuda {
         }
         s.push_str(")\n{\n");
         s.push_str("    const uint tid = threadIdx.x;\n");
-        s.push_str("    const uint gid = blockIdx.x, gid2 = blockIdx.y;\n");
+        s.push_str(if gid2 {
+            "    const uint gid = blockIdx.x, gid2 = blockIdx.y;\n"
+        } else {
+            "    const uint gid = blockIdx.x;\n"
+        });
         s
     }
 }
