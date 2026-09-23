@@ -70,6 +70,17 @@ fn main() -> Result<(), String> {
         // breakdown is the only thing that tells them apart.
         if std::env::var_os("LEX_SYNC").is_some() {
             let mut prof = rt.profile();
+            // Sum of the kernels against the wall time they ran in. What is
+            // missing is not in any kernel: dispatch gaps, host writes,
+            // downloads. Under LEX_SYNC the dispatches are serialised, so
+            // this is an upper bound on kernel time and the residue is a
+            // lower bound on everything else.
+            // `profile` accumulates seconds, not milliseconds.
+            let kernels: f64 = prof.iter().map(|(_, _, s)| s).sum::<f64>() * 1e3;
+            println!(
+                "          kernels {kernels:.0} ms serialised, wall {ms:.0} ms \
+                 -- LEX_SYNC inflates both; see the note",
+            );
             prof.sort_by(|a, b| b.2.total_cmp(&a.2));
             for (site, calls, ms) in prof.iter().take(6) {
                 println!("          {site:<22} {calls:>5} calls {ms:>8.2} ms");

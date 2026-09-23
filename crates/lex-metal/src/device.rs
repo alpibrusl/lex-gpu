@@ -211,6 +211,29 @@ impl Gpu {
         };
     }
 
+    /// Read `out.len()` elements starting `offset` elements in.
+    ///
+    /// Prefill wants the last row of a `[tokens, vocab]` logit buffer and
+    /// nothing else. Without an offset the caller copies the whole thing
+    /// and discards all but the tail -- 7.9 MB a chunk on this model, most
+    /// of a gigabyte over a long prompt.
+    pub fn download_at<T: Copy>(&self, buf: &Buffer, offset: usize, out: &mut [T]) {
+        let sz = std::mem::size_of::<T>();
+        let end = (offset + out.len()) * sz;
+        assert!(
+            end as u64 <= buf.length(),
+            "read of {end} B from a {} B buffer",
+            buf.length()
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buf.contents().cast::<T>().add(offset),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+    }
+
     /// Run the pipeline once and wait.
     pub fn run(&self, pipeline: &Pipeline, buffers: &[&Buffer]) {
         self.dispatch(pipeline, buffers, 1);

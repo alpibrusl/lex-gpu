@@ -1134,9 +1134,11 @@ mod gpu {
                 self.gpu.download(&self.bacts.logits, &mut flat);
                 Ok(flat.chunks(v).map(<[f32]>::to_vec).collect())
             } else {
-                let mut flat = vec![0.0f32; t * v];
-                self.gpu.download(&self.bacts.logits, &mut flat);
-                Ok(vec![flat[(t - 1) * v..].to_vec()])
+                // Only the last row is wanted, so only the last row moves.
+                let mut last = vec![0.0f32; v];
+                self.gpu
+                    .download_at(&self.bacts.logits, (t - 1) * v, &mut last);
+                Ok(vec![last])
             }
         }
 
