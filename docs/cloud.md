@@ -24,6 +24,37 @@ GCP_PROJECT=<project> GPU=a100 SPOT=1 scripts/gcp/nvidia_test.sh
    (`scripts/ollama_bench.py`, the same script used on the Mac). That's the
    bar the CUDA backend has to meet.
 
+## The first run: what an L4 actually is
+
+2026-09-23, `g2-standard-8` Spot in europe-west4-b, driver 580.173.02,
+CUDA 13.0. The 91 target-independent tests — IR, checker, interpreter,
+MSL emitter goldens — pass on x86 Linux exactly as they do on the Mac.
+The Mac runs 108; the other 17 are Metal-gated.
+
+Ollama on that L4, which is the bar a CUDA backend has to meet:
+
+| model | decode tok/s | prefill tok/s (0 / 512 / 1440) |
+| --- | --- | --- |
+| `llama3.2:1b` | 158–164 | 317 / 16,068 / 19,167 |
+| `llama3.1:8b` | 48–50 | 98 / 3,106 / 2,935 |
+
+**Read that next to the M4 Max, because they are opposite machines.** The
+8B decodes at 48–50 here against 83–87 on the Mac, and prefills at 2,935
+against ~900. An L4 has roughly half the memory bandwidth and several
+times the arithmetic throughput.
+
+Every choice in `lex-msl` was made against a bandwidth-bound machine: the
+NVFP4 bit-layout decode, split-KV attention, the activation-traffic work
+in the batched matmul. On an L4 the binding constraint is the other one,
+so a backend that inherits Metal's schedule will be wrong here in a
+specific and predictable direction. That is exactly the claim the
+algorithm/schedule split makes — same algorithm, different schedule — and
+it is now testable rather than asserted.
+
+It also moves the target. On this hardware the interesting number is not
+decode but **prefill**, where Metal is 5–8x short and an L4 has compute
+to spare.
+
 ## GPUs and regions
 
 | `GPU=` | Machine | GPU | Zones tried (in order) |
