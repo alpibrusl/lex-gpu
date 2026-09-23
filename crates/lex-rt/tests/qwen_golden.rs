@@ -434,3 +434,48 @@ fn split_kv_batch_agrees_with_the_serial_kernel() {
     }
     eprintln!("batch split vs serial at {FILL} positions: worst {worst:e} of scale");
 }
+
+/// `prefill` feeds the prompt batched and runs the draft head alongside it.
+///
+/// The head writes the same activation buffers the model's batched pass
+/// uses, so the thing to prove is that the model's answer is untouched: a
+/// prompt fed through `prefill` has to land exactly where the same tokens
+/// land one at a time.
+#[test]
+fn prefill_lands_where_the_same_tokens_land_one_by_one() {
+    let _lock = one_at_a_time();
+    let (model, cases) = parse(include_str!("data/qwen35_27b_golden.txt"));
+    // Past MAX_BATCH, so the chunking and the head's cache both advance
+    // more than once.
+    let prompt: Vec<u32> = (0..21).map(|i| 1000 + (i as u32 * 7919) % 200000).collect();
+    let _ = &cases;
+    let mut rt = match Runner::load(&model, prompt.len() + 16) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+
+    rt.reset();
+    let batched = rt.prefill(&prompt).expect("prefill");
+
+    rt.reset();
+    let mut serial = vec![];
+    for &t in &prompt {
+        serial = rt.step(t).expect("step");
+    }
+
+    let scale = serial.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+    let worst = batched
+        .iter()
+        .zip(&serial)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
+        / scale;
+    assert!(
+        worst < 2e-3,
+        "prefill differs from stepping by {worst:e} of scale"
+    );
+    eprintln!("prefill vs stepping: worst {worst:e} of scale");
+}

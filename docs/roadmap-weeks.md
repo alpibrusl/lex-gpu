@@ -54,37 +54,60 @@ and `llama3.1:8b` has not moved.
 
 ## M2 — speculation stops losing at context (1–2 weeks)
 
-Two faults were hiding behind each other, and M1 separated them.
+Two faults were hiding behind each other, and M1 separated them. One is
+fixed. The other turned out not to be the fault it looked like.
 
-**The verify does not scale.** After M1 a step is flat — 36.4 ms at zero
-context, 37.0 at 1440 — but the verify of two tokens goes from 40.6 ms to
-**67.9 ms**. That is 1.12 passes against 1.84. Speculation is 1.44x at zero
-context and 0.57x at 1440, and this is why.
+**The verify did not scale — fixed.** The batch plan compiled
+`build_causal` and nothing else: a serial scan of the cache with every
+query masked to its own position. `build_causal_split` cuts the cache
+across threadgroups and `build_combine_rows` merges the partials per
+query row. At 1440 positions:
 
-The cause is the same one M1 fixed, in the path M1 did not touch: the
-batch plan compiles `build_causal(t)` and there is no split variant of it.
-`build_split` attends one query to a cache; `build_causal` attends many
-queries with masking and scans serially. At 1440 positions a two-token
-verify (67.9 ms) barely beats two separate decode steps (74 ms), so
-batching the verify has stopped buying anything.
+| t | split | serial | split/step | serial/step |
+| --- | --- | --- | --- | --- |
+| 2 | 42.6 ms | 68.0 ms | 1.14 | 1.82 |
+| 4 | 55.4 ms | 98.0 ms | 1.48 | 2.62 |
 
-So this needs a **causal split kernel** — the cache cut across
-threadgroups, each query masked to its own position, partials merged. That
-is a kernel to write, not a port.
+The verify of two is now flat against the 40.5 ms it costs at no
+context. `examples/verify` measures this against the decode step it
+replaces, rather than inferring it from tokens per second — which
+divides by an acceptance rate that moves at the same time.
 
-**The draft head never sees the context.** `mtp_pos` only advances when
-the head drafts, so after a prompt fed with `step` the head's cache is
-empty while the model is at position 1440. Acceptance falls from 90.5% to
-61–75%.
+**The draft head not seeing the context was a red herring.** The head's
+cache only advanced when it drafted, so after a prompt fed with `step` it
+sat at position 0 while the model was at 1440. That was real, and
+`Runner::prefill` now fixes it: the prompt is fed batched and the head
+runs over it, since the model's hidden state at each position exists only
+while the prompt is being fed.
 
-Drafting sixteen tokens to warm it lifts acceptance to 74% and moves the
-speed not at all — because the verify, not acceptance, is what is losing.
-A short window is not enough either way, so when the verify is fixed this
-wants the head run over the prompt properly: a batched forward for the
-head, which it does not have.
+It buys nothing. Acceptance at 1440 is **68.1% warmed against 70.2%
+cold** — a wash. The drop from 89% was never the cold cache; it is what
+the benchmark feeds. With a five-token *random* prompt and no context at
+all, acceptance is 83%, against 89% for real text. The filler is 1440
+random tokens, and predicting the continuation of noise is simply harder.
 
-**Done when:** speculation is a win at 0, 512 and 1440, and acceptance at
-1440 is within a few points of acceptance at 0.
+So the head warm is kept because a head whose cache disagrees with the
+model's is wrong, not because it is worth any tokens per second. What is
+still unmeasured is acceptance on *coherent* long context, which is the
+only case anyone actually runs.
+
+**What is actually left is the undo.** With the verify fixed the trace
+at 1440 reads:
+
+    draft 3.5  save 0.8  verify 42.8  undo 18.0 (avg)  -> 1.68 tokens
+
+Every rejection restores the gated-delta state and replays the accepted
+prefix — a whole extra pass, 38.6 ms, on 32% of rounds. That is 30% of
+the round and the entire remaining gap: without it the same acceptance
+gives 35.7 tok/s (1.34x) instead of 28.3 (1.06x).
+
+The fix is not more acceptance, it is a cheaper rollback. The batched
+delta kernel already walks the `t` tokens in order; if it wrote its state
+after each one, rolling back to row `kept` would be the 0.8 ms copy
+`save` already costs instead of a replay.
+
+**Done when:** speculation is a win at 0, 512 and 1440, measured on
+coherent context rather than on random tokens.
 
 ## M3 — prefill attention (1–2 weeks)
 

@@ -67,10 +67,22 @@ fn main() -> Result<(), String> {
         rt.skip = s.split(',').map(String::from).collect();
     }
 
-    let mut logits = vec![];
-    for &t in &ids {
-        logits = rt.step(t)?;
+    // `prefill` feeds the prompt batched *and* runs the draft head over
+    // it, so the head's cache ends up holding the same history the model's
+    // does. LEX_NOWARM feeds it a token at a time instead, which is what
+    // left the head drafting from position 0 at a context of 1440.
+    fn fill(rt: &mut Runner, ids: &[u32]) -> Result<Vec<f32>, String> {
+        if std::env::var_os("LEX_NOWARM").is_some() {
+            let mut logits = vec![];
+            for &t in ids {
+                logits = rt.step(t)?;
+            }
+            return Ok(logits);
+        }
+        rt.prefill(ids)
     }
+
+    let mut logits = fill(&mut rt, &ids)?;
 
     // The draft head's attention cache only advances when it drafts, so
     // after a prompt fed with `step` it is empty while the model is deep
@@ -108,6 +120,13 @@ fn main() -> Result<(), String> {
         step_ms += t.elapsed().as_secs_f64() * 1e3;
     }
 
+    if std::env::var_os("LEX_PAIRS").is_some() {
+        eprintln!("  draft -> actual, first 8 rounds:");
+        for (s, d) in drafts.iter().enumerate().take(8) {
+            eprintln!("    {:>7?} vs {:?}", d.first(), actual.get(s + 1));
+        }
+    }
+
     // A draft counts only while every draft before it was right, because a
     // verify takes the longest matching prefix, not a scattering of hits.
     let mut hit = vec![0usize; depth];
@@ -129,10 +148,7 @@ fn main() -> Result<(), String> {
 
     // What it is all for: the same tokens, in less time.
     rt.reset();
-    let mut logits = vec![];
-    for &t in &ids {
-        logits = rt.step(t)?;
-    }
+    let logits = fill(&mut rt, &ids)?;
     let mut got = 0usize;
     let mut next = argmax(&logits);
     let t = Instant::now();

@@ -428,6 +428,8 @@ mod gpu {
         mtp: Option<Mtp>,
         /// `fc`'s input: the two normalised halves, embedding first.
         mtp_in: Buffer,
+        /// The same, for `MAX_BATCH` rows at once.
+        mtp_in_b: Buffer,
         /// The draft head's own cache length.
         mtp_pos: usize,
         snap: Option<Snapshot>,
@@ -751,6 +753,7 @@ mod gpu {
             let out_norm = floats(&gpu, &store, "model.language_model.norm.weight")?;
             let lm_head = QBuf::load(&gpu, &store, "lm_head.weight")?;
             let mtp_in = gpu.zeroed::<f32>(2 * cfg.hidden);
+            let mtp_in_b = gpu.zeroed::<f32>(MAX_BATCH * 2 * cfg.hidden);
 
             // Only a checkpoint with a draft head can reject anything.
             let snap = if mtp.is_some() {
@@ -784,6 +787,7 @@ mod gpu {
                 lm_head,
                 mtp,
                 mtp_in,
+                mtp_in_b,
                 mtp_pos: 0,
                 snap,
                 spec_h: None,
@@ -1027,6 +1031,263 @@ mod gpu {
         /// its feed-forward, then the shared norm and `lm_head`. The same
         /// shape as any attention layer in the model, which is why it needs
         /// no kernels of its own.
+        /// Every row of the last batched pass, before the head overwrites
+        /// them. One download, because `batch_hidden` of the last row
+        /// moves every earlier row anyway.
+        fn batch_hidden_all(&self, t: usize) -> Vec<f32> {
+            let mut all = vec![0.0f32; t * self.cfg.hidden];
+            self.gpu.download(&self.bacts.x, &mut all);
+            all
+        }
+
+        /// Feed a prompt, keeping the draft head's cache in step with the
+        /// model's.
+        ///
+        /// The head drafts token `t+2` from the model's hidden state at
+        /// `t` and the embedding of token `t+1`. Those hidden states exist
+        /// only while the prompt is being fed, which makes this the only
+        /// place the head can be warmed: afterwards they are gone, and
+        /// `mtp_pos` sits at 0 while the model is at 1440. The head then
+        /// drafts from a position the text never passed through, and
+        /// acceptance falls from 0.89 to 0.54 -- which costs more than the
+        /// verify does, because every rejection replays a whole pass.
+        ///
+        /// Returns the logits after the last token, as `step` would.
+        pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+            if tokens.is_empty() {
+                return Err("nothing to prefill".into());
+            }
+            let n = tokens.len();
+            let c = self.cfg.clone();
+            let mut logits = vec![];
+            let mut done = 0;
+            while done < n {
+                let t = MAX_BATCH.min(n - done);
+                let out = self.forward(&tokens[done..done + t], true)?;
+                logits = out.last().cloned().expect("a batch is never empty");
+                let hs = self.batch_hidden_all(t);
+                // The last prompt position pairs with a token the prompt
+                // does not have -- the one the model is about to generate.
+                // That row is the first real draft's, so it is left for it.
+                let warm = t.min(n - 1 - done);
+                if self.mtp.is_some() && warm > 0 {
+                    self.mtp_warm(&hs, &tokens[done + 1..done + 1 + warm])?;
+                }
+                // `forward` leaves the state in `bacts`, and `draft` reads
+                // the single-row `acts`. Handing the last row over is what
+                // keeps the first draft from guessing off a stale step.
+                if done + t == n {
+                    let h = c.hidden;
+                    self.spec_h = Some(hs[(t - 1) * h..t * h].to_vec());
+                }
+                done += t;
+            }
+            Ok(logits)
+        }
+
+        /// Advance the head's cache over `next.len()` positions at once.
+        ///
+        /// `hs` is the model's hidden state per row and `next[j]` is the
+        /// token after row `j` -- the pair the head predicts from. The
+        /// two halves are normalised on the host, as the single-row draft
+        /// does: 10240 values per row against the 239 MB the head reads.
+        fn mtp_warm(&mut self, hs: &[f32], next: &[u32]) -> Result<(), String> {
+            let t = next.len();
+            self.batch(t)?;
+            let c = self.cfg.clone();
+            let m = self.mtp.as_ref().expect("checked by the caller");
+            let (pre_e, pre_h) = (m.pre_e.clone(), m.pre_h.clone());
+            let mut fused = vec![0.0f32; t * 2 * c.hidden];
+            for (j, &tok) in next.iter().enumerate() {
+                let row = tok as usize * c.hidden;
+                let at = j * 2 * c.hidden;
+                rms_into(
+                    &self.embed[row..row + c.hidden],
+                    &pre_e,
+                    c.eps,
+                    &mut fused[at..at + c.hidden],
+                );
+                rms_into(
+                    &hs[j * c.hidden..(j + 1) * c.hidden],
+                    &pre_h,
+                    c.eps,
+                    &mut fused[at + c.hidden..at + 2 * c.hidden],
+                );
+            }
+            self.gpu.write(&self.mtp_in_b, 0, &fused);
+
+            let pos0 = self.mtp_pos;
+            if pos0 + t > self.cap {
+                return Err(format!("the head's cache is full ({} positions)", self.cap));
+            }
+            for j in 0..t {
+                let (cos, sin) = rope_tables(pos0 + j, c.rot, c.theta);
+                self.gpu.write(&self.bacts.cos, j * c.rot / 2, &cos);
+                self.gpu.write(&self.bacts.sin, j * c.rot / 2, &sin);
+            }
+            self.gpu.write(&self.bacts.scalars_pos, 0, &[pos0 as u32]);
+            self.gpu.write(
+                &self.bacts.scalars_attn,
+                0,
+                &[pos0 as u32, (pos0 + t).div_ceil(ATTN_BK) as u32],
+            );
+            let nsplit = self.nsplit(pos0 + t);
+            self.gpu.write(
+                &self.bacts.scalars_nsplit,
+                0,
+                &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
+            );
+
+            let plan = self.mtp_batch_plan(t);
+            let steps: Vec<Step<'_>> = plan
+                .iter()
+                .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
+                .collect();
+            self.gpu.run_launches(&steps);
+            drop(steps);
+            drop(plan);
+            self.mtp_pos += t;
+            Ok(())
+        }
+
+        /// The draft head over `t` rows at once, stopping before the
+        /// final norm and `lm_head`.
+        ///
+        /// Warming the head only needs its KV cache filled; the drafts it
+        /// would have made for tokens the model has already read are of no
+        /// use to anyone. Leaving `lm_head` out drops the most expensive
+        /// dispatch in the plan and a `t x vocab` download with it.
+        fn mtp_batch_plan(&self, t: usize) -> Vec<Dispatch<'_>> {
+            let (m, a, k) = (
+                self.mtp.as_ref().expect("checked by the caller"),
+                &self.bacts,
+                &self.batches[&t],
+            );
+            let at = match &m.layer.mixer {
+                Mixer::Attn(at) => at,
+                Mixer::Linear(_) => unreachable!("the draft head is an attention layer"),
+            };
+            let f = &m.layer.ffn;
+            let mut d: Vec<Dispatch<'_>> = vec![
+                (
+                    "mtp fc",
+                    &k.mv[&(m.fc.cols, m.fc.rows, false)],
+                    m.fc.bind(&self.mtp_in_b, None, &a.x),
+                    None,
+                ),
+                ("mtp rmsnorm", &k.rms, vec![&a.x, &at.norm, &a.h], None),
+                (
+                    "mtp matvec q",
+                    &k.mv[&(at.q.cols, at.q.rows, false)],
+                    at.q.bind(&a.h, None, &a.q32),
+                    None,
+                ),
+                (
+                    "mtp matvec k/v",
+                    &k.mv[&(at.k.cols, at.k.rows, false)],
+                    at.k.bind(&a.h, None, &a.k32),
+                    None,
+                ),
+                (
+                    "mtp matvec k/v",
+                    &k.mv[&(at.v.cols, at.v.rows, false)],
+                    at.v.bind(&a.h, None, &a.v32),
+                    None,
+                ),
+                (
+                    "mtp rope",
+                    &k.rope_q,
+                    vec![&a.q32, &at.q_norm, &a.cos, &a.sin, &a.q16, &a.gate],
+                    None,
+                ),
+                (
+                    "mtp rope",
+                    &k.rope_k,
+                    vec![&a.k32, &at.k_norm, &a.cos, &a.sin, &a.k16],
+                    None,
+                ),
+                (
+                    "mtp kv append",
+                    &k.kv_k,
+                    vec![&a.k16, &at.kcache, &a.scalars_pos],
+                    None,
+                ),
+                (
+                    "mtp kv append",
+                    &k.kv_v,
+                    vec![&a.v32, &at.vcache, &a.scalars_pos],
+                    None,
+                ),
+            ];
+            // The head's cache is its own and shorter than the model's, so
+            // it crosses the split threshold later -- but it crosses it.
+            let nsplit = self.nsplit(self.mtp_pos + t);
+            if nsplit >= attn_min_splits() {
+                d.push((
+                    "mtp attention",
+                    &k.attn_split,
+                    vec![
+                        &a.q16,
+                        &at.kcache,
+                        &at.vcache,
+                        &a.part_m,
+                        &a.part_l,
+                        &a.part_acc,
+                        &a.scalars_pos,
+                    ],
+                    Some([self.cfg.kv_heads, nsplit]),
+                ));
+                d.push((
+                    "mtp attention",
+                    &k.attn_combine,
+                    vec![&a.part_m, &a.part_l, &a.part_acc, &a.attn, &a.scalars_nsplit],
+                    None,
+                ));
+            } else {
+                d.push((
+                    "mtp attention",
+                    &k.attn,
+                    vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
+                    None,
+                ));
+            }
+            d.extend([
+                ("mtp gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated], None),
+                (
+                    "mtp matvec o_proj",
+                    &k.mv[&(at.o.cols, at.o.rows, true)],
+                    at.o.bind(&a.gated, Some(&a.x), &a.x2),
+                    None,
+                ),
+                ("mtp rmsnorm", &k.rms, vec![&a.x2, &f.norm, &a.h], None),
+                (
+                    "mtp matvec gate/up",
+                    &k.mv[&(f.gate.cols, f.gate.rows, false)],
+                    f.gate.bind(&a.h, None, &a.ffn_g),
+                    None,
+                ),
+                (
+                    "mtp matvec gate/up",
+                    &k.mv[&(f.up.cols, f.up.rows, false)],
+                    f.up.bind(&a.h, None, &a.ffn_u),
+                    None,
+                ),
+                (
+                    "mtp silu_mul",
+                    &k.silu,
+                    vec![&a.ffn_g, &a.ffn_u, &a.ffn_a],
+                    None,
+                ),
+                (
+                    "mtp matvec down",
+                    &k.mv[&(f.down.cols, f.down.rows, true)],
+                    f.down.bind(&a.ffn_a, Some(&a.x2), &a.x),
+                    None,
+                ),
+            ]);
+            d
+        }
+
         fn mtp_plan(&self) -> Vec<(&Pipeline, Vec<&Buffer>)> {
             let (m, a, k) = (
                 self.mtp.as_ref().expect("checked by the caller"),
@@ -1296,6 +1557,11 @@ mod gpu {
                     want.push((c.heads * c.head_dim, c.hidden, true));
                 }
             }
+            // `fc` is the only shape the draft head adds, and warming the
+            // head over a prompt runs it batched like everything else.
+            if self.mtp.is_some() {
+                want.push((2 * c.hidden, c.hidden, false));
+            }
             for key in want {
                 if let std::collections::hash_map::Entry::Vacant(slot) = mv.entry(key) {
                     let (n_in, n_out, res) = key;
@@ -1304,7 +1570,15 @@ mod gpu {
                     // and gated, not `h`, so they keep f32 inputs.
                     // Every batched matmul now reads a narrowed buffer
                     // except o_proj, which reads `gated`.
-                    let xt = if res && n_in == c.heads * c.head_dim {
+                    // The draft head's `fc` is the exception: it reads a
+                    // fused input built on the host rather than a narrowed
+                    // `h`, and the decode path's `fc` reads it in f32. The
+                    // two write the same cache -- the batched one warming
+                    // it over a prompt, the decode one drafting from it --
+                    // so they have to agree. Handed f16 it reads the f32
+                    // bytes as half pairs, and the head answers with one
+                    // constant token whatever it is asked.
+                    let xt = if n_in == 2 * c.hidden || (res && n_in == c.heads * c.head_dim) {
                         DType::F32
                     } else {
                         X_DTYPE
