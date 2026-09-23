@@ -63,6 +63,18 @@ pub trait Dialect {
     /// that, but the lowering should not have to know which world it is in.
     fn shared_ptr(&self, ty: &str) -> String;
 
+    /// A pointer into a thread's *private* memory: a row of a register
+    /// tile handed to the body of a `map_each`.
+    ///
+    /// The same split as [`Dialect::shared_ptr`], one level down. Metal
+    /// spells the address space in the type here too, and a plain `float*`
+    /// is rejected; CUDA has no qualifier for it and `thread float*` is a
+    /// syntax error. This is the one that got away: every attention kernel
+    /// emitted `thread` unconditionally and so could not be compiled for
+    /// CUDA at all, which `scripts/cuda_check.sh` says in seconds and a
+    /// rented GPU would have said in twenty minutes.
+    fn private_ptr(&self, ty: &str) -> String;
+
     /// Declare an array in threadgroup / shared memory.
     fn shared_array(&self, ty: &str, name: &str, len: usize) -> String;
 
@@ -166,6 +178,10 @@ impl Dialect for Msl {
         format!("threadgroup {ty}*")
     }
 
+    fn private_ptr(&self, ty: &str) -> String {
+        format!("thread {ty}*")
+    }
+
     fn shared_array(&self, ty: &str, name: &str, len: usize) -> String {
         format!("threadgroup {ty} {name}[{len}];")
     }
@@ -261,6 +277,10 @@ impl Dialect for Cuda {
     }
 
     fn shared_ptr(&self, ty: &str) -> String {
+        format!("{ty}*")
+    }
+
+    fn private_ptr(&self, ty: &str) -> String {
         format!("{ty}*")
     }
 

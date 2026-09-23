@@ -4,6 +4,8 @@
 //! what Ollama serves as `llama3.2:1b` (Q8_0) and `llama3.1:8b` (Q4_K_M). The loader and weight repacking run anywhere; the
 //! decode loop needs a Metal device.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod dev;
 pub mod gguf;
 pub mod json;
 pub mod llama;

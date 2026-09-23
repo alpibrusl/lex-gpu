@@ -14,3 +14,6 @@ half = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 lex-metal = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+lex-cuda = { workspace = true }

@@ -677,8 +677,8 @@ impl Gen<'_> {
                 for (&p, (name, t)) in params.iter().zip(&ins) {
                     let pname = v(p);
                     self.line(&format!(
-                        "thread {}* {pname} = {name}[{iname}];",
-                        self.d.scalar(t.dtype)
+                        "{} {pname} = {name}[{iname}];",
+                        self.d.private_ptr(self.d.scalar(t.dtype))
                     ));
                     self.locs.insert(p, Loc::Reg(pname, t.clone()));
                 }
