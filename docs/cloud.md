@@ -24,6 +24,42 @@ GCP_PROJECT=<project> GPU=a100 SPOT=1 scripts/gcp/nvidia_test.sh
    (`scripts/ollama_bench.py`, the same script used on the Mac). That's the
    bar the CUDA backend has to meet.
 
+## Most of it does not need the cloud
+
+`nvcc` needs a GPU to *run* a kernel, not to compile one, and NVIDIA ships
+CUDA for arm64 — so both it and `ptxas` run natively on an Apple Silicon
+Mac in a container. `scripts/cuda_check.sh` does that:
+
+```sh
+scripts/cuda_check.sh out/*.cu        # ARCH=sm_89 by default, which is an L4
+```
+
+That puts three of the four test layers on the laptop:
+
+| layer | catches | needs |
+| --- | --- | --- |
+| golden files | the emitted text, diffed | nothing |
+| the interpreter | that the program is correct | nothing |
+| `cuda_check.sh` | that it compiles and assembles | docker |
+| an L4 | races, numerics, speed | the cloud |
+
+The third layer is worth more here than the equivalent is on Metal.
+`ptxas -v` reports register count and spill bytes **directly**:
+
+```
+0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+Used 12 registers, used 0 barriers, 380 bytes cmem[0]
+```
+
+On Metal that has to be inferred from throughput cliffs, and this repo
+misdiagnosed it twice doing so — the `bo = 256` collapse and the 8-token
+f32 cliff were both register pressure, reached by guessing. Here the
+assembler simply says, before the code has ever run.
+
+One macOS trap, because it fails silently: Docker shares `/Users` but not
+`/private/tmp`, and a bind mount of an unshared path comes up **empty
+rather than erroring**. The script stages through `$HOME/.cache`.
+
 ## The first run: what an L4 actually is
 
 2026-09-23, `g2-standard-8` Spot in europe-west4-b, driver 580.173.02,
