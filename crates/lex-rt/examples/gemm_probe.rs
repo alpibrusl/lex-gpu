@@ -14,6 +14,26 @@
 //! matvec it would replace. If it does not win here it will not win from
 //! inside the compiler either.
 //!
+//! ## What it found
+//!
+//! Not what was hoped. The best MMA configuration (32 tokens, BN=32) costs
+//! **9.24 ms** of a notional whole pass per token; the batched matvec at
+//! eight tokens costs **8.29**. The matvec wins by 11%, and every larger
+//! `BN` — which cuts the activation re-reading — is worse still, because
+//! fewer threadgroups costs more in parallelism than it saves in traffic.
+//!
+//! The structural claim does hold: MMA keeps scaling with tokens where the
+//! matvec collapses past eight, 27x faster at 32. It is simply that the
+//! matvec at eight is already better than MMA at thirty-two, so scaling
+//! past eight buys nothing.
+//!
+//! That is a reason not to build matrix fragments into the IR on this
+//! evidence, not a proof they cannot pay: this kernel stages through
+//! threadgroup memory without double buffering or vectorised loads, and
+//! MLX's own numbers imply a much higher ceiling than 49 GB/s. But the
+//! next person to propose it should have to beat 8.29 first, here, in an
+//! afternoon -- rather than in the IR, over weeks.
+//!
 //! The thing that made this look impossible earlier was NVFP4's per-16
 //! scale: it has nowhere to go inside an MMA accumulator. Staging solves
 //! it. The scale is applied while dequantising into threadgroup memory, so
@@ -53,6 +73,14 @@ fn main() -> Result<(), String> {
         .collect();
 
     println!("\n  tokens   path                us     GB/s   ms/token(pass)");
+    // BN sets how many threadgroups there are, and every one of them
+    // re-reads every token's activations: at BN=32 that is 544 of them,
+    // moving 178 MB of activations against 50 MB of weights.
+    let bn: usize = std::env::var("LEX_BN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    println!("  BN={bn}, {} threadgroups", n / bn);
     for m in [4usize, 8, 16, 32] {
         // Varied, not a constant. With every activation 0.5 and every E2M1
         // value a multiple of 0.25, all partial sums are exact in f32 and
@@ -74,7 +102,7 @@ fn main() -> Result<(), String> {
 
         // What MLX has: a 32x32x32 tile on simdgroup_matrix, weights
         // dequantised into threadgroup memory on the way in.
-        let mma = mma_kernel(m, k, n);
+        let mma = mma_kernel(m, k, n, bn);
         let p_mma = match gpu.build_lowered(&mma) {
             Ok(p) => p,
             Err(e) => return Err(format!("the probe kernel does not compile:\n{e}")),
@@ -153,10 +181,12 @@ fn main() -> Result<(), String> {
 /// a 32x32 tile of the output and four simdgroups split it 2x2, each holding
 /// a 16x16 accumulator as four 8x8 fragments.
 #[cfg(target_os = "macos")]
-fn mma_kernel(m: usize, k: usize, n: usize) -> lex_msl::program::Lowered {
+fn mma_kernel(m: usize, k: usize, n: usize, bn: usize) -> lex_msl::program::Lowered {
     // Weights are 8 codes to a u32 word; scales are one byte per 16 values.
     let kw = k / 8;
     let ks = k / 16;
+    let nf = (bn / 2) / 8;
+    let bnp = bn + 4;
     let source = format!(
         r#"#include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -187,17 +217,20 @@ kernel void gemm_nvfp4(
     uint lane [[thread_index_in_simdgroup]])
 {{
     const uint M = {m}u, K = {k}u, N = {n}u;
-    const uint BM = 32u, BN = 32u, BK = 32u;
+    const uint BM = 32u, BN = {bn}u, BK = 32u;
     // Padded to keep a column read off one bank.
     threadgroup half As[32][36];
-    threadgroup half Bs[32][36];
+    threadgroup half Bs[{bn}][36];
 
     const uint j0 = tgid * BN;                 // first output row
     const uint wm = sgid / 2u, wn = sgid % 2u; // 2x2 simdgroups
 
-    simdgroup_matrix<float, 8, 8> acc[2][2];
+    // 2x2 simdgroups over a BM x BN tile: each owns 16 rows and BN/2
+    // columns, held as 2 x NF fragments of 8x8.
+    const uint NF = {nf}u;
+    simdgroup_matrix<float, 8, 8> acc[2][{nf}];
     for (uint a = 0; a < 2u; ++a)
-        for (uint b = 0; b < 2u; ++b)
+        for (uint b = 0; b < NF; ++b)
             acc[a][b] = simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (uint p0 = 0; p0 < K; p0 += BK) {{
@@ -229,14 +262,14 @@ kernel void gemm_nvfp4(
 
         // 16x16 per simdgroup, as four 8x8 fragments.
         for (uint kk = 0; kk < BK; kk += 8u) {{
-            simdgroup_matrix<half, 8, 8> a[2], b[2];
-            for (uint i = 0; i < 2u; ++i) {{
-                simdgroup_load(a[i], &As[wm * 16u + i * 8u][kk], 36);
-                // B is [row][k]; the fragment wants it transposed.
-                simdgroup_load(b[i], &Bs[wn * 16u + i * 8u][kk], 36, ulong2(0, 0), true);
-            }}
+            simdgroup_matrix<half, 8, 8> a[2], b[{nf}];
             for (uint i = 0; i < 2u; ++i)
-                for (uint jj = 0; jj < 2u; ++jj)
+                simdgroup_load(a[i], &As[wm * 16u + i * 8u][kk], 36);
+            for (uint i = 0; i < NF; ++i)
+                // B is [row][k]; the fragment wants it transposed.
+                simdgroup_load(b[i], &Bs[wn * (NF * 8u) + i * 8u][kk], 36, ulong2(0, 0), true);
+            for (uint i = 0; i < 2u; ++i)
+                for (uint jj = 0; jj < NF; ++jj)
                     simdgroup_multiply_accumulate(acc[i][jj], a[i], b[jj], acc[i][jj]);
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -244,25 +277,34 @@ kernel void gemm_nvfp4(
 
     // Write back through threadgroup memory: simdgroup_store wants a
     // contiguous destination and the output rows are strided by N.
-    threadgroup float Cs[32][36];
+    threadgroup float Cs[32][{bnp}];
     for (uint i = 0; i < 2u; ++i)
-        for (uint jj = 0; jj < 2u; ++jj)
-            simdgroup_store(acc[i][jj], &Cs[wm * 16u + i * 8u][wn * 16u + jj * 8u], 36);
+        for (uint jj = 0; jj < NF; ++jj)
+            simdgroup_store(
+                acc[i][jj], &Cs[wm * 16u + i * 8u][wn * (NF * 8u) + jj * 8u], {bnp});
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < BM * BN; e += 128u) {{
         const uint r = e / BN, c = e % BN;
         if (r < M) y[r * N + j0 + c] = Cs[r][c];
     }}
 }}
-"#
+"#,
+        m = m,
+        k = k,
+        n = n,
+        kw = kw,
+        ks = ks,
+        bn = bn,
+        nf = nf,
+        bnp = bnp,
     );
     lex_msl::program::Lowered {
         entry: "gemm_nvfp4".into(),
         source,
-        grid: n / 32,
+        grid: n / bn,
         grid2: 1,
         threads: 128,
-        threadgroup_bytes: 32 * 36 * 2 * 2 + 32 * 36 * 4,
+        threadgroup_bytes: 32 * 36 * 2 + bn * 36 * 2 + 32 * (bn + 4) * 4,
         arena_bytes: 0,
         scratch_bytes: 0,
         barriers: 3,
