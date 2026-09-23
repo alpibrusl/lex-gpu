@@ -241,8 +241,8 @@ this model at all. `examples/prefill` feeds 512 tokens through
 | --- | --- | --- |
 | 1 | 22 | 23 |
 | 2 | 42 | 44 |
-| 4 | 54 | **65** |
-| 8 | **26** | **69** |
+| 4 | 54 | 68 |
+| 8 | **26** | **75** |
 
 The first measurement found 54 tok/s at four tokens and a *collapse* to 26
 at eight — worse than half the batch. That was the fault the matvec sweep
@@ -259,7 +259,7 @@ activation.
 The decode path is untouched and still f32, because at one token there is
 no re-reading to save and the conversion is pure cost.
 
-**65–69 tok/s against Ollama's ~250.** Still the largest gap, but the shape
+**75 tok/s against Ollama's ~250.** Still the largest gap, but the shape
 is right now: monotonic in the chunk, which says the next thing to try is
 raising `MAX_BATCH` past eight rather than hunting another cliff.
 
