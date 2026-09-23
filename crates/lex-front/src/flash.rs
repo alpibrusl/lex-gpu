@@ -551,6 +551,117 @@ impl FlashDecode {
         Ok(b.finish())
     }
 
+    /// Split-KV attention for `tokens` queries at once, with causal
+    /// masking: instance `(head, split)` attends every query to the `bps`
+    /// blocks that split covers, and writes a partial state per query for
+    /// [`FlashDecode::build_combine_rows`] to merge.
+    ///
+    /// This is [`FlashDecode::build_split`] carrying a token dimension and
+    /// [`FlashDecode::build_causal`]'s mask. It exists because a batched
+    /// verify scans the whole cache in one threadgroup per head, which is
+    /// what a decode step did before split-KV: at 1440 positions a
+    /// two-token verify costs 67.9 ms where two separate decode steps cost
+    /// 74, so batching has stopped buying anything. Speculation needs the
+    /// verify to be cheaper than the steps it replaces.
+    ///
+    /// The mask is the causal one, `1 + pos0 + qb`, which also bounds the
+    /// live length: nothing past the last query's position is attended, so
+    /// a split beyond it costs its loads and no arithmetic.
+    pub fn build_causal_split(&self, tokens: usize, bps: usize) -> Result<Program, String> {
+        let c = *self;
+        let cap = c.kv_rows();
+        if c.bq != c.q_rows || c.consumers != 0 || c.heads == 0 || bps == 0 {
+            return Err("split attention takes one query block per head".into());
+        }
+        if !cap.is_multiple_of(c.bk * bps * COMBINE_CHUNK) {
+            return Err(format!(
+                "capacity {cap} is not whole chunks of {COMBINE_CHUNK} splits of {bps} x {}",
+                c.bk
+            ));
+        }
+        if tokens == 0 || tokens > cap {
+            return Err(format!("{tokens} tokens over a cache of {cap}"));
+        }
+        let splits = cap / (c.bk * bps);
+        let (group, hg) = (c.q_rows, c.heads * c.q_rows);
+        let rows_total = tokens * hg;
+        let mut b = Builder::new(&format!(
+            "flash_causal_split{tokens}_{}_g{group}_bk{}_bps{bps}_cap{cap}",
+            c.dtype.suffix(),
+            c.bk
+        ));
+        let pq = b.param("q", c.dtype, &[rows_total, c.d], false);
+        let pk = b.param("k", c.dtype, &[c.heads * cap, c.d], false);
+        let pv = b.param("v", c.dtype, &[c.heads * cap, c.d], false);
+        let pm = b.param("part_m", DType::F32, &[rows_total, splits], true);
+        let pl = b.param("part_l", DType::F32, &[rows_total, splits], true);
+        let pa = b.param("part_acc", DType::F32, &[rows_total, splits * c.d], true);
+        let pid = b.grid(c.heads);
+        let split = b.grid2(splits);
+        let pos0 = b.dyn_index("pos0", cap - tokens);
+
+        let strides = (hg, group);
+        // A large finite negative, not -inf: a split that sees no position
+        // must produce a zero-weight partial rather than a NaN.
+        let (qs, [ms, ls, accs]) = setup_from(&mut b, &c, pid, pq, 0, tokens, strides, -1e30);
+        let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
+        let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
+        let carry = vec![
+            Ty::Array(m_ty.clone(), tokens),
+            Ty::Array(m_ty.clone(), tokens),
+            Ty::Array(acc_ty.clone(), tokens),
+        ];
+        let kv = TileTy::new(c.dtype, &[c.bk, c.d], c.kv_space);
+        let limit = move |qb: Var| IdxExpr::lit(1).plus(pos0, 1).plus(qb, 1);
+        let out = b.for_range(0, bps, vec![ms, ls, accs], carry, |b, i, p| {
+            let first = IdxExpr::scaled(i, c.bk, 0).plus(split, bps * c.bk);
+            let at = first.clone().plus(pid, cap);
+            let k = b.op("k", Op::Load(rows(pk, at.clone(), c.bk, c.d), kv.clone()));
+            let v = b.op("v", Op::Load(rows(pv, at, c.bk, c.d), kv.clone()));
+            let out = attend(
+                b,
+                &c,
+                qs,
+                Arg::Borrow(k),
+                Arg::Borrow(v),
+                [p[0], p[1], p[2]],
+                Some((first, &limit)),
+            );
+            b.drop(k);
+            b.drop(v);
+            out.to_vec()
+        });
+        // Row `token * hg + head * group`, this split's column. `map_each`
+        // hands the token index in, which is what makes this taller than
+        // the decode store rather than different from it.
+        b.map_each(
+            vec![out[0], out[1], out[2]],
+            vec![Ty::Tile(m_ty.clone()), Ty::Tile(m_ty), Ty::Tile(acc_ty)],
+            0,
+            |b, qb, p| {
+                let row = IdxExpr::scaled(qb, hg, 0).plus(pid, group);
+                let column = |param| View {
+                    param,
+                    offset: vec![row.clone(), IdxExpr::scaled(split, 1, 0)],
+                    shape: vec![group, 1],
+                };
+                b.effect(Op::Store(Arg::Move(p[0]), column(pm)));
+                b.effect(Op::Store(Arg::Move(p[1]), column(pl)));
+                b.effect(Op::Store(
+                    Arg::Move(p[2]),
+                    View {
+                        param: pa,
+                        offset: vec![row.clone(), IdxExpr::scaled(split, c.d, 0)],
+                        shape: vec![group, c.d],
+                    },
+                ));
+                vec![]
+            },
+        );
+        b.drop(qs);
+        Ok(b.finish())
+    }
+
     /// Split-KV decode attention, second half: one instance per query row
     /// merges that row's first `nsplit` partial states (a runtime scalar;
     /// `nchunk = ceil(nsplit / COMBINE_CHUNK)`) and writes `o = acc / l`.
@@ -560,6 +671,14 @@ impl FlashDecode {
     /// and `acc = w · acc_s` as a `[1, splits] x [splits, d]` matmul, taken
     /// `COMBINE_CHUNK` splits at a time so only live splits are read.
     pub fn build_combine(&self, bps: usize) -> Result<Program, String> {
+        self.build_combine_rows(1, bps)
+    }
+
+    /// [`FlashDecode::build_combine`] for `tokens` query rows at once, to
+    /// merge what [`FlashDecode::build_causal_split`] wrote. One instance
+    /// per (token, head, query) row; the rows are independent, so this is
+    /// the decode combine with a taller grid.
+    pub fn build_combine_rows(&self, tokens: usize, bps: usize) -> Result<Program, String> {
         use Arg::{Borrow, Move};
         let c = *self;
         let cap = c.kv_rows();
@@ -570,7 +689,7 @@ impl FlashDecode {
             ));
         }
         let ch = COMBINE_CHUNK;
-        let hg = c.heads * c.q_rows;
+        let hg = tokens * c.heads * c.q_rows;
         let mut b = Builder::new(&format!("flash_combine_splits{splits}_d{}", c.d));
         let pm = b.param("part_m", DType::F32, &[hg, splits], false);
         let pl = b.param("part_l", DType::F32, &[hg, splits], false);
