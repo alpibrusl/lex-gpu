@@ -8,7 +8,8 @@ on kernels this compiler generates.
 
 | | tile | Ollama (MLX) |
 | --- | --- | --- |
-| decode | **21.8 tok/s** | 58 (hard text) – 76 (predictable) |
+| decode | **26.5 tok/s** | 58 (hard text) – 76 (predictable) |
+| a 2-token verify | **1.05 passes** | ~1.20 (implied) |
 | answers | ` Paris` `.` `\n` `The` … | the same tokens |
 
 `tests/qwen_golden.rs` checks 24 steps over three prompts against
@@ -38,23 +39,25 @@ every weight statistic looks perfectly ordinary.
 
 ## Where the time goes
 
-45.9 ms a token, per call site (`examples/qwen`, `TILE_SYNC`):
+38 ms a token, per call site (`examples/qwen`, `TILE_SYNC`):
 
 | call site | ms/token | share |
 | --- | --- | --- |
-| matvec gate/up | 17.7 | 38% |
-| matvec down | 9.4 | 20% |
-| matvec qkv (linear layers) | 4.1 | 9% |
-| matvec out_proj | 2.8 | 6% |
-| matvec z | 2.6 | 6% |
-| matvec lm head | 1.9 | 4% |
+| matvec gate/up | 13.9 | 37% |
+| matvec down | 7.5 | 20% |
+| matvec qkv (linear layers) | 3.2 | 9% |
+| matvec out_proj | 2.4 | 6% |
+| matvec z | 2.1 | 6% |
+| matvec lm head | 1.5 | 4% |
+| rmsnorm | 1.2 | 3% |
 | delta step | 0.9 | 2% |
 | attention | 0.5 | 1% |
-| everything else | < 1.5 | 3% |
+| everything else | < 1.5 | 4% |
 
-Matvecs are 95% of a step. A forward pass reads 14.5 GB of weights, so at
-the 367 GB/s the NVFP4 matvec reaches, ~40 ms is the floor — which is what
-we measure.
+Matvecs are 94% of a step. A forward pass reads 14.5 GB of weights, so at
+the 455 GB/s the NVFP4 matvec reaches, ~32 ms is the floor; the gap to 38
+is the shapes that do not reach it (`k` at 4096 → 1024 runs at 251) and
+the 3% that is not a matvec.
 
 ## NVFP4, and a measurement that lied
 
@@ -69,13 +72,30 @@ kernel ran at 236 GB/s, where Q4_K reaches 484 at the same shape.
 `examples/matvec.rs` now fills weights with real bytes.
 
 Swapping the decode for a plain integer convert gave 459 GB/s, which said
-the loop was short of ALU rather than bandwidth. Three decodes were
+the loop was short of ALU rather than bandwidth. Four decodes were
 measured: a 256-entry pair table (246), a 16-entry table gathered with
-`simd_shuffle` (236), and scalar arithmetic (203). What worked was
-decoding both codes of a byte at once on vector ALU: `(c & 7) << 22` lands
-E2M1's exponent and mantissa exactly where an IEEE float wants them, so
-the bias is a single add, and `2t - 1` corrects the two subnormals. That
-is **367 GB/s**, and it took a step from 54.9 to 45.9 ms.
+`simd_shuffle` (236), scalar arithmetic (203), and two codes of a byte at
+once on vector ALU with `(c & 7) << 22` for the IEEE bias and `2t - 1` to
+correct the subnormals (367).
+
+None of them needed to exist. Drop a code's three magnitude bits at the
+**bottom** of *half*'s exponent field and half reads back the E2M1 value
+exactly, times 2⁻¹⁴ — the two subnormals included, because half's denormal
+boundary lands where E2M1's does once the exponent sits at the bottom of
+the field. There is no bias to add and no subnormal to fix. Two codes 16
+bits apart share a shift, so a byte decodes in two shifts, two masks and
+an or, and the 2¹⁴ rides back on the group's scale, which is read once per
+16 values instead of once per value:
+
+```metal
+const uint w = b | (b << 12u);
+float2(as_type<half2>(((w & 0x00070007u) << 9u) | ((w & 0x00080008u) << 12u)))
+```
+
+That is **455 GB/s** against Q4_K's 477 at the same shape, and it took a
+step from 45.9 to 38 ms. The trick is MLX's, found by reading
+`mlx/backend/metal/kernels/fp4.h`; a host-side check confirms all 256 byte
+values, signed zero included, before trusting it on the GPU.
 
 Decoding four values at a time (two bytes into a `float4`) measured 350 —
 slower, not faster.
@@ -90,65 +110,78 @@ costs. On 5120 → 17408, reading the weights once per batch
 
 | tokens | GB/s | ms/token for a whole pass |
 | --- | --- | --- |
-| 1 (the decode matvec) | 363 | 40 |
-| 2 | 205 | 35 |
-| 4 | 183 | 20 |
-| 8 | 89 | 20 |
+| 1 (the decode matvec) | 454 | 32 |
+| 2 | 396 | 18 |
+| 4 | 329 | 11 |
+| 8 (f16 activations) | 210 | 8.6 |
 
-Amortisation stops at four tokens. Three explanations were measured and
-only the last survives:
+For a long time this table read 363 / 205 / 183 / 89 and amortisation
+stopped at four tokens. Three explanations were measured, and the one
+believed — *the loop is short of ALU, and 183 is almost exactly half of
+363* — was wrong. The arithmetic was a coincidence. **The batched kernel
+was still decoding NVFP4 with the 16-entry `simd_shuffle` table**, the
+decode the single-row matvec had abandoned two rounds of work earlier; a
+`simd_shuffle` with 32 divergent indices costs about 32 cycles against 2
+for a uniform one, and nothing about `(bo, threads)` could reach it. It
+went unnoticed because the two paths are separate arms of the emitter and
+only the one that was being benchmarked got fixed.
 
-- **Activation traffic.** Replacing the activation loads with a constant
-  doubles throughput, which looked conclusive — but staging them in
-  threadgroup memory made it worse (92 GB/s against 141), and raising the
-  rows a threadgroup owns, which cuts the number of threadgroups and so
-  the traffic, did nothing: every `(bo, threads)` pair that keeps
-  registers sane plateaus at 180–183 GB/s.
-- **Register pressure.** `bo = 256` collapses to 12 GB/s, and `bo = 64` at
-  256 threads is already half speed, because each lane holds one
-  accumulator per (row, token). It bounds how large `bo` can go but does
-  not explain the plateau.
-- **Arithmetic.** At four tokens the loop does one decode and four
-  multiply-adds per weight value, and 183 is almost exactly half of the
-  matvec's 363. The kernel is short of ALU, as the NVFP4 decode is.
+The lesson is narrower than "measure": every one of those measurements was
+real. Sweeping the parameters a kernel *exposes* cannot find a constant
+factor sitting in the code it *emits*, and a plateau flat across every
+parameter is evidence for exactly that.
 
-That sets what speculation is worth today. A two-token verify costs 1.77
-passes, so drafting one token ahead yields about 1.13 tokens per pass —
-13%, before counting a draft that is refused. Speculation is worth
-building when a verify of `k` costs near one pass, not `k` of them.
+What remains true from that work: `bo = 256` collapses to 12 GB/s because
+each lane holds an accumulator per (row, token), which bounds `bo`; and
+half activations pay only at eight tokens, where they are worth 2.4×.
+
+A whole forward pass, end to end (`examples/qwen`):
+
+| tokens | ms/pass | ms/token | vs one step |
+| --- | --- | --- | --- |
+| 1 | 42.4 | 42.4 | 1.00x |
+| 2 | 44.6 | 22.3 | **1.05x** |
+| 3 | 53.2 | 17.7 | 1.26x |
+| 4 | 67.2 | 16.8 | 1.59x |
+
+A two-token verify costs 1.05 passes, where it cost 1.77. That is the
+condition this document set for speculation being worth building, and it
+is met.
 
 ## Matching Ollama, and beating it
 
 Ollama's decode speed on this model tracks how predictable the text is —
-76 tok/s counting, 58 on random words. With 14.5 GB a pass and ~460 GB/s
-of achievable bandwidth, one token per pass cannot exceed ~32 tok/s. It is
-getting **about two tokens per weight pass** from the model's own
-multi-token-prediction head, which ships in the checkpoint (`mtp.*`,
-239 MB — 1.6% of a pass, so drafting is nearly free).
+76 tok/s counting, 58 on random words. With 14.5 GB a pass and a roof of
+about 507 GB/s (a read-only stream; copy benchmarks land near 460 because
+they pay write-allocate), one token per pass cannot exceed ~35 tok/s. So
+Ollama is getting **about two tokens per weight pass** from the model's
+own multi-token-prediction head.
 
 Ollama's numbers imply its own pass runs at about 480 GB/s and yields two
-tokens. Ours runs at 368 and yields one. So matching is two pieces:
+tokens. Ours now runs at 455 on the shapes that matter and still yields
+one. Both halves of the matching problem were the same bug — the decode —
+and the first half is essentially closed: 21.8 → 26.5 tok/s, with the
+remainder of the gap in the small shapes (`k` at 4096 → 1024 reaches 251
+GB/s) rather than in the format.
 
-1. **The last of the decode gap**, 368 → ~480 GB/s: a pass drops from 40
-   to 30 ms, which is ~33 tok/s on its own.
-2. **Speculation**, which needs a verify of two tokens to cost about one
-   pass rather than the 1.77 it costs now.
+What is left is tokens per pass. The head ships in the checkpoint (`mtp.*`,
+239 MB — 1.6% of a pass, so drafting is nearly free), and `mlx-lm` measures
+**88.3% acceptance** for it on this exact model, greedy. At a 2-token
+verify costing 1.05 passes that is 1.88 tokens per 1.05 passes — **1.79 a
+pass, or about 47 tok/s** — which would put us inside Ollama's range
+rather than at a third of it. Two things have to be true and only one is
+proven: the verify cost is measured, the acceptance is someone else's
+number on someone else's implementation.
 
-Both are the same problem seen twice: these kernels are short of
-arithmetic, not bandwidth. The untried lever for both is half precision
-for the multiply-add — Apple's f16 ALU runs at twice the f32 rate, the
-NVFP4 values are already decoded in half, and MLX and llama.cpp both feed
-their matmuls activations narrower than f32. Everything the batched path
-needs is built and tested; it is the arithmetic per weight value that has
-to come down.
+Beating it is the same lever used harder, and the research says less about
+trees than expected: vLLM closed tree verification as not planned, and
+EAGLE's own ablation buys +0.6–0.8 accepted tokens for only +0.3–0.5×.
+Depth is the cheaper axis — llama.cpp's adaptive 3..12 draft on this size
+of model reports 30 → 56 tok/s on reasoning text and 78 on prose — but
+depth needs the verify to stay cheap past two tokens, and ours costs 1.59
+passes at four. The next kernel is a narrow `simdgroup_matrix` tile:
+`simdgroup_matrix<half, 8, 8>` has a minimum M of 8, so every draft from
+2 to 8 tokens is one tile and costs the same.
 
-Beating it is the same lever, used harder: acceptance decides how many
-tokens a pass yields. A linear draft of one or two tokens is what MLX
-appears to do; verifying a small *tree* of candidates in the same pass
-accepts more of them. Colibri, which runs much larger MoE models off NVMe,
-reports 2.2–2.8 tokens per forward from GLM's MTP head "when it pays" —
-evidence that past two is reachable, and that a policy for switching
-speculation off when acceptance drops is worth having.
-
-Kernel efficiency alone tops out near 32 tok/s. Everything above that is
+Kernel efficiency alone tops out near 38 tok/s. Everything above that is
 tokens per pass.

@@ -112,9 +112,10 @@ struct Gen<'a> {
     fp4: bool,
 }
 
-/// E2M1 value codes and E4M3 scale bytes as constant tables: an NVFP4
-/// inner loop then decodes both with a load from the constant cache
-/// instead of the shifts, compare and `exp2` the formats spell out.
+/// Decoding NVFP4's two formats. The reductions that carry the weight of
+/// a model use [`fp4_pair`], which is pure bit layout; `FP4_V` remains for
+/// the paths that read a single code out of place, where a `simd_shuffle`
+/// off a lane-held table is easier than extracting one nibble.
 const FP4_TABLES: &str = concat!(
     // The sixteen E2M1 values. Each lane keeps one (see `fp4_lane`), so
     // decoding a code is `simd_shuffle`, not a memory read.
@@ -124,18 +125,23 @@ const FP4_TABLES: &str = concat!(
     // FP8 E4M3 straight into IEEE bits: exponent e - 7 + 127, the
     // mantissa in the top three bits, and a subnormal below that. A table
     // costs a data-dependent gather per group, and real weights scatter.
-    // Both E2M1 codes of a byte, on vector ALU. `(c & 7) << 22` lands the
-    // exponent and mantissa where an IEEE float wants them, so the bias is
-    // one add; the format's two subnormals (codes 0 and 1) are the only
-    // values that needs fixing, and `2t - 1` maps them from 0.5 and 0.75
-    // to 0 and 0.5.
+    // Both E2M1 codes of a byte, as half bits, with no arithmetic at all.
+    //
+    // Drop the code's three magnitude bits at the *bottom* of half's
+    // exponent field and half reads back exactly the E2M1 value times
+    // 2^-14 — including the two subnormals, because half's denormal
+    // boundary sits where E2M1's does once the exponent is at the bottom
+    // of the field. So there is no bias to add and no subnormal to
+    // correct: two shifts, two masks and an or for two values, and the
+    // caller folds the 2^14 into the group's scale for free.
+    //
+    // The two codes must be 16 bits apart to share a shift, which is what
+    // `b | (b << 12)` arranges; the low nibble's copy at bits 12..15 falls
+    // outside both masks.
     "inline float2 fp4_pair(uint b) {\n",
-    "    const ushort2 c = ushort2(b & 0xFu, b >> 4u);\n",
-    "    const ushort2 mag = c & 7;\n",
-    "    const half2 t = as_type<half2>(ushort2((mag << 9) + 0x3800));\n",
-    "    const half2 lo = half2(mag < 2);\n",
-    "    const half2 v = t * (half2(1.0h) + lo) - lo;\n",
-    "    return float2(as_type<half2>(ushort2(as_type<ushort2>(v) | (c & 8) << 12)));\n",
+    "    const uint w = b | (b << 12u);\n",
+    "    return float2(as_type<half2>(((w & 0x00070007u) << 9u)\n",
+    "                               | ((w & 0x00080008u) << 12u)));\n",
     "}\n",
     "inline float fp8_e4m3(uint b) {\n",
     "    const uint e = (b >> 3u) & 0xFu, m = b & 7u;\n",
@@ -1317,6 +1323,9 @@ impl Gen<'_> {
                                 // unscaled and pays a single multiply at
                                 // the end rather than one per value: this
                                 // loop is short of ALU, not of bandwidth.
+                                // `fp4_pair` leaves its values 2^14 small,
+                                // so the run's one multiply carries the
+                                // 2^14 back and the decode stays free.
                                 let byte = at_index(qe, &format!("j * {qc}u + p0 / 2u + u / 2u"));
                                 let a1 = Self::read(&ops[0].0, &format!("i * {kd}u + p + 1u"));
                                 self.line("    float run = 0.0f;");
@@ -1326,7 +1335,7 @@ impl Gen<'_> {
                                      const float2 w = fp4_pair(bq); \
                                      run += {av} * w.x + {a1} * w.y; }}"
                                 ));
-                                self.line("    s += run * sg;");
+                                self.line("    s += run * (sg * 16384.0f);");
                             }
                             Pack::Pairs(qe, qc) => {
                                 // One byte, two values: low nibble for p,
@@ -1572,9 +1581,7 @@ impl Gen<'_> {
                         (
                             2,
                             format!(
-                                "const uint bqb = (uint)(uchar)({byte}); \
-                                 const float2 bq = float2(simd_shuffle(fp4_lane, bqb & 0xFu), \
-                                 simd_shuffle(fp4_lane, bqb >> 4u)); "
+                                "const float2 bq = fp4_pair((uint)(uchar)({byte})); "
                             ),
                             vec![
                                 "(bq.x * sgr[rr])".to_string(),
@@ -1645,6 +1652,12 @@ impl Gen<'_> {
                 // Row-only factor (NVFP4's per-tensor scale).
                 Some(r) => format!(" * float({})", at_index(r, "j")),
                 None => String::new(),
+            };
+            // `fp4_pair` leaves its values 2^14 small, so the 2^14 rides
+            // on the group's scale: read once a group, not once a value.
+            let rs = match d.pack {
+                Pack::Fp4(..) => format!("{rs} * 16384.0f"),
+                _ => rs,
             };
             self.line(&format!("    sgr[rr] = {}{rs};", at_index(&d.s, "grp")));
             match &d.m {
