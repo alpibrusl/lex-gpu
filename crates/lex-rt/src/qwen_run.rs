@@ -388,6 +388,19 @@ mod gpu {
         snap: Option<Snapshot>,
         /// The hidden state a verify left, for the next draft.
         spec_h: Option<Vec<f32>>,
+        /// Call sites to leave out, by label prefix.
+        ///
+        /// For ablation: run without a kernel and the difference is what it
+        /// costs *on the critical path*, in a normally-scheduled pass. That
+        /// is not what `LEX_SYNC` measures -- serialised, the per-kernel
+        /// times sum to 210% of the real elapsed time, because the whole
+        /// point of the concurrent encoder is that they overlap. The
+        /// answers are wrong in different directions and only this one is
+        /// a share of anything.
+        ///
+        /// The results are nonsense once a kernel is missing. The shapes,
+        /// the dispatch count and the scheduling are not.
+        pub skip: Vec<String>,
         acts: Acts,
         /// Activations for a batch, and the kernels for each size seen.
         bacts: Acts,
@@ -717,6 +730,7 @@ mod gpu {
                 mtp_pos: 0,
                 snap,
                 spec_h: None,
+                skip: vec![],
                 acts,
                 bacts,
                 batches: HashMap::new(),
@@ -1105,7 +1119,16 @@ mod gpu {
                 &[pos0 as u32, (pos0 + t).div_ceil(ATTN_BK) as u32],
             );
 
-            let plan = self.batch_plan(t);
+            let mut plan = self.batch_plan(t);
+            if !self.skip.is_empty() {
+                // Exact labels, not prefixes. `"matvec qkv"` starts with
+                // `"matvec q"`, so a prefix match silently ablates two call
+                // sites and attributes both to one -- which is how the
+                // query projection came to look like it cost 9% of prefill
+                // when its own shape runs at 213 GB/s, the same as the
+                // feed-forward's.
+                plan.retain(|d| !self.skip.iter().any(|s| d.0 == s));
+            }
             // Same as `step`: with LEX_SYNC, dispatch one at a time and
             // record where the time went. Without it prefill can only be
             // measured in total, which is enough to see a chunk size cost
@@ -1134,9 +1157,11 @@ mod gpu {
                 self.gpu.download(&self.bacts.logits, &mut flat);
                 Ok(flat.chunks(v).map(<[f32]>::to_vec).collect())
             } else {
-                let mut flat = vec![0.0f32; t * v];
-                self.gpu.download(&self.bacts.logits, &mut flat);
-                Ok(vec![flat[(t - 1) * v..].to_vec()])
+                // Only the last row is wanted, so only the last row moves.
+                let mut last = vec![0.0f32; v];
+                self.gpu
+                    .download_at(&self.bacts.logits, (t - 1) * v, &mut last);
+                Ok(vec![last])
             }
         }
 
