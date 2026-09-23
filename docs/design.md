@@ -117,6 +117,20 @@ Each target instantiates the levels it has, with sizes and capabilities:
 
 A schedule that asks for `Cluster` on a target without it is rejected; a schedule that asks for async copy on Metal lowers to a software-pipelined synchronous copy with a cost-model warning.
 
+### Source files
+
+Source files are **`.lx`**. `.lex` belongs to `lex-lang`, the sibling
+project; the two are separate languages in one family, so they take
+separate extensions rather than one being a dialect of the other.
+
+Nothing reads a `.lx` file yet. There is no lexer and no parser: programs
+are built through the Rust IR API, and the syntax below is a design. It
+stays unbuilt deliberately until a second backend exists, because the
+parts worth arguing about — how schedules are written, what an autotuner's
+`?` binds to, how layouts and MMA fragments appear in types — are exactly
+the parts a second target would rewrite. A surface designed against one
+backend is a surface designed twice.
+
 ### Algorithm / schedule split
 
 ```
