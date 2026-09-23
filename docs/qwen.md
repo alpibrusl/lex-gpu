@@ -237,27 +237,38 @@ Decode has been measured to death here; prefill had never been measured for
 this model at all. `examples/prefill` feeds 512 tokens through
 `Runner::forward` in chunks:
 
-| chunk | tok/s | ms a chunk |
+| chunk | tok/s, f32 activations | **f16** |
 | --- | --- | --- |
-| 1 | 22 | 45.0 |
-| 2 | 42 | 48.2 |
-| **4** | **54** | 74.7 |
-| 8 | **26** | 307.3 |
+| 1 | 22 | 23 |
+| 2 | 42 | 44 |
+| 4 | 54 | **65** |
+| 8 | **26** | **69** |
 
-Ollama reads a prompt on this model at about 250 tok/s, so this is **22% of
-it** — a much worse showing than decode, and the largest gap left.
+The first measurement found 54 tok/s at four tokens and a *collapse* to 26
+at eight — worse than half the batch. That was the fault the matvec sweep
+had already found and nothing had acted on: at `bo = 32` there are 544
+threadgroups on the feed-forward shape, each re-reading every token's
+activations, so eight tokens move more activation bytes than weight bytes.
 
-The collapse at eight is not a mystery. It is the fault the matvec sweep
-already found: with f32 activations eight tokens run at 89–103 GB/s against
-210 with f16, because at `bo = 32` there are 544 threadgroups each re-reading
-every token's activations — 89 MB of them against 50 MB of weights. The
-runner passes f32. `matmul_q_x` already takes activations in any dtype and
-`examples/matvec` already measured the 2.1x; nothing has wired it into
-`Runner::forward`.
+Narrowing them to f16 removes the collapse. The batched path now stores
+`h` and `ffn_a` as f16 and reads them back that way; the reductions inside
+the norms are still f32, and only the store narrows. `ffn_a` matters most —
+it is `ffn` wide against `hidden`, three times the traffic of any other
+activation.
 
-So the next thing here is known rather than speculative, which makes a
-change from most of this document.
+The decode path is untouched and still f32, because at one token there is
+no re-reading to save and the conversion is pure cost.
+
+**65–69 tok/s against Ollama's ~250.** Still the largest gap, but the shape
+is right now: monotonic in the chunk, which says the next thing to try is
+raising `MAX_BATCH` past eight rather than hunting another cliff.
+
+The checker earned its keep on the way. The first version stored f32 into
+an f16 buffer and it refused to compile it: *"store narrows F32 to F16
+implicitly; use `convert`"*. A backend that accepted that would have
+produced a kernel that ran, looked fine, and disagreed with the
+interpreter.
 
 Kernel efficiency alone tops out near 38 tok/s of decode. Everything above
-that is tokens per pass — and prefill is a separate problem with a separate
-fix.
+that is tokens per pass — and prefill is a separate problem with its own
+ceiling.

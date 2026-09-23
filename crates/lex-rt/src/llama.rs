@@ -646,7 +646,7 @@ mod gpu {
                 mv,
                 rope_q: compile(&gpu, &rope(c.n_head, c.head_dim, DType::F16), THREADS)?,
                 rope_k: compile(&gpu, &rope(c.n_kv, c.head_dim, DType::F16), THREADS)?,
-                silu: compile(&gpu, &silu_mul(c.ffn, THREADS)?, THREADS)?,
+                silu: compile(&gpu, &silu_mul(c.ffn, THREADS, DType::F32)?, THREADS)?,
                 glu: glu_pipelines(&gpu, w, 1, BO, fold.1.then_some(c.eps))?,
                 rms_mv: rms_mv_pipelines(&gpu, w, mv_bo, mv_threads)?,
                 fold,
@@ -802,8 +802,16 @@ mod gpu {
                 kv_cap: self.cap,
             };
             let b = Batch {
-                rms: compile(gpu, &rmsnorm_rows(t, c.dim, c.eps, None), THREADS)?,
-                rms_last: compile(gpu, &rmsnorm_rows(t, c.dim, c.eps, Some(t - 1)), THREADS)?,
+                rms: compile(
+                    gpu,
+                    &rmsnorm_rows(t, c.dim, c.eps, None, DType::F32),
+                    THREADS,
+                )?,
+                rms_last: compile(
+                    gpu,
+                    &rmsnorm_rows(t, c.dim, c.eps, Some(t - 1), DType::F32),
+                    THREADS,
+                )?,
                 mv,
                 rope_q: compile(
                     gpu,
@@ -822,7 +830,7 @@ mod gpu {
                     64,
                 )?,
                 attn: compile(gpu, &attn.build_causal(t)?, 128)?,
-                silu: compile(gpu, &silu_mul(t * c.ffn, THREADS)?, THREADS)?,
+                silu: compile(gpu, &silu_mul(t * c.ffn, THREADS, DType::F32)?, THREADS)?,
                 glu: glu_pipelines(gpu, self.w, t, bo, None)?,
             };
             self.batches.insert(t, b);

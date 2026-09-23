@@ -112,7 +112,7 @@ mod gpu {
     use half::f16;
     use lex_front::flash::FlashDecode;
     use lex_front::llama::{
-        QLayout, kv_append, kv_append_rows, matmul_q, matvec_q, rmsnorm, rmsnorm_rows,
+        QLayout, kv_append, kv_append_rows, matmul_q_x, matvec_q, rmsnorm, rmsnorm_rows,
     };
     use lex_front::qwen::{
         DeltaNet, build_conv_silu_rows, build_delta_qk_rows, build_gated_norm_rows,
@@ -131,6 +131,17 @@ mod gpu {
     const ATTN_BK: usize = 16;
     /// State rows per instance of the delta step.
     const DELTA_ROWS: usize = 8;
+    /// The dtype the *batched* path keeps normalised activations in.
+    ///
+    /// A batched matmul re-reads every token's activations once per
+    /// threadgroup, and at `bo = 32` on the feed-forward shape that is 544
+    /// threadgroups: at eight tokens, 89 MB of activations against 50 MB of
+    /// weights. Halving them is worth 2.1x at eight tokens and nothing at
+    /// one, which is why the single-token path stays f32.
+    ///
+    /// The reduction inside the norm is still f32; only what it stores, and
+    /// what the matmuls then re-read, is narrowed.
+    const X_DTYPE: DType = DType::F16;
 
     fn compile(gpu: &Gpu, prog: &Program, threads: usize) -> Result<Pipeline, String> {
         let target: &Target = gpu.target();
@@ -455,7 +466,7 @@ mod gpu {
                 mv,
                 dense: compile(
                     &gpu,
-                    &build_matvec_dense_rows(1, cfg.hidden, hv, 1, DType::F32)?,
+                    &build_matvec_dense_rows(1, cfg.hidden, hv, 1, DType::F32, DType::F32)?,
                     THREADS,
                 )?,
                 conv: compile(
@@ -534,7 +545,7 @@ mod gpu {
                 mul: compile(&gpu, &build_mul(cfg.heads * cfg.head_dim, 256)?, THREADS)?,
                 silu: compile(
                     &gpu,
-                    &lex_front::llama::silu_mul(cfg.ffn, THREADS)?,
+                    &lex_front::llama::silu_mul(cfg.ffn, THREADS, DType::F32)?,
                     THREADS,
                 )?,
             };
@@ -621,12 +632,17 @@ mod gpu {
             };
 
             let (embed, _) = store.floats("model.language_model.embed_tokens.weight")?;
-            let acts_for = |t: usize| {
+            let acts_for = |t: usize, narrow: bool| {
                 let f = |n: usize| gpu.zeroed::<f32>(t * n);
                 Acts {
                     x: f(cfg.hidden),
                     x2: f(cfg.hidden),
-                    h: f(cfg.hidden),
+                    // The batched path reads this back once per threadgroup.
+                    h: if narrow {
+                        gpu.zeroed::<f16>(t * cfg.hidden)
+                    } else {
+                        f(cfg.hidden)
+                    },
                     qkv: f(ch),
                     z: f(hv * dv),
                     a: f(hv),
@@ -648,7 +664,11 @@ mod gpu {
                     gated: f(cfg.heads * cfg.head_dim),
                     ffn_g: f(cfg.ffn),
                     ffn_u: f(cfg.ffn),
-                    ffn_a: f(cfg.ffn),
+                    ffn_a: if narrow {
+                        gpu.zeroed::<f16>(t * cfg.ffn)
+                    } else {
+                        f(cfg.ffn)
+                    },
                     cos: f(cfg.rot / 2),
                     sin: f(cfg.rot / 2),
                     logits: f(cfg.vocab),
@@ -656,8 +676,8 @@ mod gpu {
                     scalars_attn: gpu.zeroed::<u32>(2),
                 }
             };
-            let acts = acts_for(1);
-            let bacts = acts_for(MAX_BATCH);
+            let acts = acts_for(1, false);
+            let bacts = acts_for(MAX_BATCH, X_DTYPE != DType::F32);
             let out_norm = floats(&gpu, &store, "model.language_model.norm.weight")?;
             let lm_head = QBuf::load(&gpu, &store, "lm_head.weight")?;
             let mtp_in = gpu.zeroed::<f32>(2 * cfg.hidden);
@@ -1137,7 +1157,17 @@ mod gpu {
             for key in want {
                 if let std::collections::hash_map::Entry::Vacant(slot) = mv.entry(key) {
                     let (n_in, n_out, res) = key;
-                    let p = matmul_q(t, n_in, n_out, bo, n_in, QLayout::NVFP4, res)?;
+                    // `res` marks the matmuls that accumulate into the
+                    // residual -- down and o_proj -- and those read ffn_a
+                    // and gated, not `h`, so they keep f32 inputs.
+                    // Every batched matmul now reads a narrowed buffer
+                    // except o_proj, which reads `gated`.
+                    let xt = if res && n_in == c.heads * c.head_dim {
+                        DType::F32
+                    } else {
+                        X_DTYPE
+                    };
+                    let p = matmul_q_x(t, n_in, n_out, bo, n_in, QLayout::NVFP4, res, xt)?;
                     slot.insert(compile(gpu, &p, THREADS)?);
                 }
             }
@@ -1164,11 +1194,15 @@ mod gpu {
                 kv_cap: self.cap,
             };
             let b = Batch {
-                rms: compile(gpu, &rmsnorm_rows(t, c.hidden, c.eps, None), THREADS)?,
+                rms: compile(
+                    gpu,
+                    &rmsnorm_rows(t, c.hidden, c.eps, None, X_DTYPE),
+                    THREADS,
+                )?,
                 mv,
                 dense: compile(
                     gpu,
-                    &build_matvec_dense_rows(t, c.hidden, hv, 1, DType::F32)?,
+                    &build_matvec_dense_rows(t, c.hidden, hv, 1, DType::F32, X_DTYPE)?,
                     THREADS,
                 )?,
                 conv: compile(
@@ -1239,7 +1273,7 @@ mod gpu {
                 mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
                 silu: compile(
                     gpu,
-                    &lex_front::llama::silu_mul(t * c.ffn, THREADS)?,
+                    &lex_front::llama::silu_mul(t * c.ffn, THREADS, X_DTYPE)?,
                     THREADS,
                 )?,
             };
