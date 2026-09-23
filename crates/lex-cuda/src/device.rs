@@ -120,7 +120,7 @@ api!(struct Driver {
     ) -> CUresult;
 });
 
-api!(struct Nvrtc {
+api!(pub struct Nvrtc {
     fn nvrtcCreateProgram(
         *mut NvrtcProgram, *const c_char, *const c_char, c_int,
         *const *const c_char, *const *const c_char,
@@ -151,6 +151,89 @@ fn check(d: &Driver, r: CUresult, what: &str) -> Result<(), String> {
         }
     };
     Err(format!("{what}: {msg}"))
+}
+
+/// Where `cuda_fp16.h` might be.
+///
+/// NVRTC compiles from a string in memory and has **no include search path
+/// at all** — not even the toolkit's own. `#include <cuda_fp16.h>` fails
+/// with "no directories in search list" unless one is supplied, which is
+/// not obvious from anything except that message.
+fn include_dirs() -> Vec<String> {
+    let mut v: Vec<String> = ["CUDA_HOME", "CUDA_PATH"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|p| format!("{p}/include"))
+        .collect();
+    v.push("/usr/local/cuda/include".into());
+    v.push("/usr/include".into());
+    v.retain(|d| std::path::Path::new(d).join("cuda_fp16.h").exists());
+    v
+}
+
+/// Compile emitted CUDA to PTX.
+///
+/// Separate from [`Gpu::build_lowered`] because **NVRTC needs no device**:
+/// it is a compiler. Splitting it is what lets a machine with the toolkit
+/// and no GPU check that the emitted source actually compiles for a real
+/// architecture — which is where the missing include path was eventually
+/// found, after a rented L4 had to find it instead.
+pub fn compile_ptx(rtc: &Nvrtc, source: &str, entry: &str, arch: &str) -> Result<Vec<u8>, String> {
+    let src = CString::new(source).map_err(|e| e.to_string())?;
+    let unit = CString::new(format!("{entry}.cu")).map_err(|e| e.to_string())?;
+    unsafe {
+        let mut prog: NvrtcProgram = ptr::null_mut();
+        if (rtc.nvrtcCreateProgram)(
+            &mut prog,
+            src.as_ptr(),
+            unit.as_ptr(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        ) != 0
+        {
+            return Err("nvrtcCreateProgram failed".into());
+        }
+        let arch = CString::new(format!("--gpu-architecture={arch}")).map_err(|e| e.to_string())?;
+        let incs: Vec<CString> = include_dirs()
+            .iter()
+            .map(|d| CString::new(format!("-I{d}")).expect("no interior nul"))
+            .collect();
+        let mut opts: Vec<*const c_char> = vec![arch.as_ptr()];
+        opts.extend(incs.iter().map(|c| c.as_ptr()));
+
+        if (rtc.nvrtcCompileProgram)(prog, opts.len() as c_int, opts.as_ptr()) != 0 {
+            let mut n = 0usize;
+            (rtc.nvrtcGetProgramLogSize)(prog, &mut n);
+            let mut log = vec![0u8; n.max(1)];
+            (rtc.nvrtcGetProgramLog)(prog, log.as_mut_ptr().cast());
+            let log = String::from_utf8_lossy(&log)
+                .trim_end_matches('\0')
+                .to_string();
+            let where_ = if incs.is_empty() {
+                "\n(no cuda_fp16.h found; set CUDA_HOME)"
+            } else {
+                ""
+            };
+            return Err(format!("`{entry}` does not compile:\n{log}{where_}"));
+        }
+        let mut n = 0usize;
+        (rtc.nvrtcGetPTXSize)(prog, &mut n);
+        let mut ptx = vec![0u8; n];
+        (rtc.nvrtcGetPTX)(prog, ptx.as_mut_ptr().cast());
+        Ok(ptx)
+    }
+}
+
+/// Open NVRTC alone, for compiling without a device.
+pub fn nvrtc() -> Result<Nvrtc, String> {
+    unsafe {
+        Nvrtc::load(open_lib(&[
+            "libnvrtc.so",
+            "libnvrtc.so.12",
+            "/usr/local/cuda/lib64/libnvrtc.so",
+        ])?)
+    }
 }
 
 /// A device buffer. Freed on drop, like Metal's.
@@ -201,11 +284,7 @@ impl Gpu {
             // The driver is `libcuda.so.1`; the toolkit's bare `libcuda.so`
             // is a link-time stub with no implementation behind it.
             let cu = Driver::load(open_lib(&["libcuda.so.1", "libcuda.so"])?)?;
-            let rtc = Nvrtc::load(open_lib(&[
-                "libnvrtc.so",
-                "libnvrtc.so.12",
-                "/usr/local/cuda/lib64/libnvrtc.so",
-            ])?)?;
+            let rtc = nvrtc()?;
 
             check(&cu, (cu.cuInit)(0), "cuInit")?;
             let mut dev: CUdevice = 0;
@@ -262,40 +341,8 @@ impl Gpu {
     /// architecture, which is the point of compiling at load time: the same
     /// emitted source runs on whatever the machine has.
     pub fn build_lowered(&self, lowered: &Lowered) -> Result<Pipeline, String> {
-        let src = CString::new(lowered.source.as_str()).map_err(|e| e.to_string())?;
-        let unit = CString::new(format!("{}.cu", lowered.entry)).map_err(|e| e.to_string())?;
+        let ptx = compile_ptx(&self.rtc, &lowered.source, &lowered.entry, &self.arch)?;
         unsafe {
-            let mut prog: NvrtcProgram = ptr::null_mut();
-            if (self.rtc.nvrtcCreateProgram)(
-                &mut prog,
-                src.as_ptr(),
-                unit.as_ptr(),
-                0,
-                ptr::null(),
-                ptr::null(),
-            ) != 0
-            {
-                return Err("nvrtcCreateProgram failed".into());
-            }
-            let arch = CString::new(format!("--gpu-architecture={}", self.arch))
-                .map_err(|e| e.to_string())?;
-            let opts = [arch.as_ptr()];
-            let rc = (self.rtc.nvrtcCompileProgram)(prog, opts.len() as c_int, opts.as_ptr());
-            if rc != 0 {
-                let mut n = 0usize;
-                (self.rtc.nvrtcGetProgramLogSize)(prog, &mut n);
-                let mut log = vec![0u8; n.max(1)];
-                (self.rtc.nvrtcGetProgramLog)(prog, log.as_mut_ptr().cast());
-                let log = String::from_utf8_lossy(&log)
-                    .trim_end_matches('\0')
-                    .to_string();
-                return Err(format!("`{}` does not compile:\n{log}", lowered.entry));
-            }
-            let mut n = 0usize;
-            (self.rtc.nvrtcGetPTXSize)(prog, &mut n);
-            let mut ptx = vec![0u8; n];
-            (self.rtc.nvrtcGetPTX)(prog, ptx.as_mut_ptr().cast());
-
             let mut module: CUmodule = ptr::null_mut();
             check(
                 &self.cu,
