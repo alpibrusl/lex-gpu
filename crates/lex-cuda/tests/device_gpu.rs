@@ -145,7 +145,7 @@ fn nvfp4_matvec_matches_the_interpreter() {
         Tensor::new(DType::F32, &[1, n_in], &fill(n_in, 5)),
         Tensor::new(DType::I8, &[n_out, n_in / 2], &codes),
         Tensor::new(DType::I8, &[n_out, n_in / 16], &scales),
-        Tensor::new(DType::F32, &[n_out, 1], &vec![1.0; n_out]),
+        Tensor::new(DType::F32, &[n_out], &vec![1.0; n_out]),
         Tensor::zeros(DType::F32, &[1, n_out]),
     ];
     same(&g, &prog, tensors, 4, 1e-4);
