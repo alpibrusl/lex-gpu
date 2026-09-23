@@ -421,7 +421,7 @@ impl Gpu {
                 (self.cu.cuMemcpyHtoD_v2)(
                     buf.ptr + (offset * sz) as u64,
                     data.as_ptr().cast(),
-                    data.len() * sz,
+                    std::mem::size_of_val(data),
                 ),
                 "cuMemcpyHtoD",
             )
