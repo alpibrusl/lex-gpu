@@ -109,23 +109,54 @@ after each one, rolling back to row `kept` would be the 0.8 ms copy
 **Done when:** speculation is a win at 0, 512 and 1440, measured on
 coherent context rather than on random tokens.
 
-## M3 — prefill attention (1–2 weeks)
+## M3 — prefill attention — done, by M2's kernel
 
-After M1, re-ablate. Today attention is 6.7% of prefill at 128 tokens,
-11.6% at 256 and **20.0% at 512** — the quadratic term, and the only share
-that grows. The kernel was written for one query against a long cache;
-prefill is every query in a chunk against a cache that grows throughout.
-`bq = 6, bk = 16` was inherited from decode unchanged.
+Attention was 6.7% of prefill at 128 tokens, 11.6% at 256 and 20.0% at
+512: the quadratic term, and the only share that grew. Wiring the split
+kernel into the batch plan for M2 fixed prefill at the same time, because
+prefill *is* the batched path.
 
-The feed-forward is 50% of prefill and within ~10% of the 507 GB/s
-bandwidth roof, so there is no 3.5x hiding there. Attention is where the
-shape is wrong.
+| tokens | prefill | attention share |
+| --- | --- | --- |
+| 128 | 90 tok/s | 3.3% |
+| 256 | 90 tok/s | 3.4% |
+| 512 | 90 tok/s | 4.0% |
+
+Prefill was 75 tok/s and falling; it is 90 and flat. No separate kernel
+was written for it. `bq = 6, bk = 16` is still inherited from decode and
+is now not worth touching.
 
 **Explicitly not:** a `simdgroup_matrix` GEMM. `examples/gemm_probe` is a
 hand-written one against the batched matvec it would replace, and the
 matvec wins — 8.29 ms of a notional pass per token against 9.24. It is
 committed so the next attempt has to beat that number in an afternoon
 rather than in the IR over weeks.
+
+## M3b — prefill is still 2.7x off Ollama (unscheduled)
+
+90 tok/s against Ollama's ~250. Attention is no longer where it is: the
+feed-forward matvecs are 54% of the pass (`gate/up` 33%, `down` 21%) and
+everything else is single digits.
+
+Two candidates, and the honest position is that they have not been
+separated yet:
+
+- **Weight re-reads.** `MAX_BATCH` is 8, so a 512-token prefill reads all
+  14.5 GB of weights 64 times. Ollama prefills in much larger batches and
+  reads them a handful of times. Raising the batch was tried once and
+  `matvec down` blew up at 16 tokens, which was recorded as "a dead end"
+  and deserves better than that, because this is the whole gap.
+- **The batched matvec is not bandwidth-bound.** `examples/matvec` shows
+  weight throughput falling from ~400 GB/s at two rows to ~216 at eight on
+  the 8B's shapes, which is what a kernel going compute-bound looks like.
+
+That measurement is of the *8B's Q4\_K decode* shapes, not Qwen's batched
+NVFP4 ones, so it is a hint and not an answer. The first job here is
+extending `examples/matvec` to the shapes prefill actually runs, before
+anything is changed on the strength of it. An earlier version of this
+document asserted the feed-forward was "within ~10% of the 507 GB/s
+bandwidth roof"; nothing measured since supports that, and it is
+withdrawn.
 
 ## M4 — a model runs on CUDA (2–3 weeks)
 
