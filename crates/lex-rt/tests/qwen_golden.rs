@@ -366,3 +366,71 @@ fn split_kv_decode_agrees_with_the_serial_kernel() {
     );
     eprintln!("split vs serial at {FILL} positions: worst {worst:e} of scale");
 }
+
+/// The batched path's split attention against the serial causal kernel.
+///
+/// This is the verify a speculative step runs, and it is the reason
+/// speculation lost as context grew: the serial kernel scans the cache
+/// with one threadgroup per KV head, so two tokens at 1440 positions cost
+/// 1.84 passes. The split kernel cuts the cache across threadgroups with
+/// each query still masked to its own position, which is a different
+/// kernel from the decode split -- so it needs its own proof.
+#[test]
+fn split_kv_batch_agrees_with_the_serial_kernel() {
+    let _lock = one_at_a_time();
+    let (model, _) = parse(include_str!("data/qwen35_27b_golden.txt"));
+    const FILL: usize = 1200;
+    /// More than one, so masking per query row is actually exercised.
+    const BATCH: usize = 4;
+
+    // Fill by decoding, then run one batch at that context and keep every
+    // token's logits -- the masking is what differs between query rows.
+    let run = |serial: bool| -> Option<Vec<Vec<f32>>> {
+        if serial {
+            unsafe { std::env::set_var("LEX_MIN_SPLITS", "999999") };
+        }
+        let out = (|| {
+            let mut rt = match Runner::load(&model, FILL + BATCH + 16) {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("SKIPPED: {model} ({e})");
+                    return None;
+                }
+            };
+            rt.reset();
+            let filler: Vec<u32> = (0..FILL)
+                .map(|i| 1000 + (i as u32 * 7919) % 200000)
+                .collect();
+            for &t in &filler {
+                rt.step(t).expect("step");
+            }
+            let batch: Vec<u32> = (0..BATCH).map(|i| 4000 + i as u32 * 131).collect();
+            Some(rt.forward(&batch, true).expect("forward"))
+        })();
+        unsafe { std::env::remove_var("LEX_MIN_SPLITS") };
+        out
+    };
+
+    // One Runner at a time: 14.5 GB of weights, and two of them is a
+    // SIGKILL that reads as a failure with no failing assertion.
+    let Some(split) = run(false) else { return };
+    let Some(serial) = run(true) else { return };
+
+    let mut worst = 0.0f32;
+    for (row, (a, b)) in split.iter().zip(&serial).enumerate() {
+        let scale = b.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+        let d = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+            / scale;
+        assert!(
+            d < 1e-3,
+            "batch row {row} of {BATCH} differs from the serial kernel by \
+             {d:e} of scale at {FILL} positions"
+        );
+        worst = worst.max(d);
+    }
+    eprintln!("batch split vs serial at {FILL} positions: worst {worst:e} of scale");
+}

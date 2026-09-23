@@ -369,6 +369,8 @@ mod gpu {
         kv_k: Pipeline,
         kv_v: Pipeline,
         attn: Pipeline,
+        attn_split: Pipeline,
+        attn_combine: Pipeline,
         mul: Pipeline,
         silu: Pipeline,
     }
@@ -818,7 +820,12 @@ mod gpu {
         /// measured without a second forward pass.
         /// Copy every gated-delta layer's memory aside, with the position
         /// it belongs to.
-        fn save(&mut self) {
+        ///
+        /// Public because a rollback is also the only honest way to time
+        /// the same work twice: 48 layers carry a recurrent state that a
+        /// forward pass mutates, so a second pass at "the same context" is
+        /// not at the same context unless the state goes back too.
+        pub fn save(&mut self) {
             let Some(s) = &self.snap else { return };
             let mut steps: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
             let mut i = 0;
@@ -844,7 +851,7 @@ mod gpu {
 
         /// Put it back, and with it the position. An attention layer needs
         /// nothing: its cache is overwritten as positions are refilled.
-        fn restore(&mut self) {
+        pub fn restore(&mut self) {
             let Some(s) = &self.snap else { return };
             let mut steps: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
             let mut i = 0;
@@ -1192,6 +1199,15 @@ mod gpu {
                 0,
                 &[pos0 as u32, (pos0 + t).div_ceil(ATTN_BK) as u32],
             );
+            // The split path's two scalars: live splits, and the chunks of
+            // COMBINE_CHUNK they make. The last token of the batch is the
+            // one that reaches furthest, so it sets the count.
+            let nsplit = self.nsplit(pos0 + t);
+            self.gpu.write(
+                &self.bacts.scalars_nsplit,
+                0,
+                &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
+            );
 
             let mut plan = self.batch_plan(t);
             if !self.skip.is_empty() {
@@ -1396,6 +1412,8 @@ mod gpu {
                     64,
                 )?,
                 attn: compile(gpu, &attn.build_causal(t)?, 128)?,
+                attn_split: compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128)?,
+                attn_combine: compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128)?,
                 mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
                 silu: compile(
                     gpu,
@@ -1531,12 +1549,50 @@ mod gpu {
                             vec![&a.v32, &at.vcache, &a.scalars_pos],
                             None,
                         ));
-                        d.push((
-                            "attention",
-                            &k.attn,
-                            vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
-                            None,
-                        ));
+                        // The serial causal kernel scans the cache with one
+                        // threadgroup per KV head, so a verify of two tokens
+                        // went from 40.6 ms at no context to 67.9 ms at 1440
+                        // -- 1.84 passes, which is why speculation lost as
+                        // context grew. Past the threshold the cache is cut
+                        // across threadgroups instead, each query still
+                        // masked to its own position, and a second kernel
+                        // merges the partials per query row.
+                        let nsplit = self.nsplit(self.pos + t);
+                        if nsplit >= attn_min_splits() {
+                            d.push((
+                                "attention",
+                                &k.attn_split,
+                                vec![
+                                    &a.q16,
+                                    &at.kcache,
+                                    &at.vcache,
+                                    &a.part_m,
+                                    &a.part_l,
+                                    &a.part_acc,
+                                    &a.scalars_pos,
+                                ],
+                                Some([self.cfg.kv_heads, nsplit]),
+                            ));
+                            d.push((
+                                "attention",
+                                &k.attn_combine,
+                                vec![
+                                    &a.part_m,
+                                    &a.part_l,
+                                    &a.part_acc,
+                                    &a.attn,
+                                    &a.scalars_nsplit,
+                                ],
+                                None,
+                            ));
+                        } else {
+                            d.push((
+                                "attention",
+                                &k.attn,
+                                vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
+                                None,
+                            ));
+                        }
                         d.push(("gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated], None));
                         d.push((
                             "matvec o_proj",
