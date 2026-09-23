@@ -1121,7 +1121,13 @@ mod gpu {
 
             let mut plan = self.batch_plan(t);
             if !self.skip.is_empty() {
-                plan.retain(|d| !self.skip.iter().any(|s| d.0.starts_with(s.as_str())));
+                // Exact labels, not prefixes. `"matvec qkv"` starts with
+                // `"matvec q"`, so a prefix match silently ablates two call
+                // sites and attributes both to one -- which is how the
+                // query projection came to look like it cost 9% of prefill
+                // when its own shape runs at 213 GB/s, the same as the
+                // feed-forward's.
+                plan.retain(|d| !self.skip.iter().any(|s| d.0 == s));
             }
             // Same as `step`: with LEX_SYNC, dispatch one at a time and
             // record where the time went. Without it prefill can only be

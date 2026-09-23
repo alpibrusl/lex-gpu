@@ -129,7 +129,14 @@ fn main() -> Result<(), String> {
         "  {:<16} {:>6} {:>4} {:>6} {:>9} {:>10} {:>9}",
         "gate/up, batched", "tokens", "bo", "x", "us", "GB/s", "ms/token"
     );
-    let (n_in, n_out) = (5120usize, 17408usize);
+    // The feed-forward by default; LEX_MV_SHAPE=q measures the query
+    // projection instead, which ablation says costs ~9% of prefill at
+    // every prompt length -- a constant, so not the quadratic attention
+    // term, and worth checking against its own shape.
+    let (n_in, n_out) = match std::env::var("LEX_MV_SHAPE").as_deref() {
+        Ok("q") => (5120usize, 12288usize),
+        _ => (5120usize, 17408usize),
+    };
     // One set of weights for every configuration: allocating a gigabyte
     // per configuration made the numbers wander by 3x between runs.
     let probe = matmul_q(2, n_in, n_out, 16, n_in, QLayout::NVFP4, false)?;
