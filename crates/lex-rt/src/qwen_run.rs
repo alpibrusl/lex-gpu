@@ -103,7 +103,7 @@ pub fn rope_tables(pos: usize, rot: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[cfg(target_os = "macos")]
-pub use gpu::Runner;
+pub use gpu::{MAX_BATCH, Runner};
 
 #[cfg(target_os = "macos")]
 mod gpu {
