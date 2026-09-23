@@ -617,7 +617,7 @@ pub fn build_matvec_dense(
     bo: usize,
     w: DType,
 ) -> Result<Program, String> {
-    build_matvec_dense_rows(1, n_in, n_out, bo, w)
+    build_matvec_dense_rows(1, n_in, n_out, bo, w, DType::F32)
 }
 
 /// [`build_matvec_dense`] for `tokens` rows of activations at once.
@@ -627,16 +627,18 @@ pub fn build_matvec_dense_rows(
     n_out: usize,
     bo: usize,
     w: DType,
+    x_dtype: DType,
 ) -> Result<Program, String> {
     use Arg::Move;
     if bo == 0 || !n_out.is_multiple_of(bo) {
         return Err(format!("{n_out} rows do not split into {bo}"));
     }
     let mut b = Builder::new(&format!(
-        "matvec_dense{tokens}_{n_out}x{n_in}_{}",
-        w.suffix()
+        "matvec_dense{tokens}_{n_out}x{n_in}_{}_{}",
+        w.suffix(),
+        x_dtype.suffix()
     ));
-    let px = b.param("x", DType::F32, &[tokens, n_in], false);
+    let px = b.param("x", x_dtype, &[tokens, n_in], false);
     let pw = b.param("w", w, &[n_out, n_in], false);
     let py = b.param("y", DType::F32, &[tokens, n_out], true);
     let row = b.grid(n_out / bo);

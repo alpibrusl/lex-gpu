@@ -259,7 +259,7 @@ fn rmsnorm_rope_silu_and_kv_append_match_the_interpreter() {
     );
     same(
         &gpu,
-        &silu_mul(n, 256).unwrap(),
+        &silu_mul(n, 256, DType::F32).unwrap(),
         vec![
             Tensor::new(DType::F32, &[1, n], &pattern(n, 4)),
             Tensor::new(DType::F32, &[1, n], &pattern(n, 5)),
@@ -620,7 +620,7 @@ fn batched_kernels_match_the_interpreter() {
         let out_rows = if pick.is_some() { 1 } else { t };
         same(
             &gpu,
-            &rmsnorm_rows(t, n, 1e-5, pick),
+            &rmsnorm_rows(t, n, 1e-5, pick, DType::F32),
             vec![
                 Tensor::new(DType::F32, &[t, n], &pattern(t * n, 1)),
                 Tensor::new(DType::F32, &[1, n], &pattern(n, 2)),

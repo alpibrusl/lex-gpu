@@ -596,17 +596,21 @@ pub fn kv_append(heads: usize, hd: usize, cap: usize, x_dtype: DType) -> Program
 /// RMSNorm over `rows` rows of `n` (`x, w: [1, n], y`), one grid instance
 /// per row. With `pick = Some(r)`, only row `r` is normalised, into a
 /// `[1, n]` output: prefill's last row, for the output head.
-pub fn rmsnorm_rows(rows: usize, n: usize, eps: f32, pick: Option<usize>) -> Program {
+pub fn rmsnorm_rows(rows: usize, n: usize, eps: f32, pick: Option<usize>, out: DType) -> Program {
     use Arg::{Borrow, Move};
+    // The reduction and the scaling stay f32 whatever `out` is; only the
+    // store narrows. A batched matmul that reads these rows back in f16
+    // halves what it re-reads, and at eight tokens the activations are
+    // more traffic than the weights.
     let name = match pick {
-        Some(r) => format!("rmsnorm_row{r}_of{rows}_{n}"),
-        None => format!("rmsnorm_{rows}x{n}"),
+        Some(r) => format!("rmsnorm_row{r}_of{rows}_{n}_{}", out.suffix()),
+        None => format!("rmsnorm_{rows}x{n}_{}", out.suffix()),
     };
     let mut b = Builder::new(&name);
     let px = b.param("x", DType::F32, &[rows, n], false);
     let pw = b.param("w", DType::F32, &[1, n], false);
     let out_rows = if pick.is_some() { 1 } else { rows };
-    let py = b.param("y", DType::F32, &[out_rows, n], true);
+    let py = b.param("y", out, &[out_rows, n], true);
     let (src, dst) = match pick {
         Some(r) => (IdxExpr::lit(r), IdxExpr::lit(0)),
         None => {
@@ -630,6 +634,14 @@ pub fn rmsnorm_rows(rows: usize, n: usize, eps: f32, pick: Option<usize>) -> Pro
     let xn = b.op("xn", Op::Binary(BinOp::Mul, Move(x), Move(r)));
     let w = b.op("w", Op::Load(row(pw, n), reg(DType::F32, &[1, n])));
     let y = b.op("y", Op::Binary(BinOp::Mul, Move(xn), Move(w)));
+    // The checker refuses an implicit narrowing store, which is the whole
+    // point of it: a norm that quietly wrote f16 would look identical here
+    // and disagree with the interpreter by more than the golden tolerance.
+    let y = if out == DType::F32 {
+        y
+    } else {
+        b.op("y16", Op::Convert(Move(y), out))
+    };
     b.effect(Op::Store(Move(y), at(py, [dst, IdxExpr::lit(0)], [1, n])));
     b.finish()
 }
@@ -719,15 +731,19 @@ pub fn kv_append_rows(
 }
 
 /// `y = silu(g) * u = g * sigmoid(g) * u`, in chunks of `chunk` per instance.
-pub fn silu_mul(n: usize, chunk: usize) -> Result<Program, String> {
+pub fn silu_mul(n: usize, chunk: usize, out: DType) -> Result<Program, String> {
     use Arg::{Borrow, Move};
     if !n.is_multiple_of(chunk) {
         return Err(format!("silu_mul: chunk {chunk} must divide {n}"));
     }
-    let mut b = Builder::new(&format!("silu_mul_{n}"));
+    let mut b = Builder::new(&format!("silu_mul_{n}_{}", out.suffix()));
     let pg = b.param("g", DType::F32, &[1, n], false);
     let pu = b.param("u", DType::F32, &[1, n], false);
-    let py = b.param("y", DType::F32, &[1, n], true);
+    // This is the widest activation in the model -- `ffn` per token, where
+    // `hidden` is three times narrower -- and the matmul that reads it back
+    // re-reads it once per threadgroup. Narrowing it is worth more than
+    // narrowing any other.
+    let py = b.param("y", out, &[1, n], true);
     let pid = b.grid(n / chunk);
     let v = |p| {
         at(
@@ -741,6 +757,11 @@ pub fn silu_mul(n: usize, chunk: usize) -> Result<Program, String> {
     let sg = b.op("sg", Op::Unary(UnOp::Sigmoid, Borrow(g)));
     let a = b.op("a", Op::Binary(BinOp::Mul, Move(g), Move(sg)));
     let y = b.op("y", Op::Binary(BinOp::Mul, Move(a), Move(u)));
+    let y = if out == DType::F32 {
+        y
+    } else {
+        b.op("y16", Op::Convert(Move(y), out))
+    };
     b.effect(Op::Store(Move(y), v(py)));
     Ok(b.finish())
 }
@@ -1223,7 +1244,7 @@ mod tests {
     #[test]
     fn silu_mul_matches_the_formula() {
         let n = 64;
-        let p = silu_mul(n, 16).unwrap();
+        let p = silu_mul(n, 16, DType::F32).unwrap();
         ok(&p);
         let (g, u) = (pattern(n, 8), pattern(n, 9));
         let mut t = vec![
