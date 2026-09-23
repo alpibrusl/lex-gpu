@@ -1,12 +1,30 @@
 # lex
 
-A GPU-native language for LLM inference: one source program for a forward pass
-that compiles to roofline-class kernels on Metal, NVIDIA and AMD, with no
-per-target kernel rewrites.
+A compiler for LLM inference kernels: one typed program for a forward pass,
+lowered to roofline-class kernels with no per-target kernel rewrites.
 
 A **tile** is what the type system tracks — a block of values with an owner, a
 layout and a lifetime — and the checker enforces that every one is consumed
-exactly once. The language is `lex`; tiles are what it is made of.
+exactly once. Tiles are what lex is made of.
+
+**Two things the design promises and this does not do yet, stated plainly
+because the rest of this file is measurements and they deserve the same
+honesty:**
+
+- **There is no surface syntax.** No parser, no file extension, nothing you
+  write a program *in*. Programs are Rust that builds the typed IR — see
+  [`llama.rs`](crates/lex-front/src/llama.rs) for what a kernel looks like
+  today. [`docs/design.md`](docs/design.md) has the intended syntax, with the
+  algorithm/schedule split; it is a design, not an implementation.
+- **Only Metal exists.** The claim that matters here is portability, and
+  nothing demonstrates it until a second backend does. Until then the type
+  system's case — that linear tiles and effects catch across targets what
+  each target's own tooling catches only on that target — is an argument,
+  not a result.
+
+What *is* real: the linear type system, the checker, the reference
+interpreter, the MSL backend, and a 27.8B model that runs end to end on the
+kernels it generates and answers with the same tokens as Ollama.
 
 The full design is in [`docs/design.md`](docs/design.md). The plan for getting
 there is in [`docs/roadmap.md`](docs/roadmap.md).
@@ -333,7 +351,11 @@ Read the diff before committing it.
 ## Not built yet
 
 - **Layouts in the type:** no swizzle or MMA-fragment layouts are checked yet.
-- **Schedule language:** schedules are Rust builder parameters for now.
+- **A surface syntax:** no lexer, no parser, no file extension. Programs are
+  built through the Rust IR API, and schedules are builder parameters. The
+  syntax in `docs/design.md` is deliberately unbuilt until a second backend
+  says what it has to express — designing it against one target would mean
+  designing it twice.
 - **Fast lowering:** simdgroup matrices, split-K decode and minimal barriers
   are P3.
 - **Around the model:** the embedding lookup and KV append as kernels (host
