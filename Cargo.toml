@@ -4,6 +4,7 @@ members = [
     "crates/lex-ir",
     "crates/lex-front",
     "crates/lex-msl",
+    "crates/lex-cuda",
     "crates/lex-metal",
     "crates/lex-bench",
     "crates/lex-rt",
@@ -19,6 +20,7 @@ repository = "https://github.com/alpibrusl/lex-gpu"
 lex-ir = { path = "crates/lex-ir" }
 lex-front = { path = "crates/lex-front" }
 lex-msl = { path = "crates/lex-msl" }
+lex-cuda = { path = "crates/lex-cuda" }
 lex-metal = { path = "crates/lex-metal" }
 lex-rt = { path = "crates/lex-rt" }
 half = "2"

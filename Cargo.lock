@@ -109,6 +109,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lex-cuda"
+version = "0.0.1"
+dependencies = [
+ "lex-ir",
+]
+
+[[package]]
 name = "lex-front"
 version = "0.0.1"
 dependencies = [

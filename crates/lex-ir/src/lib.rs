@@ -184,6 +184,26 @@ impl Target {
         }
     }
 
+    /// NVIDIA L4 (Ada, sm_89). 99 KiB is the largest dynamic shared-memory
+    /// allocation one block can opt into on Ada, against Hopper's 227.
+    ///
+    /// `async_copy` is true because Ampere onwards has `cp.async`, but it is
+    /// a weaker thing than Hopper's TMA: a per-thread copy with a commit and
+    /// wait, not a descriptor a single thread hands to a copy engine. The
+    /// distinction matters for a schedule that expects one thread to issue a
+    /// whole tile, so it is worth not papering over.
+    pub const fn nvidia_ada() -> Target {
+        Target {
+            name: "nvidia-ada",
+            simd_width: 32,
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_bytes: 99 * 1024,
+            unified_memory: false,
+            async_copy: true,
+            split_barriers: false,
+        }
+    }
+
     /// AMD MI300 (CDNA3): wave64, 64 KiB LDS, no async copy engine.
     pub const fn amd_cdna3() -> Target {
         Target {
