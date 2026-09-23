@@ -53,8 +53,12 @@ fn flash_decode_lowered() {
 }
 
 fn compare(case: &str, got: &str) {
+    compare_ext(case, got, "metal")
+}
+
+fn compare_ext(case: &str, got: &str, ext: &str) {
     let got = got.to_string();
-    let path = golden_dir().join(format!("{case}.metal"));
+    let path = golden_dir().join(format!("{case}.{ext}"));
 
     if std::env::var_os("LEX_BLESS").is_some() {
         std::fs::create_dir_all(golden_dir()).unwrap();
@@ -73,7 +77,7 @@ fn compare(case: &str, got: &str) {
         // Line-oriented, because a 60-line shader diffed as one string is
         // unreadable in test output.
         let mut report = format!(
-            "emitted MSL for `{case}` does not match {}\n",
+            "emitted source for `{case}` does not match {}\n",
             path.display()
         );
         for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
@@ -138,4 +142,40 @@ fn rmsnorm_f32_narrow() {
         "rmsnorm_f32_narrow",
         &Kernel::rmsnorm(DType::F32, 8, 128, 1e-5),
     );
+}
+
+/// The same typed program, lowered through the same `lower_with`, to CUDA.
+///
+/// This is the claim the whole design rests on, reduced to a file someone
+/// can read: one program, two targets, no per-target kernel rewrite. The
+/// Metal goldens beside it come from the identical lowering.
+///
+/// `scripts/cuda_check.sh crates/lex-msl/tests/golden/*.cu` compiles these
+/// with nvcc and assembles them for sm_89 — no GPU, and not in CI, because
+/// CI has no container runtime. The golden is what CI can check.
+#[test]
+fn rmsnorm_rows_lowered_to_cuda() {
+    use lex_msl::dialect::Cuda;
+    let prog = lex_front::llama::rmsnorm_rows(4, 4096, 1e-5, None, DType::F32);
+    let target = Target::nvidia_ada();
+    let l = lex_msl::program::lower_with(&prog, &target, 256, &Cuda).expect("lower");
+    compare_ext("rmsnorm_4x4096_f32_cuda", &l.source, "cu");
+}
+
+/// Narrowing to f16 is where the two languages stop agreeing on grammar:
+/// Metal casts with `half(x)`, CUDA calls `__float2half(x)`. A dialect that
+/// was copied and not read would emit a cast CUDA silently accepts as
+/// something else.
+#[test]
+fn a_narrowing_store_lowered_to_cuda() {
+    use lex_msl::dialect::Cuda;
+    let prog = lex_front::llama::rmsnorm_rows(4, 4096, 1e-5, None, DType::F16);
+    let target = Target::nvidia_ada();
+    let l = lex_msl::program::lower_with(&prog, &target, 256, &Cuda).expect("lower");
+    assert!(
+        l.source.contains("__float2half"),
+        "no CUDA narrowing in:\n{}",
+        l.source
+    );
+    compare_ext("rmsnorm_4x4096_f16_cuda", &l.source, "cu");
 }

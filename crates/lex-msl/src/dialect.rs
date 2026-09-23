@@ -22,6 +22,13 @@
 
 use lex_ir::DType;
 
+/// One buffer the kernel takes, already named and typed by the lowering.
+pub struct Param<'a> {
+    pub ty: &'a str,
+    pub name: &'a str,
+    pub writable: bool,
+}
+
 /// How a target spells the primitives the lowering emits.
 ///
 /// Every method returns text rather than writing, so a dialect stays a pure
@@ -58,6 +65,50 @@ pub trait Dialect {
 
     /// Declare an array in threadgroup / shared memory.
     fn shared_array(&self, ty: &str, name: &str, len: usize) -> String;
+
+    /// `exp`, `log` and `rsqrt`, at the accuracy the reference interpreter
+    /// is written against.
+    ///
+    /// Metal has an explicit `precise::` namespace because its default
+    /// versions are allowed to be sloppier; CUDA's unsuffixed `expf` and
+    /// `rsqrtf` already meet the accuracy the interpreter assumes, and its
+    /// fast versions are the ones that need asking for (`__expf`). So the
+    /// *default* is the dangerous one in Metal and the safe one in CUDA,
+    /// which is a good reason for neither spelling to appear in the
+    /// lowering.
+    fn exp(&self, x: &str) -> String;
+    fn log(&self, x: &str) -> String;
+    fn rsqrt(&self, x: &str) -> String;
+    /// Absolute value of a float.
+    fn fabs(&self, x: &str) -> String;
+    /// Larger of two floats.
+    fn fmax(&self, a: &str, b: &str) -> String;
+
+    /// Convert `expr` to `d`.
+    ///
+    /// Metal spells every narrowing as a functional cast, so `half(x)` is
+    /// the whole story. CUDA's `__half` has no such constructor from float
+    /// in device code, and wants `__float2half`. Same operation, different
+    /// grammar -- which is exactly the kind of thing that compiles as a
+    /// silent no-op if a backend is copied and not read.
+    fn convert(&self, d: DType, expr: &str) -> String;
+
+    /// Whatever has to precede the kernel: includes, and any typedef the
+    /// emitted body assumes.
+    fn includes(&self) -> String;
+
+    /// The entry point, from its name through the opening brace and the
+    /// declarations that tell the body where this thread is.
+    ///
+    /// This is the one place the two languages disagree about *shape* and
+    /// not merely spelling, so it is a whole-prologue method rather than a
+    /// set of substitutions. Metal declares the thread and threadgroup
+    /// indices as parameters carrying attributes, and binds buffers by an
+    /// explicit index. CUDA takes buffers positionally -- there is no index
+    /// to get wrong, and equally none to get right -- and reads the indices
+    /// from builtins inside the body. The body that follows is identical
+    /// either way, which is the point.
+    fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool) -> String;
 }
 
 /// Metal Shading Language.
@@ -87,6 +138,55 @@ impl Dialect for Msl {
 
     fn shared_array(&self, ty: &str, name: &str, len: usize) -> String {
         format!("threadgroup {ty} {name}[{len}];")
+    }
+
+    fn exp(&self, x: &str) -> String {
+        format!("precise::exp({x})")
+    }
+
+    fn log(&self, x: &str) -> String {
+        format!("precise::log({x})")
+    }
+
+    fn rsqrt(&self, x: &str) -> String {
+        format!("precise::rsqrt({x})")
+    }
+
+    fn fabs(&self, x: &str) -> String {
+        format!("fabs({x})")
+    }
+
+    fn fmax(&self, a: &str, b: &str) -> String {
+        format!("max({a}, {b})")
+    }
+
+    fn convert(&self, d: DType, expr: &str) -> String {
+        format!("{}({expr})", d.msl_scalar())
+    }
+
+    fn includes(&self) -> String {
+        "\n#include <metal_stdlib>\nusing namespace metal;\n\n".to_string()
+    }
+
+    fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool) -> String {
+        let mut s = format!("kernel void {name}(\n");
+        for (i, p) in params.iter().enumerate() {
+            let cv = if p.writable { "" } else { "const " };
+            s.push_str(&format!(
+                "    device {cv}{}* {} [[buffer({i})]],\n",
+                p.ty, p.name
+            ));
+        }
+        if scalars {
+            s.push_str(&format!(
+                "    constant uint* scalars [[buffer({})]],\n",
+                params.len()
+            ));
+        }
+        s.push_str("    uint tid [[thread_index_in_threadgroup]],\n");
+        s.push_str("    uint3 tgpos [[threadgroup_position_in_grid]])\n{\n");
+        s.push_str("    const uint gid = tgpos.x, gid2 = tgpos.y;\n");
+        s
     }
 }
 
@@ -128,6 +228,64 @@ impl Dialect for Cuda {
 
     fn shared_array(&self, ty: &str, name: &str, len: usize) -> String {
         format!("__shared__ {ty} {name}[{len}];")
+    }
+
+    fn exp(&self, x: &str) -> String {
+        format!("expf({x})")
+    }
+
+    fn log(&self, x: &str) -> String {
+        format!("logf({x})")
+    }
+
+    fn rsqrt(&self, x: &str) -> String {
+        format!("rsqrtf({x})")
+    }
+
+    fn fabs(&self, x: &str) -> String {
+        format!("fabsf({x})")
+    }
+
+    fn fmax(&self, a: &str, b: &str) -> String {
+        format!("fmaxf({a}, {b})")
+    }
+
+    fn convert(&self, d: DType, expr: &str) -> String {
+        match d {
+            DType::F16 => format!("__float2half({expr})"),
+            DType::F32 => format!("float({expr})"),
+            DType::I8 => format!("char({expr})"),
+        }
+    }
+
+    /// `uint` and `uchar` are Metal spellings the lowering uses throughout
+    /// its index arithmetic. Typedefs here are worth far more than editing
+    /// several hundred body sites, and they keep the emitted CUDA readable
+    /// next to the emitted MSL when the two are diffed.
+    fn includes(&self) -> String {
+        "\n#include <cuda_fp16.h>\n\ntypedef unsigned int uint;\ntypedef unsigned char uchar;\n\n"
+            .to_string()
+    }
+
+    fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool) -> String {
+        let mut s = format!("extern \"C\" __global__ void {name}(\n");
+        for p in params {
+            let cv = if p.writable { "" } else { "const " };
+            s.push_str(&format!("    {cv}{}* __restrict__ {},\n", p.ty, p.name));
+        }
+        if scalars {
+            s.push_str("    const uint* __restrict__ scalars,\n");
+        }
+        // Trailing comma: Metal ends its list with the index parameters,
+        // CUDA has none to end with.
+        if s.ends_with(",\n") {
+            s.truncate(s.len() - 2);
+            s.push('\n');
+        }
+        s.push_str(")\n{\n");
+        s.push_str("    const uint tid = threadIdx.x;\n");
+        s.push_str("    const uint gid = blockIdx.x, gid2 = blockIdx.y;\n");
+        s
     }
 }
 

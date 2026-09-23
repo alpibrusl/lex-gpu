@@ -38,7 +38,7 @@ use lex_front::ir::{
 };
 use lex_ir::{DType, Space, Target};
 
-use crate::dialect::{Dialect, Msl};
+use crate::dialect::{Dialect, Msl, Param};
 
 /// A lowered kernel and everything needed to launch it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,6 +192,22 @@ enum Pack {
 /// Lower `prog` (which must already pass `lex_front::check` for `target`)
 /// with `threads` threads per threadgroup.
 pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered, String> {
+    lower_with(prog, target, threads, &Msl)
+}
+
+/// Lower for a dialect other than Metal.
+///
+/// The whole point of the seam: the same 1,800 lines below decide what to
+/// emit, and the dialect decides how to spell it. What is *not* yet behind
+/// the seam is the NVFP4 decode preamble, so a program that dequantises
+/// four-bit weights still emits Metal helpers and will not compile
+/// elsewhere. Everything else does.
+pub fn lower_with(
+    prog: &Program,
+    target: &Target,
+    threads: usize,
+    dialect: &dyn Dialect,
+) -> Result<Lowered, String> {
     if threads == 0
         || !threads.is_multiple_of(target.simd_width)
         || threads > target.max_threads_per_threadgroup
@@ -203,7 +219,7 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
     }
     let mut g = Gen {
         prog,
-        d: &Msl,
+        d: dialect,
         threads,
         body: String::new(),
         depth: 1,
@@ -255,30 +271,27 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
         "// tg mem : {arena_bytes} B tiles + {scratch_bytes} B scratch of {} B",
         target.max_threadgroup_bytes
     );
-    s.push_str("\n#include <metal_stdlib>\nusing namespace metal;\n\n");
+    s.push_str(&g.d.includes());
     if g.fp4 {
         s.push_str(FP4_TABLES);
     }
-    let _ = writeln!(s, "kernel void {entry}(");
-    for (i, p) in prog.params.iter().enumerate() {
-        let cv = if p.writable { "" } else { "const " };
-        let _ = writeln!(
-            s,
-            "    device {cv}{}* {} [[buffer({i})]],",
-            p.dtype.msl_scalar(),
-            param_ident(i, &p.name)
-        );
-    }
-    if !prog.dyn_scalars.is_empty() {
-        let _ = writeln!(
-            s,
-            "    constant uint* scalars [[buffer({})]],",
-            prog.params.len()
-        );
-    }
-    s.push_str("    uint tid [[thread_index_in_threadgroup]],\n");
-    s.push_str("    uint3 tgpos [[threadgroup_position_in_grid]])\n{\n");
-    s.push_str("    const uint gid = tgpos.x, gid2 = tgpos.y;\n");
+    let names: Vec<String> = prog
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| param_ident(i, &p.name))
+        .collect();
+    let params: Vec<Param<'_>> = prog
+        .params
+        .iter()
+        .zip(&names)
+        .map(|(p, name)| Param {
+            ty: g.d.scalar(p.dtype),
+            name,
+            writable: p.writable,
+        })
+        .collect();
+    s.push_str(&g.d.entry(&entry, &params, !prog.dyn_scalars.is_empty()));
     if arena_bytes > 0 {
         let _ = writeln!(
             s,
@@ -890,7 +903,7 @@ impl Gen<'_> {
             Op::Convert(a, dt) if self.lazy(*a).is_some() => {
                 let x = dst.ok_or("op without a result")?;
                 let (e, t) = self.lazy(*a).expect("checked");
-                let e = format!("{}(float({e}))", dt.msl_scalar());
+                let e = self.d.convert(*dt, &format!("float({e})"));
                 self.locs.insert(x, Loc::Lazy(e, reg(*dt, &t.shape)));
             }
             Op::Dequant(q, s, m, group) | Op::Dequant4(q, s, m, group, _)
@@ -1061,23 +1074,30 @@ impl Gen<'_> {
                 let src = Self::read(&ops[0].0, "e");
                 let (dt, expr) = match op {
                     Op::Dup(_) => (ty.dtype, src),
-                    Op::Exp(_) => (ty.dtype, format!("precise::exp({src})")),
+                    Op::Exp(_) => (ty.dtype, self.d.exp(&src)),
                     Op::Scale(_, f) => (ty.dtype, format!("{src} * {}", lit(*f))),
                     Op::Convert(_, d) => (*d, src),
-                    Op::Unary(UnOp::Rsqrt, _) => (ty.dtype, format!("precise::rsqrt({src})")),
-                    Op::Unary(UnOp::Sigmoid, _) => {
-                        (ty.dtype, format!("1.0f / (1.0f + precise::exp(-{src}))"))
-                    }
+                    Op::Unary(UnOp::Rsqrt, _) => (ty.dtype, self.d.rsqrt(&src)),
+                    Op::Unary(UnOp::Sigmoid, _) => (
+                        ty.dtype,
+                        format!("1.0f / (1.0f + {})", self.d.exp(&format!("-{src}"))),
+                    ),
                     Op::Unary(UnOp::Softplus, _) => (
                         ty.dtype,
                         format!(
-                            "max({src}, 0.0f) + precise::log(1.0f + precise::exp(-fabs({src})))"
+                            "{} + {}",
+                            self.d.fmax(&src, "0.0f"),
+                            self.d.log(&format!(
+                                "1.0f + {}",
+                                self.d.exp(&format!("-{}", self.d.fabs(&src)))
+                            ))
                         ),
                     ),
                     _ => unreachable!(),
                 };
                 let name = self.declare_reg(x, &reg(dt, &ty.shape));
-                self.owned(n, &[format!("{name}[k] = {}({expr});", dt.msl_scalar())]);
+                let cv = self.d.convert(dt, &expr);
+                self.owned(n, &[format!("{name}[k] = {cv};")]);
             }
             Op::Binary(bop, a, b) => {
                 let x = dst.ok_or("op without a result")?;
@@ -1103,7 +1123,8 @@ impl Gen<'_> {
                 };
                 let dt = ta.dtype;
                 let name = self.declare_reg(x, &reg(dt, &ta.shape));
-                self.owned(n, &[format!("{name}[k] = {}({expr});", dt.msl_scalar())]);
+                let cv = self.d.convert(dt, &expr);
+                self.owned(n, &[format!("{name}[k] = {cv};")]);
             }
             Op::MaskCols(a, first, limit) => {
                 let x = dst.ok_or("op without a result")?;
@@ -1403,8 +1424,8 @@ impl Gen<'_> {
                     self.owned(
                         outs,
                         &[format!(
-                            "{name}[k] = {}(scratch[{res} + e]);",
-                            acc.msl_scalar()
+                            "{name}[k] = {};",
+                            self.d.convert(*acc, &format!("scratch[{res} + e]"))
                         )],
                     );
                 } else {
@@ -1415,7 +1436,7 @@ impl Gen<'_> {
                             format!("const uint i = e / {n}u, j = e % {n}u;"),
                             "float s = 0.0f;".into(),
                             format!("for (uint p = 0; p < {kd}u; ++p) s += {av} * {bv};"),
-                            format!("{name}[k] = {}(s);", acc.msl_scalar()),
+                            format!("{name}[k] = {};", self.d.convert(*acc, "s")),
                         ],
                     );
                 }
@@ -1483,7 +1504,7 @@ impl Gen<'_> {
                                 "for (uint q = 0; q < {sgs}u; ++q) s = {};",
                                 join("s", &format!("scratch[{res} + e * {sgs}u + q]"))
                             ),
-                            format!("{name}[k] = {}(s);", dt.msl_scalar()),
+                            format!("{name}[k] = {};", self.d.convert(dt, "s")),
                         ],
                     );
                     return Ok(());
@@ -1497,7 +1518,7 @@ impl Gen<'_> {
                     &[
                         format!("float s = {init};"),
                         format!("for (uint j = 0; j < {n}u; ++j) {step}"),
-                        format!("{name}[k] = {}(s);", dt.msl_scalar()),
+                        format!("{name}[k] = {};", self.d.convert(dt, "s")),
                     ],
                 );
             }
@@ -1835,8 +1856,8 @@ impl Gen<'_> {
         self.owned(
             m * n,
             &[format!(
-                "{name}[k] = {}(scratch[{res} + e]);",
-                acc.msl_scalar()
+                "{name}[k] = {};",
+                self.d.convert(acc, &format!("scratch[{res} + e]"))
             )],
         );
         Ok(())
