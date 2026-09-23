@@ -38,6 +38,8 @@ use lex_front::ir::{
 };
 use lex_ir::{DType, Space, Target};
 
+use crate::dialect::{Dialect, Msl};
+
 /// A lowered kernel and everything needed to launch it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lowered {
@@ -95,6 +97,9 @@ enum Access {
 
 struct Gen<'a> {
     prog: &'a Program,
+    /// How this target spells barriers and lane shuffles. See
+    /// [`crate::dialect`] for why this is a seam and not a second file.
+    d: &'a dyn Dialect,
     threads: usize,
     body: String,
     depth: usize,
@@ -198,6 +203,7 @@ pub fn lower(prog: &Program, target: &Target, threads: usize) -> Result<Lowered,
     }
     let mut g = Gen {
         prog,
+        d: &Msl,
         threads,
         body: String::new(),
         depth: 1,
@@ -370,7 +376,8 @@ impl Gen<'_> {
 
     fn barrier(&mut self) {
         self.barriers += 1;
-        self.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        let text = self.d.barrier();
+        self.line(&text);
     }
 
     fn per(&self, n: usize) -> usize {
@@ -952,8 +959,9 @@ impl Gen<'_> {
                     &qe,
                     &format!("({AT} / {c}u) * {}u + ({AT} % {c}u) / 2u", tq.shape[1]),
                 );
-                let v = format!(
-                    "simd_shuffle(fp4_lane, ((uint)(uchar)({byte}) >> (({AT} & 1u) * 4u)) & 0xFu)"
+                let v = self.d.shuffle(
+                    "fp4_lane",
+                    &format!("((uint)(uchar)({byte}) >> (({AT} & 1u) * 4u)) & 0xFu"),
                 );
                 // Inside a reduction the scale is formed once per group, so
                 // the row scale rides along with it: group G is row
@@ -1153,8 +1161,12 @@ impl Gen<'_> {
                 self.owned(
                     n,
                     &[format!(
-                        "{name}[k] = simd_shuffle(fp4_lane, ((uint)(uchar)({byte}) >> ((e & 1u) * 4u)) & 0xFu) \
-                         * fp8_e4m3((uint)(uchar)({sv}) & 0xFFu) * {gv};"
+                        "{name}[k] = {} \
+                         * fp8_e4m3((uint)(uchar)({sv}) & 0xFFu) * {gv};",
+                        self.d.shuffle(
+                            "fp4_lane",
+                            &format!("((uint)(uchar)({byte}) >> ((e & 1u) * 4u)) & 0xFu")
+                        )
                     )],
                 );
             }
@@ -1372,8 +1384,9 @@ impl Gen<'_> {
                     self.depth -= 1;
                     self.line("}");
                     self.line(&format!(
-                        "for (uint d = {}u; d > 0; d /= 2) s += simd_shuffle_down(s, d);",
-                        lanes / 2
+                        "for (uint d = {}u; d > 0; d /= 2) s += {};",
+                        lanes / 2,
+                        self.d.shuffle_down("s", "d")
                     ));
                     self.line(&format!(
                         "if (o < {outs}u && lane == 0) scratch[{res} + o] = s;"
@@ -1448,7 +1461,7 @@ impl Gen<'_> {
                     self.line(&format!(
                         "for (uint d = {}u; d > 0; d /= 2) s = {};",
                         lanes.min(32) / 2,
-                        join("s", "simd_shuffle_down(s, d)")
+                        join("s", &self.d.shuffle_down("s", "d"))
                     ));
                     self.line(&format!(
                         "if (o < {m}u && lane % 32u == 0) scratch[{res} + o * {sgs}u + lane / 32u] = s;"
@@ -1779,8 +1792,9 @@ impl Gen<'_> {
                 for i in 0..m {
                     self.line(&format!(
                         "for (uint d = {}u; d > 0; d /= 2) \
-                         s[{rr}][{i}] += simd_shuffle_down(s[{rr}][{i}], d);",
-                        lanes / 2
+                         s[{rr}][{i}] += {};",
+                        lanes / 2,
+                        self.d.shuffle_down(&format!("s[{rr}][{i}]"), "d")
                     ));
                 }
             }
@@ -1800,8 +1814,9 @@ impl Gen<'_> {
         } else {
             self.line(&format!(
                 "for (uint rr = 0; rr < {r}u; ++rr) for (uint i = 0; i < {m}u; ++i) \
-                 for (uint d = {}u; d > 0; d /= 2) s[rr][i] += simd_shuffle_down(s[rr][i], d);",
-                lanes / 2
+                 for (uint d = {}u; d > 0; d /= 2) s[rr][i] += {};",
+                lanes / 2,
+                self.d.shuffle_down("s[rr][i]", "d")
             ));
             self.line(&format!(
                 "if (lane == 0) for (uint rr = 0; rr < {r}u; ++rr) {{ const uint j = sgid * {r}u + rr; \

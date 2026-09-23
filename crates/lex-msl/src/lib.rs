@@ -10,6 +10,7 @@
 //! is what lets the golden tests run on any host — including a Linux CI box
 //! with no Metal toolchain anywhere near it.
 
+pub mod dialect;
 pub mod program;
 
 use std::fmt::Write as _;
