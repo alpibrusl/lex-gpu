@@ -72,6 +72,23 @@ fn main() -> Result<(), String> {
         logits = rt.step(t)?;
     }
 
+    // The draft head's attention cache only advances when it drafts, so
+    // after a prompt fed with `step` it is empty while the model is deep
+    // into a sequence: it guesses from a state the text never passed
+    // through. LEX_WARM drafts (and throws away) this many tokens first,
+    // to find out how much history the head actually needs -- if a short
+    // window recovers acceptance, warming is cheap; if only the whole
+    // prompt does, the head has to be run over the prompt properly.
+    let warm: usize = std::env::var("LEX_WARM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for _ in 0..warm {
+        let next = argmax(&logits);
+        rt.draft(1, next)?;
+        logits = rt.step(next)?;
+    }
+
     // Record first, score afterwards: the draft made at step `s` is only
     // judged once the model has produced the tokens it guessed at.
     let mut actual: Vec<u32> = vec![];

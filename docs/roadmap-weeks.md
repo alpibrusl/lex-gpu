@@ -25,17 +25,16 @@ model" — which is the failure that would make this project pointless.
 
 ## Where things actually stand
 
-| | lex | Ollama | |
-| --- | --- | --- | --- |
-| decode, no context | 27.5 (37.4 speculating) | 42.7 | |
-| decode, 1440 context | **19.1** (16.7 speculating) | **53.1** | we get worse, they get better |
-| prefill, 512 | 75 | 247 | |
-| CUDA | three kernels, verified on an L4 | — | no model yet |
+| | lex | Ollama |
+| --- | --- | --- |
+| decode, no context | 27.4 (39.5 speculating) | 42.7 |
+| decode, 1440 context | 27.0 (15.3 speculating) | 53.1 |
+| prefill, 512 | 75 | 247 |
+| CUDA | three kernels, verified on an L4 | — |
 
-The two decode numbers are the story. Ollama is flat with context and we
-are not, and our speculation turns into a *loss* at real context lengths.
-Both have causes, both are measured, and both are already-solved problems
-in this repository.
+Decode is flat with context now, which it was not this morning — M1. What
+is left is that speculation still *loses* as context grows, and that
+prefill is 3.3x off. Both are measured below rather than guessed at.
 
 ## M1 — decode stops degrading with context (days)
 
@@ -53,19 +52,39 @@ across 0–1440 positions. It was never ported.
 **Done when:** a step at 1440 costs what a step at 0 costs, within noise,
 and `llama3.1:8b` has not moved.
 
-## M2 — the draft head sees the context (days)
+## M2 — speculation stops losing at context (1–2 weeks)
 
-`step()` never advances `mtp_pos`, so after a 512-token prompt the model is
-at position 512 and the draft head's attention cache is empty. It drafts
-from a state the sequence never passed through. Acceptance falls from 90.5%
-to 74.6%, and with the step cost rising too, speculation goes from 1.36x to
-0.88x — worse than not speculating.
+Two faults were hiding behind each other, and M1 separated them.
 
-Needs the head run over the prompt as the model is, which means a batched
-forward for the head, not only the single-token one it has.
+**The verify does not scale.** After M1 a step is flat — 36.4 ms at zero
+context, 37.0 at 1440 — but the verify of two tokens goes from 40.6 ms to
+**67.9 ms**. That is 1.12 passes against 1.84. Speculation is 1.44x at zero
+context and 0.57x at 1440, and this is why.
 
-**Done when:** acceptance at 1440 is within a few points of acceptance at
-0, and speculation is a win at every context measured.
+The cause is the same one M1 fixed, in the path M1 did not touch: the
+batch plan compiles `build_causal(t)` and there is no split variant of it.
+`build_split` attends one query to a cache; `build_causal` attends many
+queries with masking and scans serially. At 1440 positions a two-token
+verify (67.9 ms) barely beats two separate decode steps (74 ms), so
+batching the verify has stopped buying anything.
+
+So this needs a **causal split kernel** — the cache cut across
+threadgroups, each query masked to its own position, partials merged. That
+is a kernel to write, not a port.
+
+**The draft head never sees the context.** `mtp_pos` only advances when
+the head drafts, so after a prompt fed with `step` the head's cache is
+empty while the model is at position 1440. Acceptance falls from 90.5% to
+61–75%.
+
+Drafting sixteen tokens to warm it lifts acceptance to 74% and moves the
+speed not at all — because the verify, not acceptance, is what is losing.
+A short window is not enough either way, so when the verify is fixed this
+wants the head run over the prompt properly: a batched forward for the
+head, which it does not have.
+
+**Done when:** speculation is a win at 0, 512 and 1440, and acceptance at
+1440 is within a few points of acceptance at 0.
 
 ## M3 — prefill attention (1–2 weeks)
 
