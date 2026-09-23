@@ -62,5 +62,22 @@ for m in $MODELS; do
       | tee -a "$R/ollama-bench.txt" || fail=1
 done
 
+# The milestone: not a kernel against the interpreter, but a whole model
+# through the same `lex-front` programs the Mac runs, on an NVIDIA device.
+# Everything up to here says the emitted CUDA compiles; only a real device
+# says the numbers are right.
+step "a model on CUDA"
+if ollama pull llama3.2:1b >/dev/null 2>&1; then
+  # "The capital of France is" -- greedy, so the continuation is fixed and
+  # `scripts/lex_vs_ollama.py` has the reference this is checked against.
+  cargo run --release -p lex-rt --example generate -- \
+    --model llama3.2:1b --ids 128000,791,6864,315,9822,374 --steps 16 --top 5 \
+    2>&1 | tee "$R/cuda-generate.txt" | tail -20
+  [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+else
+  echo "could not pull llama3.2:1b" | tee "$R/cuda-generate.txt"
+  fail=1
+fi
+
 step "done (failures: $fail)"
 exit $fail
