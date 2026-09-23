@@ -388,6 +388,19 @@ mod gpu {
         snap: Option<Snapshot>,
         /// The hidden state a verify left, for the next draft.
         spec_h: Option<Vec<f32>>,
+        /// Call sites to leave out, by label prefix.
+        ///
+        /// For ablation: run without a kernel and the difference is what it
+        /// costs *on the critical path*, in a normally-scheduled pass. That
+        /// is not what `LEX_SYNC` measures -- serialised, the per-kernel
+        /// times sum to 210% of the real elapsed time, because the whole
+        /// point of the concurrent encoder is that they overlap. The
+        /// answers are wrong in different directions and only this one is
+        /// a share of anything.
+        ///
+        /// The results are nonsense once a kernel is missing. The shapes,
+        /// the dispatch count and the scheduling are not.
+        pub skip: Vec<String>,
         acts: Acts,
         /// Activations for a batch, and the kernels for each size seen.
         bacts: Acts,
@@ -717,6 +730,7 @@ mod gpu {
                 mtp_pos: 0,
                 snap,
                 spec_h: None,
+                skip: vec![],
                 acts,
                 bacts,
                 batches: HashMap::new(),
@@ -1105,7 +1119,10 @@ mod gpu {
                 &[pos0 as u32, (pos0 + t).div_ceil(ATTN_BK) as u32],
             );
 
-            let plan = self.batch_plan(t);
+            let mut plan = self.batch_plan(t);
+            if !self.skip.is_empty() {
+                plan.retain(|d| !self.skip.iter().any(|s| d.0.starts_with(s.as_str())));
+            }
             // Same as `step`: with LEX_SYNC, dispatch one at a time and
             // record where the time went. Without it prefill can only be
             // measured in total, which is enough to see a chunk size cost
