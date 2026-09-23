@@ -110,7 +110,7 @@ mod gpu {
     use std::collections::HashMap;
 
     use half::f16;
-    use lex_front::flash::FlashDecode;
+    use lex_front::flash::{COMBINE_CHUNK, FlashDecode};
     use lex_front::llama::{
         QLayout, kv_append, kv_append_rows, matmul_q_x, matvec_q, rmsnorm, rmsnorm_rows,
     };
@@ -148,9 +148,21 @@ mod gpu {
     );
 
     const ATTN_BPS: usize = 2;
-    const ATTN_MIN_SPLITS: usize = 2;
-    /// Splits one combine threadgroup reduces.
-    const COMBINE_CHUNK: usize = 8;
+    /// Splits below which the serial kernel is used instead.
+    ///
+    /// Read fresh every time on purpose: the golden test builds one Runner,
+    /// decodes with splits, then sets `LEX_MIN_SPLITS` and decodes again to
+    /// compare against the serial kernel. Caching this in a `OnceLock` would
+    /// pin the first value and leave that test comparing the split path
+    /// against itself -- passing while checking nothing. It costs one lookup
+    /// per attention layer per step, about 0.04% of a step, which is below
+    /// the noise in every measurement here.
+    fn attn_min_splits() -> usize {
+        std::env::var("LEX_MIN_SPLITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    }
     /// State rows per instance of the delta step.
     const DELTA_ROWS: usize = 8;
     /// The dtype the *batched* path keeps normalised activations in.
@@ -1106,10 +1118,15 @@ mod gpu {
                 &[len as u32, len.div_ceil(ATTN_BK) as u32],
             );
             self.gpu.write(&a.scalars_len, 0, &[len as u32]);
+            // The combine takes the live split count and how many chunks
+            // of COMBINE_CHUNK they make -- not the head count. Writing the
+            // wrong second scalar makes it reduce a prefix of the splits
+            // and quietly drop the rest of the cache.
+            let nsplit = self.nsplit(len);
             self.gpu.write(
                 &a.scalars_nsplit,
                 0,
-                &[self.nsplit(len) as u32, c.kv_heads as u32],
+                &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
             );
 
             let mut plan = self.plan();
@@ -1680,7 +1697,7 @@ mod gpu {
                         // attended in parallel, their partial softmaxes
                         // merged by a second kernel.
                         let nsplit = self.nsplit(self.pos + 1);
-                        if nsplit >= ATTN_MIN_SPLITS {
+                        if nsplit >= attn_min_splits() {
                             d.push((
                                 "attention",
                                 &k.attn_split,

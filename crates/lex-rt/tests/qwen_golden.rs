@@ -9,6 +9,20 @@
 
 use lex_rt::qwen_run::Runner;
 
+/// Held for the length of any test that loads the model.
+///
+/// The weights are 14.5 GB and `cargo test` runs a binary's tests in
+/// parallel, so four of these at once asks for 58 GB on a machine with a
+/// 55 GB working set. What that looks like is the whole binary dying with
+/// SIGKILL and no failing assertion -- a test suite that reports a failure
+/// it cannot explain. One model at a time instead.
+static MODEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The lock, ignoring poisoning: a panicking test has already reported.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    MODEL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Log-probabilities differ from the reference by f32 rounding and by the
 /// attention kernel's f16 cache; the reference itself sits within 0.10 of
 /// Ollama's own numbers.
@@ -64,6 +78,7 @@ fn log_softmax(v: &[f32]) -> Vec<f64> {
 
 #[test]
 fn qwen35_matches_the_reference_that_matches_ollama() {
+    let _lock = one_at_a_time();
     let golden = include_str!("data/qwen35_27b_golden.txt");
     let (model, cases) = parse(golden);
     let longest = cases
@@ -124,6 +139,7 @@ fn qwen35_matches_the_reference_that_matches_ollama() {
 /// is only sound if a batch and a sequence agree.
 #[test]
 fn a_batch_lands_where_the_same_tokens_land_one_by_one() {
+    let _lock = one_at_a_time();
     let golden = include_str!("data/qwen35_27b_golden.txt");
     let (model, cases) = parse(golden);
     let prompt = &cases[0].prompt;
@@ -146,6 +162,8 @@ fn a_batch_lands_where_the_same_tokens_land_one_by_one() {
     rt.reset();
     let many = rt.forward(prompt, true).expect("batch");
     assert_eq!(many.len(), prompt.len());
+
+    unsafe { std::env::remove_var("LEX_MIN_SPLITS") };
 
     let mut worst = 0.0f32;
     for (i, (b, s)) in many.iter().zip(&one).enumerate() {
@@ -180,6 +198,7 @@ fn a_batch_lands_where_the_same_tokens_land_one_by_one() {
 /// would not have produced is a wrong answer delivered faster.
 #[test]
 fn speculation_lands_exactly_where_greedy_lands() {
+    let _lock = one_at_a_time();
     let golden = include_str!("data/qwen35_27b_golden.txt");
     let (model, cases) = parse(golden);
     let prompt = &cases[0].prompt;
@@ -234,4 +253,116 @@ fn speculation_lands_exactly_where_greedy_lands() {
         "speculation changed the output: {spec:?} against {plain:?}"
     );
     eprintln!("{STEPS} tokens identical with a draft depth of 2");
+}
+
+/// The same tokens, from the same state, with a long enough context that
+/// decode attention takes the split-KV path.
+///
+/// The golden tests above use prompts of about a dozen positions, where
+/// `nsplit` is 1 and the serial kernel runs. So the split pair — two
+/// kernels and two scalars — was never exercised by any test, and a wrong
+/// scalar in the combine (the head count where the chunk count belongs)
+/// reduced a prefix of the splits and dropped the rest of the cache, while
+/// every test stayed green and the speed went *up*.
+///
+/// Feeding the same tokens from position 0 and from deep in a sequence
+/// must give the same logits for the layers that carry no cache, and must
+/// give *correct* ones for the sixteen that do. The check here is against
+/// the serial kernel: same prompt, same continuation, split path against
+/// non-split.
+#[test]
+fn split_kv_decode_agrees_with_the_serial_kernel() {
+    let _lock = one_at_a_time();
+    let golden = include_str!("data/qwen35_27b_golden.txt");
+    let (model, cases) = parse(golden);
+    // Long enough that the combine needs more chunks than the model has
+    // KV heads. At 600 positions a wrong second scalar happens to be
+    // *larger* than the right one, so it over-reduces into zeroed partials
+    // and nothing shows; past ~1024 it is smaller and drops cache. The
+    // first version of this test used 600 and passed with the bug in.
+    const FILL: usize = 1200;
+    const STEPS: usize = 6;
+    let mut rt = match Runner::load(&model, FILL + STEPS + 16) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+    let top = |v: &[f32]| {
+        (0..v.len())
+            .max_by(|&a, &b| v[a].total_cmp(&v[b]))
+            .expect("logits") as u32
+    };
+    let filler: Vec<u32> = (0..FILL)
+        .map(|i| 1000 + (i as u32 * 7919) % 200000)
+        .collect();
+
+    // With the split path.
+    rt.reset();
+    let mut logits = vec![];
+    for &t in filler.iter().chain(&cases[0].prompt) {
+        logits = rt.step(t).expect("step");
+    }
+    // Logits, not argmax. Dropping the last splits of a 1200-position
+    // cache moves the distribution and often leaves the top token alone:
+    // an earlier version of this test compared tokens, and passed with the
+    // bug deliberately put back in.
+    let mut split: Vec<Vec<f32>> = vec![];
+    for _ in 0..STEPS {
+        let t = top(&logits);
+        split.push(logits.clone());
+        logits = rt.step(t).expect("step");
+    }
+
+    // The same, forced down the serial kernel.
+    rt.skip.clear();
+    // One Runner at a time: this model is 14.5 GB of weights and the suite
+    // runs its model tests in parallel. Holding two was enough to have the
+    // whole binary killed with SIGKILL, which reads as a test failure with
+    // no failing assertion.
+    drop(rt);
+
+    // The threshold is read per step, at plan time -- so it has to stay
+    // set for the whole of this run, not just while the Runner is built.
+    // Removing it after construction left both runs on the split path,
+    // comparing it against itself, and the test passed with the bug in.
+    unsafe { std::env::set_var("LEX_MIN_SPLITS", "999999") };
+    let mut rt2 = match Runner::load(&model, FILL + STEPS + 16) {
+        Ok(rt) => rt,
+        Err(e) => {
+            unsafe { std::env::remove_var("LEX_MIN_SPLITS") };
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+    rt2.reset();
+    let mut logits = vec![];
+    for &t in filler.iter().chain(&cases[0].prompt) {
+        logits = rt2.step(t).expect("step");
+    }
+    let mut serial: Vec<Vec<f32>> = vec![];
+    for _ in 0..STEPS {
+        let t = top(&logits);
+        serial.push(logits.clone());
+        logits = rt2.step(t).expect("step");
+    }
+
+    let mut worst = 0.0f32;
+    for (a, b) in split.iter().zip(&serial) {
+        let scale = b.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+        let d = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+            / scale;
+        worst = worst.max(d);
+    }
+    assert!(
+        worst < 1e-3,
+        "split-KV decode differs from the serial kernel by {worst:e} of scale \
+         at {FILL} positions"
+    );
+    eprintln!("split vs serial at {FILL} positions: worst {worst:e} of scale");
 }
