@@ -580,6 +580,19 @@ mod gpu {
             self.pos
         }
 
+        /// The residual stream after the last layer and *before* the final
+        /// norm, as it stands after the most recent step.
+        ///
+        /// This is what the checkpoint's multi-token-prediction head takes:
+        /// it carries its own `pre_fc_norm_hidden`, so it wants the
+        /// unnormalised state. Reading it out is how the draft head is
+        /// measured without a second forward pass.
+        pub fn hidden(&self) -> Vec<f32> {
+            let mut h = vec![0.0f32; self.cfg.hidden];
+            self.gpu.download(&self.acts.x, &mut h);
+            h
+        }
+
         /// Forget the sequence. A linear layer's memory is its state and
         /// its convolution window, so both are cleared; an attention
         /// layer's cache is simply overwritten as positions are refilled.

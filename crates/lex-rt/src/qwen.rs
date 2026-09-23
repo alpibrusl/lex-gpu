@@ -26,12 +26,23 @@ use std::path::{Path, PathBuf};
 use crate::json::Json;
 
 /// Norm weights the checkpoint stores as a delta from 1.
-pub const SHIFTED: [&str; 5] = [
+///
+/// The first five are the suffixes `mlx_lm`'s `sanitize()` shifts, and the
+/// first, second, fourth and fifth match inside the multi-token-prediction
+/// head as well. The last three are the head's own norms, which `mlx_lm`
+/// never reaches because it drops every `mtp.` weight before it shifts
+/// anything. They are shifted here because measurement says so: drafting
+/// with them shifted accepts 96.9% of the model's next token, and with any
+/// of them left alone it accepts 0.4%.
+pub const SHIFTED: [&str; 8] = [
     ".input_layernorm.weight",
     ".post_attention_layernorm.weight",
     "model.language_model.norm.weight",
     ".q_norm.weight",
     ".k_norm.weight",
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.pre_fc_norm_embedding.weight",
 ];
 
 /// How a tensor is stored in its blob.

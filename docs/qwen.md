@@ -164,14 +164,57 @@ and the first half is essentially closed: 21.8 → 26.5 tok/s, with the
 remainder of the gap in the small shapes (`k` at 4096 → 1024 reaches 251
 GB/s) rather than in the format.
 
-What is left is tokens per pass. The head ships in the checkpoint (`mtp.*`,
-239 MB — 1.6% of a pass, so drafting is nearly free), and `mlx-lm` measures
-**88.3% acceptance** for it on this exact model, greedy. At a 2-token
-verify costing 1.05 passes that is 1.88 tokens per 1.05 passes — **1.79 a
-pass, or about 47 tok/s** — which would put us inside Ollama's range
-rather than at a third of it. Two things have to be true and only one is
-proven: the verify cost is measured, the acceptance is someone else's
-number on someone else's implementation.
+What is left is tokens per pass, and the head that provides them ships in
+the checkpoint: `mtp.*`, 239 MB of NVFP4 in the same three-entry blobs as
+the rest, holding one full-attention layer, a fusing `fc`, and four norms.
+
+**Its acceptance is now measured here rather than borrowed.**
+`examples/mtp_trace` dumps the model's own hidden state and chosen token
+for 256 steps; `scripts/mtp_accept.py` runs the head over that trace in
+f32 and counts how often its draft is what the model went on to pick:
+
+| text | acceptance |
+| --- | --- |
+| prose (`The capital of France is`) | **96.9%** |
+| code (`def quicksort(arr):`) | 96.1% |
+| ten unrelated rare words | **82.4%** |
+
+That range is the same shape as Ollama's 58–76 tok/s on the same kinds of
+text, which is the strongest evidence yet that its speed is this head.
+
+Two things about the head are inferred, because `mlx_lm` drops every
+`mtp.` weight in `sanitize()` before it shifts anything and so documents
+neither. Both were settled by measurement, and neither is marginal — the
+wrong choice accepts **0.4%**, not 80%:
+
+- **Every one of its norms is stored as a delta from 1**, including the
+  three (`mtp.norm`, `mtp.pre_fc_norm_hidden`, `mtp.pre_fc_norm_embedding`)
+  that match none of `mlx_lm`'s suffixes. Unshifted, `pre_fc_norm_embedding`
+  runs −0.75 to −0.19 — entirely negative, which no RMSNorm gain is.
+- **The embedding comes first** in the concatenation into `fc`:
+  `fc(concat(norm_emb(embed(x_{t+1})), norm_hidden(h_t)))`. The other
+  order is the one the obvious reading of the architecture suggests, and
+  it accepts nothing at all.
+
+Drafting is not as free as this document previously claimed. A draft is
+the head *and* a pass over `lm_head` to turn its hidden state into a
+token: 239 + 715 MB, **6.6% of a pass per drafted token**, not 1.6%.
+
+Putting the measured numbers together — verify costs of 1.04 / 1.27 /
+1.57 passes, 6.6% a draft, and the acceptance above:
+
+| | hard text (α 0.82) | easy text (α 0.97) |
+| --- | --- | --- |
+| draft 1 | 44 tok/s | 48 |
+| draft 2 | **48** | 56 |
+| draft 3 | 47 | **58** |
+| Ollama | 58 | 76 |
+
+So speculation as it stands reaches about 80% of Ollama, not parity. The
+binding constraint is no longer acceptance: it is that a verify of four
+tokens costs 1.57 passes. Get that to ~1.15, which is what a narrow
+`simdgroup_matrix` tile is for, and draft 3 becomes 61 and 76 — parity at
+both ends.
 
 Beating it is the same lever used harder, and the research says less about
 trees than expected: vLLM closed tree verification as not planned, and
