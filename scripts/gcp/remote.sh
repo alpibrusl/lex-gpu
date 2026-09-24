@@ -134,13 +134,26 @@ cargo run --release -p lex-rt --example generate -- \
 # Metal tests are held to as well. Opt-in: 14.5 GB to pull.
 if [ -n "${QWEN:-}" ]; then
   step "the hard model on CUDA"
-  ollama pull qwen3.8:27b-mlx >/dev/null 2>&1 || echo "pull failed; trying the store"
+  # Keep the reason. `|| echo "pull failed"` threw away the only
+  # evidence of why, and the step then passed on an empty test run.
+  ollama pull qwen3.8:27b-mlx 2>&1 | tail -2 | tee -a "$R/qwen-cuda.log"
   sudo chmod a+rX /usr/share/ollama /usr/share/ollama/.ollama 2>/dev/null || true
   sudo chmod -R a+rX "${OLLAMA_MODELS:-/usr/share/ollama/.ollama/models}" 2>/dev/null || true
+  # Ollama holds the baseline models on the GPU -- 6.6 GB of a 23 GB
+  # card after llama3.1:8b -- and this one needs about 15.5.
+  sudo systemctl stop ollama 2>/dev/null || true
   nvidia-smi --query-gpu=memory.total,memory.used --format=csv | tee -a "$R/machine.txt"
-  cargo test --release -p lex-rt --test qwen_golden -- --nocapture 2>&1 \
-    | tee "$R/qwen-cuda.log" | grep -E "test result|worst|SKIPPED|panicked|differs"
-  [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+
+  QOUT=$(cargo test --release -p lex-rt --test qwen_golden -- --nocapture 2>&1)
+  echo "$QOUT" >> "$R/qwen-cuda.log"
+  echo "$QOUT" | grep -E "test result|worst|SKIPPED|panicked|differs" || true
+  # A suite that runs nothing is not a pass. The first version of this
+  # step reported success off `test result: ok. 0 passed`, because the
+  # test file was still gated to macOS and compiled to nothing.
+  if ! echo "$QOUT" | grep -qE "test result: ok\. [1-9]"; then
+    echo "no qwen test actually ran -- gated out, or the model is missing"
+    fail=1
+  fi
   cargo run --release -p lex-rt --example mtp -- --steps 32 --depth 1 2>&1 \
     | tee -a "$R/qwen-cuda.log" | grep -E "tok/s|offset 1"
 fi

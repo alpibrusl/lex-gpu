@@ -5,7 +5,7 @@
 //! reference picks at every step and the log-probabilities of its top few.
 //! Needs macOS and the model pulled; skips itself otherwise.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use lex_rt::qwen_run::Runner;
 
