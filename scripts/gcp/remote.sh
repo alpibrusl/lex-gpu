@@ -93,10 +93,27 @@ step "a model on CUDA"
 # milestone: one run died on exactly that, `ollama pull` refusing because
 # the server had fallen over, with the model sitting in the store.
 ollama pull llama3.2:1b >/dev/null 2>&1 || echo "pull failed; using whatever is in the store"
+# Ask Ollama which blob the tag resolves to rather than reconstructing
+# the manifest path. The store layout changed between versions -- 0.34.4
+# grew a `metadata/` directory and the old
+# manifests/registry.ollama.ai/library/<repo>/<tag> guess stopped
+# resolving -- and three runs were lost to guessing at it. `--modelfile`
+# prints `FROM <blob>`, which is the file we actually want.
+GGUF=$(ollama show llama3.2:1b --modelfile 2>/dev/null | awk '/^FROM /{print $2; exit}')
+echo "gguf: ${GGUF:-<not resolved, falling back to the manifest>}" | tee -a "$R/machine.txt"
+# The layout, recorded either way, so the fallback can be fixed from fact.
+sudo find "${OLLAMA_MODELS:-/usr/share/ollama/.ollama/models}/manifests" -maxdepth 4 \
+  2>/dev/null | head -20 | tee -a "$R/machine.txt"
+
 # "The capital of France is" -- greedy, so the continuation is fixed and
 # `scripts/lex_vs_ollama.py` has the reference this is checked against.
+if [ -n "$GGUF" ] && [ -r "$GGUF" ]; then
+  MODEL_ARG=(--gguf "$GGUF")
+else
+  MODEL_ARG=(--model llama3.2:1b)
+fi
 cargo run --release -p lex-rt --example generate -- \
-  --model llama3.2:1b --ids 128000,791,6864,315,9822,374 --steps 16 --top 5 \
+  "${MODEL_ARG[@]}" --ids 128000,791,6864,315,9822,374 --steps 16 --top 5 \
   2>&1 | tee "$R/cuda-generate.txt" | tail -20
 [ "${PIPESTATUS[0]}" = 0 ] || fail=1
 
