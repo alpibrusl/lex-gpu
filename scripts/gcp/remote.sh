@@ -180,22 +180,23 @@ if [ -n "${QWEN:-}" ]; then
   # pressure, and the right value is a property of the register file, not
   # of the kernel -- so there is no reason the Metal answer should be the
   # Ada one, and nobody has ever looked.
-  # `bo` is the one that matters and the first sweep missed it: the
-  # decode table takes BO from the environment, so three runs varying
-  # only THREADS all measured the Metal-tuned default of 8 and reported
-  # the same ~100 GB/s. The batched table varies `bo` itself and reaches
-  # twice that, which is what says the decode kernel is the problem.
-  step "the schedule, swept on this card"
-  for th in 128 256; do
-    for bo in 4 8 16 32 64; do
-      echo "--- THREADS=$th BO=$bo"
-      # No `head`: the whole table goes to the log. Truncating it is how
-      # the rows that mattered were lost last time.
-      THREADS=$th BO=$bo cargo run --release -p lex-rt --example matvec 2>&1 \
-        | tee -a "$R/matvec-cuda.log" | grep -E "qwen (gate|down|qkv|lm)"
-    done
-  done
 fi
+
+# `bo` is the one that matters and the first sweep missed it: the
+# decode table takes BO from the environment, so three runs varying
+# only THREADS all measured the Metal-tuned default of 8 and reported
+# the same ~100 GB/s. The batched table varies `bo` itself and reaches
+# twice that, which is what says the decode kernel is the problem.
+step "the schedule, swept on this card"
+for th in 128 256; do
+  for bo in 4 8 16 32 64; do
+    echo "--- THREADS=$th BO=$bo"
+    # No `head`: the whole table goes to the log. Truncating it is how
+    # the rows that mattered were lost last time.
+    THREADS=$th BO=$bo cargo run --release -p lex-rt --example matvec 2>&1 \
+      | tee -a "$R/matvec-cuda.log" | grep -E "qwen (gate|down|qkv|lm)"
+  done
+done
 
 step "done (failures: $fail)"
 exit $fail
