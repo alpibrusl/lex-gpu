@@ -1,0 +1,26 @@
+// y = x * rsqrt(mean(x^2) + eps) * w, over one row of n.
+//
+// The same program as `lex_front::llama::rmsnorm`, written in the surface
+// instead of in Rust. `tests/syntax.rs` requires the two to lower to the
+// same MSL, byte for byte -- an equivalent program would not be evidence
+// that the surface builds *this* IR.
+//
+// `&x` borrows and `x` moves. The checker counts consumptions, so which
+// is which is not a detail: `&x * &x` leaves x alive for the multiply at
+// the end, and the bare `x` there is what finally spends it.
+
+algo rmsnorm(n, eps)
+  in  x: f32[1, n]
+  in  w: f32[1, n]
+  out y: f32[1, n]
+{
+  let x  = load x
+  let sq = &x * &x
+  let ss = rowsum sq
+  let ms = ss * 0.000244140625   // 1/n at n = 4096
+  let t  = ms + eps
+  let r  = rsqrt t
+  let xn = x * r
+  let w  = load w
+  store xn * w -> y
+}

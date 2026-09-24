@@ -9,3 +9,9 @@ description = "Typed tile programs: linearity and effect checking, and a referen
 [dependencies]
 lex-ir = { workspace = true }
 half = { workspace = true }
+
+[dev-dependencies]
+# A dev-only cycle, which Cargo allows: the surface test compares the
+# program it parses against the MSL the Rust one emits, and the emitter
+# is the only thing that can say two programs are the same program.
+lex-msl = { workspace = true }
