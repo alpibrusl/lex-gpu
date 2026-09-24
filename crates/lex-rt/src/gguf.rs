@@ -248,21 +248,48 @@ impl Gguf {
 /// The GGUF blob behind an Ollama model tag such as `llama3.2:1b`, found
 /// through Ollama's manifest (`$OLLAMA_MODELS`, else `~/.ollama/models`).
 pub fn ollama_model(tag: &str) -> Result<PathBuf, String> {
-    let root = std::env::var_os("OLLAMA_MODELS")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".ollama/models")))
-        .ok_or("cannot locate the Ollama model store")?;
+    // Where a store might be, in the order worth trying. On Linux the
+    // installer creates an `ollama` system user and the service keeps its
+    // blobs under that user's home, so `ollama pull` as yourself leaves
+    // nothing in *your* `~/.ollama` -- the models are there, just not
+    // where a Mac-shaped guess looks. That cost a cloud run.
+    let mut roots: Vec<PathBuf> = vec![];
+    if let Some(r) = std::env::var_os("OLLAMA_MODELS") {
+        roots.push(PathBuf::from(r));
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(h).join(".ollama/models"));
+    }
+    roots.push(PathBuf::from("/usr/share/ollama/.ollama/models"));
+    if roots.is_empty() {
+        return Err("cannot locate the Ollama model store".into());
+    }
+
     let (repo, t) = tag.split_once(':').unwrap_or((tag, "latest"));
-    let manifest = root
-        .join("manifests/registry.ollama.ai/library")
-        .join(repo)
-        .join(t);
-    let text = std::fs::read_to_string(&manifest).map_err(|e| {
-        format!(
-            "no Ollama manifest for {tag} at {}: {e}",
-            manifest.display()
-        )
-    })?;
+    let path_in = |r: &PathBuf| {
+        r.join("manifests/registry.ollama.ai/library")
+            .join(repo)
+            .join(t)
+    };
+    let (manifest, text) = roots
+        .iter()
+        .map(&path_in)
+        .find_map(|m| std::fs::read_to_string(&m).ok().map(|s| (m, s)))
+        .ok_or_else(|| {
+            let tried: Vec<String> = roots
+                .iter()
+                .map(|r| path_in(r).display().to_string())
+                .collect();
+            format!("no Ollama manifest for {tag}; tried {}", tried.join(", "))
+        })?;
+    // manifests/registry.ollama.ai/library/<repo>/<tag> is five components
+    // below the store, and `ancestors` counts the path itself as the
+    // first, so the store is the sixth.
+    let root = manifest
+        .ancestors()
+        .nth(5)
+        .ok_or("manifest is not inside a model store")?
+        .to_path_buf();
     // The manifest is small JSON; find the model layer's digest without a
     // JSON dependency.
     let key = "application/vnd.ollama.image.model";
