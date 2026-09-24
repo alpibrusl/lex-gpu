@@ -4,7 +4,7 @@
 #
 #   gcloud auth login                       # once; the script cannot prompt
 #   GCP_PROJECT=my-project scripts/gcp/nvidia_test.sh
-#   GCP_PROJECT=my-project GPU=a100 SPOT=1 scripts/gcp/nvidia_test.sh
+#   GCP_PROJECT=my-project GPU=a100 scripts/gcp/nvidia_test.sh
 #
 # What runs on the VM is scripts/gcp/remote.sh, against the committed HEAD
 # (`git archive`): uncommitted changes are not tested.
@@ -16,7 +16,9 @@
 #                come with their GPU attached; no --accelerator flag.
 #   ZONES        space-separated zones to try in order; EU only by default.
 #                GPUs are often out of stock in one zone and free in the next.
-#   SPOT=1       Spot VM: ~60-70% cheaper, can be preempted mid-run.
+#   SPOT=0       On-demand instead of the default Spot. Spot is 60-70%
+#                cheaper and can be preempted mid-run; use SPOT=0 only for
+#                a run long enough that losing it matters.
 #   MODELS       Ollama models for the baseline (default: llama3.2:1b llama3.1:8b).
 #   QWEN=1       also run qwen3.8:27b-mlx on the GPU -- the hybrid
 #                gated-delta / NVFP4 / draft-head model. 14.5 GB to pull,
@@ -32,7 +34,12 @@ set -euo pipefail
 
 : "${GCP_PROJECT:?set GCP_PROJECT to the Google Cloud project to bill}"
 GPU="${GPU:-l4}"
-SPOT="${SPOT:-0}"
+# Spot by default: 60-70% cheaper, and this is a test harness whose runs
+# are all repeatable. A preemption costs the run, not the results, and
+# the alternative was quietly paying on-demand for every one of them --
+# which is what happened for a day because the default was 0 and the
+# flag was never passed.
+SPOT="${SPOT:-1}"
 MAX_RUN="${MAX_RUN:-2h}"
 KEEP="${KEEP:-0}"
 MODELS="${MODELS:-llama3.2:1b llama3.1:8b}"
