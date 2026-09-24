@@ -73,23 +73,45 @@ context. `examples/verify` measures this against the decode step it
 replaces, rather than inferring it from tokens per second — which
 divides by an acceptance rate that moves at the same time.
 
-**The draft head not seeing the context was a red herring.** The head's
+**The draft head not seeing the context was real after all.** The head's
 cache only advanced when it drafted, so after a prompt fed with `step` it
-sat at position 0 while the model was at 1440. That was real, and
-`Runner::prefill` now fixes it: the prompt is fed batched and the head
-runs over it, since the model's hidden state at each position exists only
-while the prompt is being fed.
+sat at position 0 while the model was at 1440. `Runner::prefill` fixes it:
+the prompt is fed batched and the head runs over it, which is the only
+place it can be done -- the model's hidden state at each position exists
+only while the prompt is being fed.
 
-It buys nothing. Acceptance at 1440 is **68.1% warmed against 70.2%
-cold** — a wash. The drop from 89% was never the cold cache; it is what
-the benchmark feeds. With a five-token *random* prompt and no context at
-all, acceptance is 83%, against 89% for real text. The filler is 1440
-random tokens, and predicting the continuation of noise is simply harder.
+This document previously said the warm bought nothing. That was measured
+on 1440 *random* filler tokens, and it is the one text where it cannot
+possibly help: a cache full of noise carries nothing for the head to use.
+Measured paired, 192 rounds, same context, same positions:
 
-So the head warm is kept because a head whose cache disagrees with the
-model's is wrong, not because it is worth any tokens per second. What is
-still unmeasured is acceptance on *coherent* long context, which is the
-only case anyone actually runs.
+| context | warm | cold | warm-only | cold-only | McNemar p |
+| --- | --- | --- | --- | --- | --- |
+| coherent 1440 | 71.7% | 64.4% | 16 | 2 | **0.0013** |
+| random 1440 | 79.1% | 79.1% | 1 | 1 | 1.0 |
+
+On prose the warm is worth 7.3 points and takes speculation from 0.97x to
+1.05x. On noise it is worth nothing, and two discordant pairs out of 191
+say so about as flatly as a measurement can.
+
+The pairing is what made this decidable. `actual` is the model's own
+greedy continuation and does not depend on the drafts, so two runs over
+the same ids predict exactly the same positions -- the script checks that
+and refuses to report if it is ever false. Unpaired, the same 191 rounds
+sit at 1.5 sigma and say nothing; paired, they are p = 0.0013.
+
+Two older numbers here are withdrawn. Acceptance at 1440 random was
+reported as 68-70%; at 192 rounds instead of 47 it is 79.1%. Random
+filler does not depress acceptance -- if anything the model's
+continuation of noise is *more* predictable than prose. Any acceptance
+figure in this repository taken over ~48 rounds should be assumed noisy
+to several points.
+
+`scripts/ollama_context.py` is where coherent ids come from: Ollama's
+`/api/generate` returns `context`, the token ids of the prompt and its
+own reply, so no tokenizer is needed in the repo. It reports the share of
+immediate repeats so a degenerate passage can be thrown away (this one:
+1440 ids, 628 distinct, 0.0%).
 
 **What is actually left is the undo.** With the verify fixed the trace
 at 1440 reads:
@@ -132,31 +154,49 @@ matvec wins — 8.29 ms of a notional pass per token against 9.24. It is
 committed so the next attempt has to beat that number in an afternoon
 rather than in the IR over weeks.
 
-## M3b — prefill is still 2.7x off Ollama (unscheduled)
+## M3b — the batched matvec reaches neither roof (1–2 weeks)
 
 90 tok/s against Ollama's ~250. Attention is no longer where it is: the
 feed-forward matvecs are 54% of the pass (`gate/up` 33%, `down` 21%) and
 everything else is single digits.
 
-Two candidates, and the honest position is that they have not been
-separated yet:
+`examples/matvec` already measures the shape that matters — Qwen's
+`5120 -> 17408` gate/up in NVFP4, batched — and it separates the two
+candidates. Best configuration at each batch (f16 activations, `bo=32`):
 
-- **Weight re-reads.** `MAX_BATCH` is 8, so a 512-token prefill reads all
-  14.5 GB of weights 64 times. Ollama prefills in much larger batches and
-  reads them a handful of times. Raising the batch was tried once and
-  `matvec down` blew up at 16 tokens, which was recorded as "a dead end"
-  and deserves better than that, because this is the whole gap.
-- **The batched matvec is not bandwidth-bound.** `examples/matvec` shows
-  weight throughput falling from ~400 GB/s at two rows to ~216 at eight on
-  the 8B's shapes, which is what a kernel going compute-bound looks like.
+| tokens | kernel | GB/s | ms/token |
+| --- | --- | --- | --- |
+| 1 | 122 µs | 410 | 35.3 |
+| 2 | 117 µs | 428 | 17.0 |
+| 4 | 149 µs | 336 | 10.8 |
+| 8 | 232 µs | 217 | 8.4 |
 
-That measurement is of the *8B's Q4\_K decode* shapes, not Qwen's batched
-NVFP4 ones, so it is a hint and not an answer. The first job here is
-extending `examples/matvec` to the shapes prefill actually runs, before
-anything is changed on the strength of it. An earlier version of this
-document asserted the feed-forward was "within ~10% of the 507 GB/s
-bandwidth roof"; nothing measured since supports that, and it is
-withdrawn.
+**It is not weight re-reads.** Eight tokens instead of one is 8x the work
+for one set of weights and buys 4.2x. Raising `MAX_BATCH` climbs a curve
+that is already flattening, so the 2.7x is not sitting there.
+
+**Nor is it honestly "compute-bound".** At eight tokens the kernel does
+1.43 GFLOP in 232 µs — **6.2 TFLOP/s against the 15.1 measured for MPS
+f16**, while moving 217 GB/s against a 507 GB/s read roof. That is 41% of
+one roof and 43% of the other. Arithmetic intensity is 28.4 FLOP/byte and
+the machine's ridge is 29.8, so this shape sits *exactly* at the ridge
+point and reaches neither side of it. There is ~2.4x in the kernel.
+
+Two things the same table says, worth keeping in view:
+
+- `bo` past 32 collapses at eight tokens — 217 GB/s at 32, 90 at 64, 44 at
+  128. That is the register-spill cliff already recorded: tiles must be
+  indexed by literals or Metal spills the array to stack.
+- f16 activations are worth 2.1x at eight tokens (217 against 104) and
+  nothing at two, because 544 threadgroups each re-read every token's
+  activations.
+
+So the work is the kernel, and the thing to beat is 6.2 TFLOP/s at the
+ridge. The research already gathered points at 2-D register blocking
+(activations held in registers across two or more output rows, with
+compile-time-constant indices). A `simdgroup_matrix` GEMM was measured and
+lost — `examples/gemm_probe`, 8.29 ms against 9.24 — so that is not the
+first thing to try.
 
 ## M4 — a model runs on CUDA (2–3 weeks)
 
