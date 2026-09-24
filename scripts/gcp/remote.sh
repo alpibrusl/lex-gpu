@@ -174,6 +174,18 @@ if [ -n "${QWEN:-}" ]; then
   cargo run --release -p lex-rt --example mtp -- --steps 32 --depth 1 2>&1 \
     | tee -a "$R/qwen-cuda.log" | grep -E "tok/s|offset 1"
   [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+
+  # Every schedule constant in this repository was chosen on an M4 Max.
+  # `bo` and `threads` set rows per simdgroup and therefore register
+  # pressure, and the right value is a property of the register file, not
+  # of the kernel -- so there is no reason the Metal answer should be the
+  # Ada one, and nobody has ever looked.
+  step "the schedule, swept on this card"
+  for th in 128 256 512; do
+    echo "--- THREADS=$th"
+    THREADS=$th cargo run --release -p lex-rt --example matvec 2>&1 \
+      | tee -a "$R/matvec-cuda.log" | grep -E "qwen|tokens|^ +[0-9]" | head -30
+  done
 fi
 
 step "done (failures: $fail)"

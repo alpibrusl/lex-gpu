@@ -8,12 +8,12 @@
 //! cargo run --release -p lex-rt --example matvec
 //! BO=16 THREADS=128 cargo run --release -p lex-rt --example matvec
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn main() -> Result<(), String> {
     use lex_front::llama::{QLayout, matmul_q, matmul_q_x, matvec_q};
     use lex_ir::DType;
-    use lex_metal::{Buffer, Gpu, Step};
-    use lex_msl::program::lower;
+    use lex_rt::dev::{Buffer, Gpu, Step};
+    use lex_msl::program::lower_with;
 
     let env = |k: &str, d: usize| {
         std::env::var(k)
@@ -60,7 +60,7 @@ fn main() -> Result<(), String> {
     for (label, n_in, n_out, layout) in shapes {
         let prog = matvec_q(n_in, n_out, bo, n_in, layout, false)?;
         lex_front::check(&prog, gpu.target()).map_err(|e| format!("{e:?}"))?;
-        let pipe = gpu.build_lowered(&lower(&prog, gpu.target(), threads)?)?;
+        let pipe = gpu.build_lowered(&lower_with(&prog, gpu.target(), threads, lex_rt::dev::dialect())?)?;
         let bytes = |p: &lex_front::ir::Param| {
             let n: usize = p.shape.iter().product();
             n * match p.dtype {
@@ -198,7 +198,7 @@ fn main() -> Result<(), String> {
             if lex_front::check(&prog, gpu.target()).is_err() {
                 continue;
             }
-            let Ok(pipe) = gpu.build_lowered(&lower(&prog, gpu.target(), threads)?) else {
+            let Ok(pipe) = gpu.build_lowered(&lower_with(&prog, gpu.target(), threads, lex_rt::dev::dialect())?) else {
                 continue;
             };
             let binds: Vec<Vec<&Buffer>> = sets
@@ -234,7 +234,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn main() {
     eprintln!("matvec needs a Metal device");
     std::process::exit(1);
