@@ -329,25 +329,49 @@ baseline for Qwen on NVIDIA**: the non-MLX `qwen3.8:27b` is a 16.8 GB
 GGUF against our 14.5 GB NVFP4, a different quantisation of the same
 weights, so any comparison would be of two different models.
 
-**Speed is where the CUDA backend shows its age.** 6.4 tok/s against
-26.3 on an M4 Max:
+**Speed: 9.1 tok/s, up from 6.4, against 26.3 on an M4 Max.**
 
 | | tok/s | GB/s | of its read roof |
 | --- | --- | --- | --- |
 | M4 Max (~507 GB/s) | 26.3 | 381 | 75% |
-| L4 (~300 GB/s) | 6.4 | 93 | 31% |
+| L4 (~300 GB/s) | 9.1 | 132 | 44% |
 
-Bandwidth alone would put the L4 at 15.6. The missing 2.4x is not a
-mystery and is documented where it was made: `lex_cuda`'s `run_launches`
-issues every dispatch on the default stream in order, because that stream
-orders its launches and correctness came free. Metal runs a concurrent
-encoder with hazard barriers, so independent kernels -- q, k and v, gate
-and up, every small one -- share the GPU there and queue here. Qwen
-dispatches a great many small kernels per step, which is exactly the
-shape that punishes.
+The 42% came from one number in the target table. The decode matvec
+gives a threadgroup `bo` output rows and splits them across its
+simdgroups; `bo = 8` at 256 threads is one row per simdgroup, which is
+Apple's optimum and which CUDA inherited. Sweeping both knobs on an L4
+shows the ratio is what predicts the bandwidth:
 
-So the next CUDA work is streams and events, and it now has a number to
-beat rather than a principle behind it.
+| rows per warp | configurations | GB/s |
+| --- | --- | --- |
+| 1 | 256/8, 128/4 | 107, 109 |
+| **2** | **256/16, 128/8** | **189, 180** |
+| 4 | 128/16, 256/32 | 170, 166 |
+| 8 | 128/32, 256/64, 128/64 | 103, 105, 104 |
+
+`Target::matvec_rows_per_simd` now carries it: 1 for Apple, 2 for
+NVIDIA. Apple's `1 * (256/32) = 8` is the constant that was already
+there, so Metal is unchanged by construction.
+
+**Two things went the other way, and both are honest costs.**
+
+`llama3.2:1b` on the same card went 124.4 to 116.9 tok/s, −6%. The sweep
+was on Qwen's `5120 -> 17408` in NVFP4 and the 1B's matvecs are
+`2048 -> 8192` in Q8_0, so the optimum is probably a function of shape
+as well as of machine — which would make one number per target the wrong
+home for it, or at least too coarse a one. It belongs in the planner.
+
+Speculation on CUDA is now a loss: 6.2 tok/s against 9.1 plain, where
+before the change it was 6.4 against 6.4. Nothing about it got slower —
+the decode step got 42% faster and the verify did not, so the break-even
+moved. The verify of two tokens costs about 2.7 steps there against 1.15
+on Metal, and that gap is its own investigation: the batched matvec on
+Ada already reaches 67% of roof, so the cost is somewhere else in the
+batched path.
+
+So the next CUDA work is that verify, and after it streams and events —
+which remain unmeasured, and which bought only 4% when they were added
+on Metal.
 
 ## M4 — first proof: a Llama on CUDA
 
