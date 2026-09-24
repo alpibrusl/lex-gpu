@@ -364,6 +364,16 @@ pub struct Schedule {
     /// The `Target::name` this binds to, e.g. `apple-m-series`.
     pub target: String,
     pub threads: usize,
+    /// Elements one grid instance owns, partitioning the trailing
+    /// dimension. `None` runs the whole thing in one instance.
+    ///
+    /// This is here and not in the algorithm on purpose, and it is the
+    /// clearest case for the split in the language so far. What the
+    /// kernel means is `y = silu(g) * u` over n elements; cutting n into
+    /// pieces of 256 is a decision about a machine. The algorithm does
+    /// not mention it, the schedule does, and the same algorithm takes a
+    /// different cut on a different card without being rewritten.
+    pub chunk: Option<usize>,
 }
 
 /// One `.lx` file: an algorithm, and the schedules that bind it.
@@ -390,6 +400,19 @@ impl Unit {
                     self.algo.name
                 )
             })
+    }
+}
+
+impl Unit {
+    /// The algorithm, bound to one target's schedule.
+    ///
+    /// This is the whole split in one call: the constants come from the
+    /// caller, the machine-shaped decisions come from the file's
+    /// `schedule` block, and what comes back is a program plus the thread
+    /// count to lower it with.
+    pub fn compile(&self, target: &str, args: &[(&str, f64)]) -> Result<(Program, usize), String> {
+        let s = self.schedule_for(target)?;
+        Ok((self.algo.build_with(args, s.chunk)?, s.threads))
     }
 }
 
@@ -486,7 +509,7 @@ pub fn parse(src: &str) -> Result<Unit, String> {
             target.push_str(&p.want_ident()?);
         }
         p.want_punct("{")?;
-        let mut threads = None;
+        let (mut threads, mut chunk) = (None, None);
         while !p.eat_punct("}") {
             let at = p.at();
             let key = p.want_ident()?;
@@ -495,15 +518,28 @@ pub fn parse(src: &str) -> Result<Unit, String> {
                     Tok::Num(n) => threads = Some(n as usize),
                     other => return Err(format!("{at}: threads takes a number, found {other:?}")),
                 },
+                "chunk" => match p.bump() {
+                    Tok::Num(n) => chunk = Some(n as usize),
+                    other => return Err(format!("{at}: chunk takes a number, found {other:?}")),
+                },
                 other => return Err(format!("{at}: `{other}` is not a schedule key")),
             }
+            // A comma between keys is allowed and means nothing. The
+            // design doc writes them on separate lines without; a writer
+            // who reaches for one anyway should not get a parse error
+            // about a name.
+            p.eat_punct(",");
         }
         let threads =
             threads.ok_or_else(|| format!("{at}: the schedule for `{target}` sets no threads"))?;
         if schedules.iter().any(|s: &Schedule| s.target == target) {
             return Err(format!("{at}: two schedules for `{target}`"));
         }
-        schedules.push(Schedule { target, threads });
+        schedules.push(Schedule {
+            target,
+            threads,
+            chunk,
+        });
     }
 
     if !matches!(p.peek(), Tok::End) {
@@ -519,6 +555,23 @@ impl Algo {
     /// because the emitter's golden files are keyed by it and this has to
     /// produce the same program, not merely an equivalent one.
     pub fn build(&self, args: &[(&str, f64)]) -> Result<Program, String> {
+        self.build_with(args, None)
+    }
+
+    /// [`Algo::build`], partitioning the trailing dimension into pieces of
+    /// `chunk`, one grid instance each.
+    ///
+    /// Every parameter is cut the same way and every load becomes this
+    /// instance's slice, which is why the algorithm can be written as if
+    /// it saw the whole tensor. The restriction is that they must all
+    /// have the same trailing dimension: a kernel whose inputs are cut
+    /// differently is expressing something this cannot say, and saying so
+    /// is better than cutting one of them wrongly.
+    pub fn build_with(
+        &self,
+        args: &[(&str, f64)],
+        chunk: Option<usize>,
+    ) -> Result<Program, String> {
         let vals: HashMap<&str, f64> = args.iter().copied().collect();
         for c in &self.consts {
             if !vals.contains_key(c.as_str()) {
@@ -552,12 +605,48 @@ impl Algo {
         // rather than where it is written.
         let subst = |e: &Expr| -> Expr { substitute(e, &vals) };
 
-        let mut params: HashMap<&str, (usize, Vec<usize>, DType)> = HashMap::new();
+        // Declare every parameter at its full shape, then decide what one
+        // instance sees.
+        let mut full_shapes: Vec<Vec<usize>> = vec![];
         for p in &self.params {
-            let shape: Vec<usize> = p.shape.iter().map(dim).collect::<Result<_, _>>()?;
-            let id = b.param(&p.name, p.dtype, &shape, p.writable);
-            params.insert(&p.name, (id, shape, p.dtype));
+            full_shapes.push(p.shape.iter().map(dim).collect::<Result<_, _>>()?);
         }
+        let trailing: Vec<usize> = full_shapes
+            .iter()
+            .map(|s| *s.last().expect("a shape has a dimension"))
+            .collect();
+        if chunk.is_some() && trailing.windows(2).any(|w| w[0] != w[1]) {
+            return Err(format!(
+                "`{}`: a chunked algo needs one trailing dimension, not {trailing:?}",
+                self.name
+            ));
+        }
+        let pid = match chunk {
+            Some(c) => {
+                let n = trailing[0];
+                if !n.is_multiple_of(c) {
+                    return Err(format!("`{}`: chunk {c} does not divide {n}", self.name));
+                }
+                Some((b.grid(n / c), c))
+            }
+            None => None,
+        };
+
+        let mut params: HashMap<&str, (usize, Vec<usize>, DType)> = HashMap::new();
+        for (p, full) in self.params.iter().zip(&full_shapes) {
+            let id = b.param(&p.name, p.dtype, full, p.writable);
+            // What the body sees: the whole thing, or this instance's cut.
+            let seen = match pid {
+                Some((_, c)) => {
+                    let mut s = full.clone();
+                    *s.last_mut().expect("checked above") = c;
+                    s
+                }
+                None => full.clone(),
+            };
+            params.insert(&p.name, (id, seen, p.dtype));
+        }
+
 
         // Tiles in scope. A name maps to the IR var and the shape it has,
         // so a `Fill` can take the shape of whatever it is added to.
@@ -566,15 +655,15 @@ impl Algo {
         for stmt in &self.body {
             match stmt {
                 Stmt::Let(dst, e) => {
-                    let (v, shape, dt) = self.lower(&mut b, &mut env, &params, &subst(e), dst)?;
+                    let (v, shape, dt) = self.lower(&mut b, &mut env, &params, &subst(e), dst, pid)?;
                     env.insert(dst.clone(), (v, shape, dt));
                 }
                 Stmt::Store(e, dst) => {
-                    let (v, _, _) = self.lower(&mut b, &mut env, &params, &subst(e), "y")?;
+                    let (v, _, _) = self.lower(&mut b, &mut env, &params, &subst(e), "y", pid)?;
                     let (id, shape, _) = params
                         .get(dst.as_str())
                         .ok_or_else(|| format!("`{dst}` is not a parameter"))?;
-                    b.effect(Op::Store(Arg::Move(v), whole(*id, shape)));
+                    b.effect(Op::Store(Arg::Move(v), slice(pid, *id, shape)));
                 }
             }
         }
@@ -589,6 +678,7 @@ impl Algo {
         params: &HashMap<&str, (usize, Vec<usize>, DType)>,
         e: &Expr,
         name: &str,
+        pid: Option<(crate::ir::Var, usize)>,
     ) -> Result<(crate::ir::Var, Vec<usize>, DType), String> {
         Ok(match e {
             Expr::Load(p) => {
@@ -597,7 +687,7 @@ impl Algo {
                     .ok_or_else(|| format!("`{p}` is not a parameter"))?;
                 let v = b.op(
                     p,
-                    Op::Load(whole(*id, shape), TileTy::new(*dt, shape, Space::Reg)),
+                    Op::Load(slice(pid, *id, shape), TileTy::new(*dt, shape, Space::Reg)),
                 );
                 (v, shape.clone(), *dt)
             }
@@ -610,7 +700,7 @@ impl Algo {
             }
             Expr::Num(_) => return Err("a constant needs something to take its shape from".into()),
             Expr::Call(f, inner) => {
-                let (v, shape, dt) = self.lower(b, env, params, inner, name)?;
+                let (v, shape, dt) = self.lower(b, env, params, inner, name, pid)?;
                 let a = arg(inner, v);
                 match f.as_str() {
                     "rowsum" | "rowmax" => {
@@ -642,14 +732,14 @@ impl Algo {
                 // multiply by a constant is `Scale`, which the emitter
                 // folds, and anything else needs a tile to add to.
                 if let (BinOp::Mul, Expr::Num(k)) = (op, r.as_ref()) {
-                    let (v, shape, dt) = self.lower(b, env, params, l, name)?;
+                    let (v, shape, dt) = self.lower(b, env, params, l, name, pid)?;
                     return Ok((b.op(name, Op::Scale(arg(l, v), *k as f32)), shape, dt));
                 }
                 if let (BinOp::Mul, Expr::Num(k)) = (op, l.as_ref()) {
-                    let (v, shape, dt) = self.lower(b, env, params, r, name)?;
+                    let (v, shape, dt) = self.lower(b, env, params, r, name, pid)?;
                     return Ok((b.op(name, Op::Scale(arg(r, v), *k as f32)), shape, dt));
                 }
-                let (lv, lshape, dt) = self.lower(b, env, params, l, name)?;
+                let (lv, lshape, dt) = self.lower(b, env, params, l, name, pid)?;
                 let (rv, rshape, _) = match r.as_ref() {
                     Expr::Num(k) => {
                         // Shaped like what it meets, so `ms + eps` fills a
@@ -657,7 +747,7 @@ impl Algo {
                         let t = TileTy::new(dt, &lshape, Space::Reg);
                         (b.op("eps", Op::Fill(t, *k as f32)), lshape.clone(), dt)
                     }
-                    other => self.lower(b, env, params, other, name)?,
+                    other => self.lower(b, env, params, other, name, pid)?,
                 };
                 // The checker's two broadcasts, and no others: a 1-d
                 // tile of `rows` against `[rows, n]`, and a single row
@@ -712,6 +802,25 @@ fn arg_r(e: &Expr, v: crate::ir::Var) -> Arg {
     match e {
         Expr::Borrow(_) => Arg::Borrow(v),
         _ => Arg::Move(v),
+    }
+}
+
+/// What one grid instance sees of a parameter: the whole thing, or its
+/// own cut of the trailing dimension.
+fn slice(pid: Option<(crate::ir::Var, usize)>, id: usize, shape: &[usize]) -> View {
+    match pid {
+        Some((pid, c)) => {
+            let mut offset: Vec<IdxExpr> = shape.iter().map(|_| IdxExpr::lit(0)).collect();
+            if let Some(last) = offset.last_mut() {
+                *last = IdxExpr::scaled(pid, c, 0);
+            }
+            View {
+                param: id,
+                offset,
+                shape: shape.to_vec(),
+            }
+        }
+        None => whole(id, shape),
     }
 }
 

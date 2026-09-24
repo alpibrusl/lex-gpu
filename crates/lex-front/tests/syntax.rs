@@ -150,3 +150,48 @@ fn a_missing_schedule_is_an_error() {
         "the error should say what is missing and what is there: {err}"
     );
 }
+
+const SILU: &str = include_str!("lx/silu_mul.lx");
+
+/// A second kernel, which is what says the first was not a coincidence.
+///
+/// It also exercises the part rmsnorm does not: a grid. The algorithm is
+/// written over the whole tensor and the schedule cuts it into pieces of
+/// 256, so the partition -- a fact about a machine -- never appears in
+/// the algorithm. The Rust equivalent takes `chunk` as an argument and
+/// builds the grid itself; both must emit the same text.
+#[test]
+fn a_grid_comes_from_the_schedule() {
+    let unit = syntax::parse(SILU).unwrap_or_else(|e| panic!("{e}"));
+    let target = lex_ir::Target::apple_m_series();
+    let (got, threads) = unit
+        .compile(target.name, &[])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let want = lex_front::llama::silu_mul(16384, 256, lex_ir::DType::F32).expect("rust silu_mul");
+
+    assert_eq!(got.name, want.name);
+    lex_front::check(&got, &target).unwrap_or_else(|e| panic!("{e:#?}"));
+
+    let a = lex_msl::program::lower(&got, &target, threads).expect("lower parsed");
+    let b = lex_msl::program::lower(&want, &target, threads).expect("lower rust");
+    assert_eq!(a.grid, b.grid, "the grid the schedule asked for");
+    assert!(a.grid > 1, "a chunked algo should have more than one instance");
+    if a.source != b.source {
+        let (x, y): (Vec<_>, Vec<_>) = (a.source.lines().collect(), b.source.lines().collect());
+        let at = x.iter().zip(&y).position(|(p, q)| p != q).unwrap_or(0);
+        panic!(
+            "MSL differs at line {}:\n  parsed: {:?}\n  rust  : {:?}",
+            at + 1,
+            x.get(at),
+            y.get(at)
+        );
+    }
+}
+
+#[test]
+fn a_chunk_that_does_not_divide_is_rejected() {
+    let src = SILU.replace("chunk 256", "chunk 300");
+    let unit = syntax::parse(&src).expect("parses");
+    let err = unit.compile("apple-m-series", &[]).unwrap_err();
+    assert!(err.contains("does not divide"), "got {err}");
+}
