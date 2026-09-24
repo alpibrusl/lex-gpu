@@ -221,19 +221,55 @@ compile-time-constant indices). A `simdgroup_matrix` GEMM was measured and
 lost — `examples/gemm_probe`, 8.29 ms against 9.24 — so that is not the
 first thing to try.
 
-## M4 — a model runs on CUDA (2–3 weeks)
+## M4 — a model runs on CUDA — done
 
-`lex-cuda` emits, compiles and runs three kernels, verified against the
-interpreter on an L4. It does not run a model: no buffer offsets, no
-multi-dispatch plan, no `Runner`.
+`llama3.2:1b` runs end to end on an L4, from the same `lex-front`
+programs the Mac runs, and produces the same tokens:
 
-This is the milestone that matters most for the project's actual claim, and
-the least for anyone's tokens per second. One typed program, two backends,
-one model — until that exists, "no per-target kernel rewrites" is an
-argument with one backend behind it.
+    Metal: 12366 13 578 469 3168 301 22703 374 7559 304 12366 13 578 9928 49606 16730
+    L4   : 12366 13 578 469 3168 301 22703 374 7559 304 12366 13 578 9928 49606 16730
 
-**Done when:** `llama3.2:1b` produces Ollama's tokens on an L4, from the
-same `lex-front` programs the Mac runs.
+Identical, with logprobs agreeing to about 5e-4 and the same 4,410
+dispatches. Metal is pinned to Ollama's tokens by the Llama golden tests,
+so the chain holds at both ends. Speed is 124 tok/s on the L4 against
+Ollama's 163 on the same machine (76%), and 219 on an M4 Max.
+
+This is the milestone that matters most for the project's claim and least
+for anyone's tokens per second. Until it existed, "no per-target kernel
+rewrites" was an argument with one backend behind it.
+
+### What it cost, and why
+
+Seven cloud runs, because the checks on the laptop were weaker than they
+looked. In order:
+
+1. `ollama_model` looked only in `$HOME/.ollama`. On Linux the store
+   belongs to the `ollama` service user.
+2. The CUDA step was gated on `ollama pull`, which failed when the server
+   fell over, with the model already on disk.
+3. Two runs guessing at store layout, when the layout was right all
+   along.
+4. The real cause of (3): the store belongs to another user and the
+   installer's `usermod` does nothing for a shell whose groups were fixed
+   at login. The file was there, `sudo` read it, we could not, and the
+   error said only "no manifest". It now reports each candidate's io
+   error kind, so "permission denied" and "entity not found" are told
+   apart.
+5. `INFINITY` undefined. The emitter writes it for an online softmax's
+   running max; MSL has it, and CUDA has it in `math.h`, which NVRTC does
+   not give you.
+
+(5) is the one worth keeping. `scripts/cuda_check.sh` had reported all 28
+kernels compiling, and it was right -- it used `nvcc`, which has the full
+toolchain's headers, while the runtime uses NVRTC in-process. **The gate
+was checking a different compiler from the one that runs.** It now runs
+both, via `scripts/nvrtc_check.c` in the same container with no GPU.
+Deleting the fix and re-running gives the number worth remembering: nvcc
+0 errors, NVRTC 44.
+
+The general lesson is the one this repository keeps relearning: a check
+that cannot fail, or that checks something adjacent to what ships, reads
+exactly like a check that passes.
 
 ## M5 — scaling beyond one machine (unscheduled)
 
