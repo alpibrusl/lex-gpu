@@ -24,3 +24,15 @@ algo rmsnorm(n, eps)
   let w  = load w
   store xn * w -> y
 }
+
+// The algorithm above names no target. These bind it to one each, which
+// is the split the whole design rests on: the algorithm is checked once
+// and the vendor knowledge lives here, in the short part.
+//
+// Both say 256 today because rmsnorm's shape does not depend on the
+// machine. The matvec's does -- one output row per simdgroup on Apple,
+// two on Ada, measured at 107 GB/s against 189 -- and that is the next
+// thing these blocks should carry.
+
+schedule rmsnorm for apple-m-series { threads 256 }
+schedule rmsnorm for nvidia-ada     { threads 256 }

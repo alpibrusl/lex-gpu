@@ -15,8 +15,9 @@ const EPS: f32 = 1e-5;
 
 #[test]
 fn the_surface_builds_the_same_program_as_the_rust() {
-    let algo = syntax::parse(RMSNORM).unwrap_or_else(|e| panic!("{e}"));
-    let got = algo
+    let unit = syntax::parse(RMSNORM).unwrap_or_else(|e| panic!("{e}"));
+    let got = unit
+        .algo
         .build(&[("n", N as f64), ("eps", EPS as f64)])
         .unwrap_or_else(|e| panic!("{e}"));
     let want = lex_front::llama::rmsnorm(N, EPS);
@@ -47,8 +48,8 @@ fn a_moved_tile_cannot_be_used_again() {
     // what must say so -- if this ever parses *and* checks, the sigil is
     // decorative.
     let src = RMSNORM.replace("let sq = &x * &x", "let sq = x * x");
-    let algo = syntax::parse(&src).expect("it should still parse");
-    let prog = algo.build(&[("n", N as f64), ("eps", EPS as f64)]).expect("and build");
+    let unit = syntax::parse(&src).expect("it should still parse");
+    let prog = unit.algo.build(&[("n", N as f64), ("eps", EPS as f64)]).expect("and build");
     let errs = lex_front::check(&prog, &lex_ir::Target::apple_m_series());
     assert!(
         errs.is_err(),
@@ -65,11 +66,87 @@ fn errors_say_where() {
         ("algo f in x: f32[1, 4] { let a = nope }", "not bound"),
     ] {
         let got = syntax::parse(src)
-            .and_then(|a| a.build(&[]).map(|_| ()))
+            .and_then(|u| u.algo.build(&[]).map(|_| ()))
             .unwrap_err();
         assert!(
             got.contains(want),
             "for {src:?}\n  wanted an error mentioning {want:?}\n  got {got:?}"
         );
     }
+}
+
+/// One algorithm, two schedules, two backends.
+///
+/// This is the claim the whole design rests on, and the reason the
+/// surface waited for a second target: the algorithm names no machine,
+/// each schedule names exactly one, and what comes out has to be what
+/// the hand-written Rust produces on both. Not similar to it -- the same
+/// text, because a backend that is merely close is a backend with a bug
+/// nobody has found yet.
+#[test]
+fn one_algorithm_two_schedules_two_backends() {
+    use lex_msl::dialect::{Cuda, Msl};
+    use lex_msl::program::lower_with;
+
+    let unit = syntax::parse(RMSNORM).unwrap_or_else(|e| panic!("{e}"));
+    let prog = unit
+        .algo
+        .build(&[("n", N as f64), ("eps", EPS as f64)])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let want = lex_front::llama::rmsnorm(N, EPS);
+
+    for (target, dialect) in [
+        (lex_ir::Target::apple_m_series(), &Msl as &dyn lex_msl::dialect::Dialect),
+        (lex_ir::Target::nvidia_ada(), &Cuda),
+    ] {
+        let sched = unit
+            .schedule_for(target.name)
+            .unwrap_or_else(|e| panic!("{e}"));
+        lex_front::check(&prog, &target).unwrap_or_else(|e| panic!("{}: {e:#?}", target.name));
+
+        let a = lower_with(&prog, &target, sched.threads, dialect)
+            .unwrap_or_else(|e| panic!("{}: {e}", target.name));
+        let b = lower_with(&want, &target, sched.threads, dialect)
+            .unwrap_or_else(|e| panic!("{}: {e}", target.name));
+        assert_eq!(
+            a.source, b.source,
+            "{}: the parsed program and the Rust one emit different source",
+            target.name
+        );
+        // Each backend must have emitted its own language. Comparing
+        // the two outputs for inequality does not test this: the targets
+        // differ in name and budget, so the text differs even with one
+        // dialect wired to both -- which is exactly what happened when I
+        // checked, and why this asserts on the dialect's own keywords
+        // instead.
+        let (want, avoid) = if target.name.starts_with("apple") {
+            (["kernel void", "threadgroup"], ["__global__", "__syncthreads"])
+        } else {
+            (["__global__", "__syncthreads"], ["kernel void", "threadgroup "])
+        };
+        for w in want {
+            assert!(
+                a.source.contains(w),
+                "{}: emitted source has no `{w}` in it",
+                target.name
+            );
+        }
+        for v in avoid {
+            assert!(
+                !a.source.contains(v),
+                "{}: emitted source contains `{v}`, which belongs to the other backend",
+                target.name
+            );
+        }
+    }
+}
+
+#[test]
+fn a_missing_schedule_is_an_error() {
+    let unit = syntax::parse(RMSNORM).expect("parses");
+    let err = unit.schedule_for("amd-cdna3").unwrap_err();
+    assert!(
+        err.contains("no schedule for") && err.contains("apple-m-series"),
+        "the error should say what is missing and what is there: {err}"
+    );
 }

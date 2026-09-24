@@ -346,8 +346,55 @@ pub struct Algo {
     body: Vec<Stmt>,
 }
 
+/// What a target binds that the algorithm leaves open.
+///
+/// The algorithm says what to compute and contains no target anywhere in
+/// it; the schedule says how, for one machine. That split is the design's
+/// central claim and the reason the surface waited for a second backend:
+/// with one target there is nothing to split, and any syntax invented for
+/// it would be a syntax invented twice.
+///
+/// What a schedule can set today is `threads`. The design has tile sizes,
+/// MMA atoms, copy staging and layouts here too, and the measurement that
+/// most wants to live here -- rows per simdgroup, 1 on Apple and 2 on Ada
+/// -- is still a constant in the target table because no rule fits both
+/// of the shapes measured. That is the next thing this grows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Schedule {
+    /// The `Target::name` this binds to, e.g. `apple-m-series`.
+    pub target: String,
+    pub threads: usize,
+}
+
+/// One `.lx` file: an algorithm, and the schedules that bind it.
+pub struct Unit {
+    pub algo: Algo,
+    pub schedules: Vec<Schedule>,
+}
+
+impl Unit {
+    /// The schedule for a target, by its `Target::name`.
+    ///
+    /// An error rather than a default: a program with no schedule for the
+    /// machine it is being compiled for is a program nobody has chosen a
+    /// shape for, and quietly picking one is how a 3x slowdown becomes
+    /// somebody's afternoon.
+    pub fn schedule_for(&self, target: &str) -> Result<&Schedule, String> {
+        self.schedules
+            .iter()
+            .find(|s| s.target == target)
+            .ok_or_else(|| {
+                let have: Vec<&str> = self.schedules.iter().map(|s| s.target.as_str()).collect();
+                format!(
+                    "`{}` has no schedule for `{target}`; it has {have:?}",
+                    self.algo.name
+                )
+            })
+    }
+}
+
 /// Parse one `algo` from `.lx` source.
-pub fn parse(src: &str) -> Result<Algo, String> {
+pub fn parse(src: &str) -> Result<Unit, String> {
     let toks = Lexer::new(src).tokens()?;
     let mut p = Parser { toks, i: 0 };
 
@@ -411,15 +458,58 @@ pub fn parse(src: &str) -> Result<Algo, String> {
             ));
         }
     }
-    if !matches!(p.peek(), Tok::End) {
-        return Err(format!("{}: trailing input after the algo", p.at()));
-    }
-    Ok(Algo {
+    let algo = Algo {
         name,
         consts,
         params,
         body,
-    })
+    };
+
+    // `schedule <algo> for <target> { threads N }`
+    let mut schedules = vec![];
+    while p.eat_kw("schedule") {
+        let at = p.at();
+        let for_algo = p.want_ident()?;
+        if for_algo != algo.name {
+            return Err(format!(
+                "{at}: this file declares `{}`, not `{for_algo}`",
+                algo.name
+            ));
+        }
+        if !p.eat_kw("for") {
+            return Err(format!("{}: expected `for <target>`", p.at()));
+        }
+        // Target names carry dashes, which do not lex as one identifier.
+        let mut target = p.want_ident()?;
+        while p.eat_punct("-") {
+            target.push('-');
+            target.push_str(&p.want_ident()?);
+        }
+        p.want_punct("{")?;
+        let mut threads = None;
+        while !p.eat_punct("}") {
+            let at = p.at();
+            let key = p.want_ident()?;
+            match key.as_str() {
+                "threads" => match p.bump() {
+                    Tok::Num(n) => threads = Some(n as usize),
+                    other => return Err(format!("{at}: threads takes a number, found {other:?}")),
+                },
+                other => return Err(format!("{at}: `{other}` is not a schedule key")),
+            }
+        }
+        let threads =
+            threads.ok_or_else(|| format!("{at}: the schedule for `{target}` sets no threads"))?;
+        if schedules.iter().any(|s: &Schedule| s.target == target) {
+            return Err(format!("{at}: two schedules for `{target}`"));
+        }
+        schedules.push(Schedule { target, threads });
+    }
+
+    if !matches!(p.peek(), Tok::End) {
+        return Err(format!("{}: trailing input after the algo", p.at()));
+    }
+    Ok(Unit { algo, schedules })
 }
 
 impl Algo {
