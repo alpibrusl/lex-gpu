@@ -195,8 +195,17 @@ for th in 128 256; do
     # the rows that mattered were lost last time.
     THREADS=$th BO=$bo cargo run --release -p lex-rt --example matvec 2>&1 \
       | tee -a "$R/matvec-cuda.log" | grep -E "qwen (gate|down|qkv|lm)"
+    [ "${PIPESTATUS[0]}" = 0 ] || fail=1
   done
 done
+# A step that measured nothing is not a step that passed. This sweep sat
+# inside the QWEN block once, a run without it skipped the whole thing,
+# and the harness reported `failures: 0` -- which cost a VM to discover.
+rows=$(grep -c "qwen gate/up (nvfp4)" "$R/matvec-cuda.log" 2>/dev/null || true)
+if [ "${rows:-0}" -lt 10 ]; then
+  echo "the sweep produced ${rows:-0} rows, expected 10 -- it did not run"
+  fail=1
+fi
 
 step "done (failures: $fail)"
 exit $fail
