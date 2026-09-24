@@ -53,54 +53,74 @@ there is in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Status
 
-**Where it stands:** a Llama-3.1-8B served by Ollama, in 4-bit, runs entirely
-on kernels this compiler generated, and produces the same tokens as Ollama.
-Decode runs at 89–95% of Ollama's speed on the 8B and 95–99% on the 1B,
-from an empty context to 1,440 positions: split-KV attention made decode
-flat with context, as Ollama's is. That's 12× and 20× faster than where
-correctness left it. Prefill has a correct batched path, but it's 5–8×
-short of Ollama.
+Two backends, four model/hardware combinations, and one number that is
+bad. Everything here was measured on the dates in `docs/roadmap-weeks.md`
+and is re-measured rather than remembered.
 
-**Qwen3.8-27B** (`qwen3.8:27b-mlx`, NVFP4, the model in daily use here)
-also runs on these kernels now, at 26.5 tok/s, or **42.7 speculating with
-the checkpoint's own draft head** — against Ollama's 58–76, with the same
-answers either way. [`docs/qwen.md`](docs/qwen.md) has the shape of the
-model, where the time goes, and what matching Ollama needs.
+**Decode, against Ollama on the same machine:**
+
+| Model | Hardware | lex | Ollama | |
+| --- | --- | --- | --- | --- |
+| `qwen3.8:27b-mlx` | M4 Max | 42.9 (speculating) | 42.7 | parity |
+| `qwen3.8:27b-mlx` | M4 Max, 1440 ctx | 34.4 | 39.7 | 87% |
+| `llama3.1:8b` | M4 Max | 79.2 | 86.0 | 92% |
+| `llama3.2:1b` | M4 Max | 233.7 | 261.9 | 89% |
+| `llama3.2:1b` | NVIDIA L4 | 124.4 | 162.9 | 76% |
+| `qwen3.8:27b-mlx` | NVIDIA L4 | 6.4 | — | see below |
+
+**A caution about the Ollama column.** `scripts/ollama_bench.py` prompts
+with random words, which is right for timing prefill — it defeats the
+prompt cache — and wrong for timing decode on a model that speculates:
+noise has a more predictable continuation than prose, so a draft head
+accepts more of it. Ollama's Qwen decode at 1,440 positions is 57.8 on
+random words and 39.7 on a real passage. The prose figure is the one
+above; use `--prompt-file` for decode comparisons.
+
+**Prefill is the weak point: 90 tok/s against Ollama's ~250.** Not a
+mystery. 512 tokens is 28.5 TFLOP, and at the measured 13.7 TFLOP/s that
+is 246 tok/s — which is what Ollama gets, because it prefills in large
+batches and pays only the arithmetic. `MAX_BATCH` is 8 here, so a
+512-token prompt also reads all 14.5 GB of weights sixty-four times.
+Raising it needs a tiled GEMM on the matrix units; `examples/gemm_probe`
+measures one at 6.95 ms/token against the batched matvec's best 8.49,
+with the crossover at 16 tokens.
+
+**Qwen on the L4 is correct and slow.** The full golden suite passes there
+against the f32 reference — 24 steps over 3 prompts, worst |dlogprob|
+0.00064 against a tolerance of 0.02 — at 6.4 tok/s. That is 93 GB/s of a
+~300 GB/s card, 31% of its roof, where Metal reaches 75% of its own.
+Bandwidth scaling alone would predict 15.6. The CUDA backend is days old
+and issues every dispatch on the default stream in order, while Metal runs
+a concurrent encoder with hazard barriers.
 
 | Phase | State | Details |
 | --- | --- | --- |
 | **P0** Spine | closed | RMSNorm at 98.1% of the copy ceiling (463.6 GB/s) on an M4 Max, matching the reference. [`docs/P0.md`](docs/P0.md) |
 | **P1** Types | closed (in the interpreter) | Linear tiles, effect-typed copies and barrier-synchronised pipes check a flash-attention decode loop: plain, double-buffered, and warp-specialised for Hopper. All variants match PyTorch. [`docs/P1.md`](docs/P1.md) |
 | **P2** Metal, correct | **exit test met** | Llama-3.1-8B in int4 (Q4_K_M, from Ollama) runs on lex kernels on the GPU, and its greedy tokens are identical to Ollama's. [`docs/P2.md`](docs/P2.md) |
-| **P3** Metal, fast | in progress | Decode at 89–99% of Ollama at every context measured (0–1,440 positions), reading as many bytes per token as llama.cpp. A batched forward pass (prefill, speculative verify) is correct but slow. Next: `simdgroup_matrix` and split-KV for prefill. [`docs/P3.md`](docs/P3.md) |
+| **P3** Metal, fast | decode done, prefill open | Decode 87–100% of Ollama at every context measured, flat from 0 to 1,440 positions, reading as many bytes per token as llama.cpp. Prefill is 36%. [`docs/P3.md`](docs/P3.md) |
+| **P4** A second backend | **met** | `llama3.2:1b` gives Metal's tokens exactly on an L4; `qwen3.8:27b-mlx` passes the whole golden suite there. Porting each runtime took three lines. Speed on CUDA is open. |
 
 Measured on an M4 Max, each model greedy-decoded on 4 prompts × 24 tokens
 next to Ollama itself (`scripts/lex_vs_ollama.py`):
 
-| Model | Weights | Tokens identical to Ollama | Log-prob gap vs Ollama | vs f32 reference | lex decode, 0–1,440 context | Ollama |
-| --- | --- | --- | --- | --- | --- | --- |
-| `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.009 | ≤ 0.007 | ~244–265 tok/s | ~256–275 tok/s |
-| `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.08 | ≤ 0.007 | ~77–80 tok/s | ~83–87 tok/s |
+| Model | Weights | Tokens identical to Ollama | Log-prob gap vs Ollama | vs f32 reference |
+| --- | --- | --- | --- | --- |
+| `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.009 | ≤ 0.007 |
+| `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.08 | ≤ 0.007 |
 
-How to read the table:
+How to read that:
 - **Correctness:** lex agrees with an f32 PyTorch reference to within 0.007 on
   both models. Ollama differs from both by more, up to 0.09 on the 8B,
   because llama.cpp's quantised kernels round differently. So the remaining
   gap is on Ollama's side, not lex's.
-- **Speed:** lex reaches 95–99% of Ollama on the 1B and 89–95% on the 8B,
-  reading 4.71 GB of weights per token against llama.cpp's 4.62. Its big
-  matvecs read at 437–523 GB/s, against a 463 GB/s copy benchmark. Like
-  Ollama's, the speed barely moves with context: split-KV attention spreads
-  the cache over many threadgroups and merges their partial softmaxes
-  (before it, the 8B fell to 20 tok/s at 1,440 positions).
-  [`docs/P3.md`](docs/P3.md) has the table. At P2's end it was 13 and
-  6.8 tok/s: every op was a separate dispatch that waited for the last, and
-  the kernels were the simplest correct ones.
+- **Speed:** the big matvecs read at 437–523 GB/s against a 463 GB/s copy
+  benchmark, and 4.71 GB of weights move per token against llama.cpp's
+  4.62. Speed barely moves with context, because split-KV attention
+  spreads the cache over many threadgroups and merges their partial
+  softmaxes; before it, the 8B fell to 20 tok/s at 1,440 positions.
   `cargo run --release -p lex-rt --example profile -- --model llama3.1:8b --context 512`
-  shows where the time goes at a given context, per kernel from GPU
-  timestamps.
-  [`docs/P3.md`](docs/P3.md) covers what's left: prefill and fused small
-  ops.
+  shows where the time goes, per kernel, from GPU timestamps.
 
 What runs where:
 - **Copy and RMSNorm** are hand-planned P0 kernels. They run on the GPU at
@@ -119,7 +139,34 @@ Rust ≥ 1.88 for everything. The Python scripts need `torch`, `numpy` and
 `tokenizers` (`pip install torch numpy tokenizers`); nothing in `cargo test`
 does.
 
-### 1. A real model, against Ollama (Mac only)
+### 0. Talk to it (Metal or CUDA)
+
+```sh
+cargo run --release -p lex-rt --example serve -- --model qwen3.8:27b-mlx
+```
+
+```sh
+curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"lex","messages":[{"role":"user","content":"hello"}]}'
+```
+
+An OpenAI-compatible endpoint: `GET /v1/models`, `POST
+/v1/chat/completions`, streaming and not. The official OpenAI Python
+client drives it unmodified, which is the point — an agent can use this
+without knowing what is behind it.
+
+One request at a time, deliberately: there is one GPU and a 14.5 GB model
+on it, so a second caller queues rather than interleaving two sequences
+through one KV cache. `--port`, `--max-seq` and `--depth` are the knobs.
+
+The tokenizer comes from the checkpoint's own `tokenizer.json` in the
+Ollama store — byte-level BPE, written from the format because this
+repository is EUPL-1.2 and the reference tokenizers are Apache-2.0.
+`cargo test -p lex-rt --test tokenizer` holds it to the reference's exact
+output on twenty awkward cases, which is the only thing that makes
+"written from the format" mean anything.
+
+### 1. A real model, against Ollama (Metal or CUDA)
 
 ```sh
 ollama pull llama3.1:8b                            # or llama3.2:1b (1.3 GB)
@@ -312,9 +359,18 @@ included) and reference, plus these suites:
   interpreter, at real sizes and in every weight layout.
 - lex-rt `llama_ollama`: Llama 3.2 1B and Llama 3.1 8B on the GPU against
   the Ollama-checked reference, fed four ways (token by token, prefill in 4s
-  and 16s, batched verify). It needs macOS and the models pulled; for any
-  model missing, it prints `SKIPPED`. Run it with `--release`: in a debug
-  build it takes many minutes.
+  and 16s, batched verify).
+- lex-rt `qwen_golden`: Qwen3.8-27B against its f32 reference, plus the
+  batched, prefill, split-KV and speculative paths against the serial ones.
+  It passes on Metal and on an NVIDIA L4.
+- lex-rt `tokenizer`: byte-level BPE against the reference tokenizer's exact
+  output.
+
+  The GPU suites need a device and the models pulled; for any model missing
+  they print `SKIPPED`. Run them with `--release`: in a debug build they take
+  many minutes. `scripts/linux_check.sh` type-checks and lints the
+  Linux-only code in a container, because `lex-cuda`'s device module is not
+  compiled on macOS at all.
 
 ### 7. Ollama's baseline, here or on an NVIDIA GPU in the cloud
 
@@ -328,8 +384,11 @@ positions) and prefills at ~900 tok/s. The 1B decodes at 263–266 tok/s and
 prefills at 5,300–6,200 tok/s. The cloud script creates the VM, runs the
 workspace tests and the same benchmark on the GPU, copies the results home,
 and deletes the VM. [`docs/cloud.md`](docs/cloud.md) covers GPUs, EU zones,
-quota and the cost guard rails. It becomes the CUDA backend's test bed
-once that backend exists.
+quota and the cost guard rails. `QWEN=1` also fetches and runs
+Qwen3.8-27B there — `ollama pull` refuses an MLX build on Linux, so
+`scripts/ollama_fetch.py` takes the blobs from the registry directly,
+which is a client-side check rather than a registry one and `lex-rt` reads
+the store without asking Ollama to run anything.
 
 ## Layering
 
@@ -351,8 +410,9 @@ in its smallest possible form.
 | `lex-front` | Typed tile programs: linearity, effect and pipe-protocol checker; concurrent reference interpreter | yes |
 | `lex-msl` | MSL emission for P0 kernels; lowering of `lex-front` programs; golden files | yes |
 | `lex-metal` | Compile, allocate, dispatch, time | **no** |
+| `lex-cuda` | The same, on NVIDIA: NVRTC, driver API via `dlopen`, no link-time dependency on a driver | yes (device path is Linux-only) |
 | `lex-bench` | Harness: emit, verify, measure (`--flash` for decode attention) | yes (device path gated) |
-| `lex-rt` | Runtime: GGUF reader, Q8_0/Q4_K/Q6_K repacking, Llama decode loop over lex kernels | yes (decode loop gated) |
+| `lex-rt` | Runtime: GGUF and safetensors readers, Q8_0/Q4_K/Q6_K/NVFP4 repacking, Llama and Qwen decode loops, tokenizer, OpenAI-compatible server | yes (device paths gated) |
 
 That boundary is load-bearing. Everything except device dispatch is ordinary
 Rust with tests, so the compiler can be developed anywhere and only the numbers
