@@ -14,8 +14,13 @@
 #   GPU          l4 (default, g2-standard-8, 24 GB), a100 (a2-highgpu-1g,
 #                40 GB) or h100 (a3-highgpu-1g, 80 GB). These machine types
 #                come with their GPU attached; no --accelerator flag.
-#   ZONES        space-separated zones to try in order; EU only by default.
-#                GPUs are often out of stock in one zone and free in the next.
+#   ZONES        space-separated zones to try in order. EU first, then US:
+#                GPUs are often out of stock in one zone and free in the
+#                next, and L4 capacity in europe-west was unavailable for
+#                an entire afternoon. Set it explicitly to stay in one
+#                region -- these runs carry no user data, only public
+#                model weights and this repository, which is why leaving
+#                the EU is allowed here and would not be for everything.
 #   SPOT=0       On-demand instead of the default Spot. Spot is 60-70%
 #                cheaper and can be preempted mid-run; use SPOT=0 only for
 #                a run long enough that losing it matters.
@@ -45,9 +50,9 @@ KEEP="${KEEP:-0}"
 MODELS="${MODELS:-llama3.2:1b llama3.1:8b}"
 
 case "$GPU" in
-  l4)   MACHINE=g2-standard-8; DEFAULT_ZONES="europe-west4-a europe-west4-b europe-west4-c europe-west1-b europe-west1-c europe-west3-a europe-west3-b europe-west2-a europe-west2-b" ;;
-  a100) MACHINE=a2-highgpu-1g; DEFAULT_ZONES="europe-west4-a europe-west4-b" ;;
-  h100) MACHINE=a3-highgpu-1g; DEFAULT_ZONES="europe-west4-b europe-west4-c europe-west1-b" ;;
+  l4)   MACHINE=g2-standard-8; DEFAULT_ZONES="europe-west4-a europe-west4-b europe-west4-c europe-west1-b europe-west1-c europe-west3-a europe-west3-b europe-west2-a europe-west2-b us-central1-a us-central1-b us-central1-c us-east1-c us-east1-d us-east4-a us-east4-c us-west1-a us-west1-b us-west4-a" ;;
+  a100) MACHINE=a2-highgpu-1g; DEFAULT_ZONES="europe-west4-a europe-west4-b us-central1-a us-central1-b us-central1-c us-east1-b" ;;
+  h100) MACHINE=a3-highgpu-1g; DEFAULT_ZONES="europe-west4-b europe-west4-c europe-west1-b us-central1-a us-east4-a us-east5-a" ;;
   *) echo "GPU must be l4, a100 or h100" >&2; exit 2 ;;
 esac
 ZONES="${ZONES:-$DEFAULT_ZONES}"
