@@ -286,7 +286,12 @@ mod gpu {
         Vec<&'a Buffer>,
         Option<[usize; 2]>,
     );
-    const BO: usize = 8;
+    /// Output rows a decode matvec gives one threadgroup, from the
+    /// target: Apple wants one row per simdgroup, Ada two. See
+    /// `Target::matvec_rows_per_simd` for the measurement.
+    fn bo(target: &Target) -> usize {
+        target.matvec_rows_per_simd * (THREADS / target.simd_width)
+    }
 
     fn compile(gpu: &Gpu, prog: &Program, threads: usize) -> Result<Pipeline, String> {
         let target: &Target = gpu.target();
@@ -595,7 +600,10 @@ mod gpu {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(d)
             };
-            let (mv_bo, mv_threads) = (tune("LEX_MV_BO", BO), tune("LEX_MV_THREADS", THREADS));
+            let (mv_bo, mv_threads) = (
+                tune("LEX_MV_BO", bo(gpu.target())),
+                tune("LEX_MV_THREADS", THREADS),
+            );
             // Folding a norm into a matvec saves a dispatch the whole GPU
             // waits on, but costs every threadgroup a read of x and a
             // reduction. Measured on the M4 Max at 512 positions: the 8B
@@ -648,7 +656,7 @@ mod gpu {
                 rope_q: compile(&gpu, &rope(c.n_head, c.head_dim, DType::F16), THREADS)?,
                 rope_k: compile(&gpu, &rope(c.n_kv, c.head_dim, DType::F16), THREADS)?,
                 silu: compile(&gpu, &silu_mul(c.ffn, THREADS, DType::F32)?, THREADS)?,
-                glu: glu_pipelines(&gpu, w, 1, BO, fold.1.then_some(c.eps))?,
+                glu: glu_pipelines(&gpu, w, 1, bo(gpu.target()), fold.1.then_some(c.eps))?,
                 rms_mv: rms_mv_pipelines(&gpu, w, mv_bo, mv_threads)?,
                 fold,
             };

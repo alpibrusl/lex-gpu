@@ -146,6 +146,20 @@ pub struct Target {
     /// later by hardware (TMA / cp.async). Without it an async copy still
     /// type-checks, but lowers to a synchronous one and the checker warns.
     pub async_copy: bool,
+    /// Output rows one simdgroup should own in a decode matvec.
+    ///
+    /// The kernel gives a threadgroup `bo` rows and splits them across its
+    /// simdgroups, so this and the thread count choose `bo`. It is a
+    /// property of the machine and not of the kernel, and the two machines
+    /// measured disagree: on an L4, `5120 -> 17408` in NVFP4 runs at 107
+    /// GB/s with one row per warp and 189 with two, and the same curve
+    /// holds across thread counts and weight formats. Apple wants one.
+    ///
+    /// Inheriting Apple's answer is what left the CUDA backend at a third
+    /// of its card's bandwidth while the batched path, which picks its own
+    /// `bo`, reached two thirds on the same card.
+    pub matvec_rows_per_simd: usize,
+
     /// True when one part of a threadgroup can wait on another without the
     /// whole threadgroup meeting at a barrier (Hopper mbarrier). Producer /
     /// consumer warp specialisation needs it; without it there is no lowering
@@ -166,6 +180,7 @@ impl Target {
             max_threadgroup_bytes: 32 * 1024,
             unified_memory: true,
             async_copy: false,
+            matvec_rows_per_simd: 1,
             split_barriers: false,
         }
     }
@@ -187,6 +202,7 @@ impl Target {
             max_threadgroup_bytes: 227 * 1024,
             unified_memory: false,
             async_copy: true,
+            matvec_rows_per_simd: 2,
             split_barriers: true,
         }
     }
@@ -208,6 +224,8 @@ impl Target {
             max_threadgroup_bytes: 99 * 1024,
             unified_memory: false,
             async_copy: true,
+            // Measured on an L4: 189 GB/s at two rows against 107 at one.
+            matvec_rows_per_simd: 2,
             split_barriers: false,
         }
     }
@@ -221,6 +239,10 @@ impl Target {
             max_threadgroup_bytes: 64 * 1024,
             unified_memory: false,
             async_copy: false,
+            // Unmeasured: no CDNA3 has ever run this. Two because that is
+            // what the one non-Apple machine measured wanted, which is a
+            // guess wearing a number.
+            matvec_rows_per_simd: 2,
             split_barriers: false,
         }
     }

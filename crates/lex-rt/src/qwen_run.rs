@@ -128,7 +128,15 @@ mod gpu {
     use crate::qwen::Store;
 
     const THREADS: usize = 256;
-    const BO: usize = 8;
+    /// Output rows a decode matvec gives one threadgroup.
+    ///
+    /// Derived from the target rather than fixed, because the right
+    /// answer is a property of the machine: Apple wants one row per
+    /// simdgroup and Ada wants two, and the constant that used to be here
+    /// was Apple's. On an L4 that difference is 107 GB/s against 189.
+    fn bo(target: &Target) -> usize {
+        target.matvec_rows_per_simd * (THREADS / target.simd_width)
+    }
     const ATTN_BK: usize = 16;
     /// Cache blocks per split, and the fewest splits worth splitting for.
     ///
@@ -522,7 +530,7 @@ mod gpu {
             for key in want {
                 if let std::collections::hash_map::Entry::Vacant(slot) = mv.entry(key) {
                     let (n_in, n_out, res) = key;
-                    let p = matvec_q(n_in, n_out, BO, n_in, QLayout::NVFP4, res)?;
+                    let p = matvec_q(n_in, n_out, bo(gpu.target()), n_in, QLayout::NVFP4, res)?;
                     slot.insert(compile(&gpu, &p, THREADS)?);
                 }
             }
