@@ -177,49 +177,51 @@ matvec wins — 8.29 ms of a notional pass per token against 9.24. It is
 committed so the next attempt has to beat that number in an afternoon
 rather than in the IR over weeks.
 
-## M3b — the batched matvec reaches neither roof (1–2 weeks)
+## M3b — the batched matvec has less room than it looked (revised)
 
-90 tok/s against Ollama's ~250. Attention is no longer where it is: the
-feed-forward matvecs are 54% of the pass (`gate/up` 33%, `down` 21%) and
-everything else is single digits.
+An earlier version of this section said the kernel sat at the roofline
+ridge reaching 41% of one roof and 43% of the other, with ~2.4x in it.
+**That is withdrawn.** It counted weight bytes only. At eight tokens the
+kernel also issues 356 MB of activation loads against 50 MB of weights,
+so it moves about 406 MB in 232 µs -- 1,750 GB/s, three and a half times
+the DRAM roof, i.e. served from cache. The kernel is much closer to its
+limit than a weights-only roofline suggests.
 
-`examples/matvec` already measures the shape that matters — Qwen's
-`5120 -> 17408` gate/up in NVFP4, batched — and it separates the two
-candidates. Best configuration at each batch (f16 activations, `bo=32`):
+Two hypotheses were tested against that and both failed.
 
-| tokens | kernel | GB/s | ms/token |
+**Cross-threadgroup redundancy is not the cost.** Every simdgroup in a
+threadgroup reads the same activation vector, so halving the threadgroup
+count should halve those loads. Holding rows per simdgroup at 4 and
+raising both `threads` and `bo` does exactly that, and it gets *slower*:
+
+| threads | bo | rows/simdgroup | GB/s |
 | --- | --- | --- | --- |
-| 1 | 122 µs | 410 | 35.3 |
-| 2 | 117 µs | 428 | 17.0 |
-| 4 | 149 µs | 336 | 10.8 |
-| 8 | 232 µs | 217 | 8.4 |
+| 256 | 32 | 4 | **214** |
+| 512 | 64 | 4 | 188 |
+| 1024 | 128 | 4 | 159 |
 
-**It is not weight re-reads.** Eight tokens instead of one is 8x the work
-for one set of weights and buys 4.2x. Raising `MAX_BATCH` climbs a curve
-that is already flattening, so the 2.7x is not sitting there.
+Those loads are cache-served and cheap; the larger threadgroups cost more
+in occupancy than the saved traffic is worth.
 
-**Nor is it honestly "compute-bound".** At eight tokens the kernel does
-1.43 GFLOP in 232 µs — **6.2 TFLOP/s against the 15.1 measured for MPS
-f16**, while moving 217 GB/s against a 507 GB/s read roof. That is 41% of
-one roof and 43% of the other. Arithmetic intensity is 28.4 FLOP/byte and
-the machine's ridge is 29.8, so this shape sits *exactly* at the ridge
-point and reaches neither side of it. There is ~2.4x in the kernel.
+**What binds is rows per simdgroup**, at fixed threads: r=4 gives 214
+GB/s, r=8 gives 90, r=16 gives 44. `r` wants to be larger -- it amortises
+each activation load over more output rows -- and cannot be, because the
+accumulators are `r x tokens` and 8x8 spills. At r=4 that is 32
+accumulators plus 16 for the staged activations, which is about right for
+the register file. The `bo` cliff is real and not an emitter artifact:
+the emitted MSL indexes every register array by a literal, which was
+checked.
 
-Two things the same table says, worth keeping in view:
+Threadgroup staging of the activations was tried before this and lost (92
+GB/s against 141, because it needs a chunked reduction). Those numbers
+predate a kernel that is now 2.4x faster, so the result is stale rather
+than wrong, but it is not the obvious win either.
 
-- `bo` past 32 collapses at eight tokens — 217 GB/s at 32, 90 at 64, 44 at
-  128. That is the register-spill cliff already recorded: tiles must be
-  indexed by literals or Metal spills the array to stack.
-- f16 activations are worth 2.1x at eight tokens (217 against 104) and
-  nothing at two, because 544 threadgroups each re-read every token's
-  activations.
-
-So the work is the kernel, and the thing to beat is 6.2 TFLOP/s at the
-ridge. The research already gathered points at 2-D register blocking
-(activations held in registers across two or more output rows, with
-compile-time-constant indices). A `simdgroup_matrix` GEMM was measured and
-lost — `examples/gemm_probe`, 8.29 ms against 9.24 — so that is not the
-first thing to try.
+So there is no easy multiple here. What is left in this kernel is the
+load-to-weight ratio of 2 at r=4, and breaking it needs either a
+different accumulator layout or the matrix unit -- and
+`examples/gemm_probe` already measured `simdgroup_matrix` losing to this
+matvec, by more now than when it was written.
 
 ## M4 — a model runs on CUDA — done
 

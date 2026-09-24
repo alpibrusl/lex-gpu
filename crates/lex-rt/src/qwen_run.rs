@@ -981,8 +981,20 @@ mod gpu {
                 return Ok((vec![last], argmax(&logits)));
             }
 
+            // `save` exists for the replay path: restore the pre-batch
+            // state, feed the accepted prefix again. With per-token
+            // snapshots nothing reads it, so on that path it is 0.8 ms of
+            // copying a state that is never put back.
             let mark = std::time::Instant::now();
-            self.save();
+            let batch = 1 + drafts.len();
+            let snapped = batch <= SPEC_MAX
+                && self
+                    .batches
+                    .get(&batch)
+                    .is_some_and(|b| b.delta_snap.is_some() && b.conv_snap.is_some());
+            if !snapped {
+                self.save();
+            }
             let t_save = mark.elapsed().as_secs_f64() * 1e3;
             let mut fed = vec![last];
             fed.extend(&drafts);

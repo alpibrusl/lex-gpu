@@ -31,6 +31,19 @@ fn main() -> Result<(), String> {
             matvec_q(n_in, n_out, 8, n_in, layout, false)?
         }
         Some("rmsnorm") => rmsnorm(num(1)?, 1e-5),
+        // The batched matmul, which is what prefill and a speculative
+        // verify actually run. `bo` is the lever the sweeps found a cliff
+        // in -- 217 GB/s at 32, 90 at 64 -- and reading the emitted text
+        // is how to tell a hardware limit from a register array that fell
+        // out to stack because one index was not a literal.
+        Some("batch") => {
+            let (tok, n_in, n_out, bo) = (num(1)?, num(2)?, num(3)?, num(4)?);
+            let xt = match a.get(5).map(String::as_str) {
+                Some("f32") => lex_ir::DType::F32,
+                _ => lex_ir::DType::F16,
+            };
+            lex_front::llama::matmul_q_x(tok, n_in, n_out, bo, n_in, QLayout::NVFP4, false, xt)?
+        }
         Some(k @ ("split" | "combine")) => {
             let (cap, bps) = (num(1)?, num(2)?);
             let f = lex_front::flash::FlashDecode {
@@ -58,7 +71,7 @@ fn main() -> Result<(), String> {
             }
         }
         _ => {
-            return Err("usage: emit matvec <q4k|q6k|q8> <n_in> <n_out> | rmsnorm <n> | split|combine <cap> <bps> [direct]".into());
+            return Err("usage: emit matvec <q4k|q6k|q8> <n_in> <n_out> | rmsnorm <n> | batch <t> <n_in> <n_out> <bo> [f16|f32] | split|combine <cap> <bps> [direct]".into());
         }
     };
     lex_front::check(&prog, &Target::apple_m_series()).map_err(|e| format!("{e:?}"))?;
