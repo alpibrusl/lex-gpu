@@ -79,9 +79,18 @@ if [ -n "$STORE" ]; then
   echo "OLLAMA_MODELS=$OLLAMA_MODELS" | tee -a "$R/machine.txt"
   # Recorded so the next change to this can be made from fact.
   sudo ls -la "$OLLAMA_MODELS" 2>&1 | tee -a "$R/machine.txt"
-  # The service runs as its own user and may not have made the blobs
-  # readable to us.
+  # The store belongs to the `ollama` service user and its home is not
+  # world-readable. The installer adds us to the `ollama` group, which
+  # does nothing for a shell whose group membership was fixed at login --
+  # so the files are there, `sudo` reads them, and we do not. Open the
+  # whole chain, not just the store: it was `/usr/share/ollama` itself
+  # that blocked, two runs after the store was already being found.
+  sudo chmod a+rX /usr/share/ollama /usr/share/ollama/.ollama 2>/dev/null || true
   sudo chmod -R a+rX "$OLLAMA_MODELS" 2>/dev/null || true
+  # Prove it from this shell, since that is the process that has to read.
+  test -r "$OLLAMA_MODELS/manifests/registry.ollama.ai/library/llama3.2/1b" \
+    && echo "manifest readable as $(whoami)" | tee -a "$R/machine.txt" \
+    || echo "manifest STILL unreadable as $(whoami)" | tee -a "$R/machine.txt"
 else
   echo "no Ollama model store anywhere on this disk" | tee -a "$R/machine.txt"
 fi

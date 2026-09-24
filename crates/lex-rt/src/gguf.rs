@@ -271,17 +271,28 @@ pub fn ollama_model(tag: &str) -> Result<PathBuf, String> {
             .join(repo)
             .join(t)
     };
-    let (manifest, text) = roots
-        .iter()
-        .map(&path_in)
-        .find_map(|m| std::fs::read_to_string(&m).ok().map(|s| (m, s)))
-        .ok_or_else(|| {
-            let tried: Vec<String> = roots
-                .iter()
-                .map(|r| path_in(r).display().to_string())
-                .collect();
-            format!("no Ollama manifest for {tag}; tried {}", tried.join(", "))
-        })?;
+    // "Not there" and "there but unreadable" are different problems with
+    // the same symptom, and telling them apart matters more than it
+    // sounds: on a Linux box the store belongs to the `ollama` service
+    // user, the installer adds you to its group, and your *running shell*
+    // does not get that membership because its groups were fixed at
+    // login. The path then exists, `sudo` can read it, and you cannot --
+    // which reads exactly like a layout change if the error only says
+    // "no manifest". It cost several rented GPUs to see.
+    let mut tried: Vec<String> = vec![];
+    let mut found = None;
+    for r in &roots {
+        let m = path_in(r);
+        match std::fs::read_to_string(&m) {
+            Ok(s) => {
+                found = Some((m, s));
+                break;
+            }
+            Err(e) => tried.push(format!("{} ({})", m.display(), e.kind())),
+        }
+    }
+    let (manifest, text) =
+        found.ok_or_else(|| format!("no readable Ollama manifest for {tag}; tried {}", tried.join(", ")))?;
     // manifests/registry.ollama.ai/library/<repo>/<tag> is five components
     // below the store, and `ancestors` counts the path itself as the
     // first, so the store is the sixth.
