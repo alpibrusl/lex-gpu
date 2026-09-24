@@ -11,11 +11,16 @@ exactly once. Tiles are what lex is made of.
 because the rest of this file is measurements and they deserve the same
 honesty:**
 
-- **There is no surface syntax.** No parser, no file extension, nothing you
-  write a program *in*. Programs are Rust that builds the typed IR — see
-  [`llama.rs`](crates/lex-front/src/llama.rs) for what a kernel looks like
-  today. [`docs/design.md`](docs/design.md) has the intended syntax, with the
-  algorithm/schedule split; it is a design, not an implementation.
+- **The surface syntax is one slice deep.** `.lx` files parse, and
+  [`rmsnorm.lx`](crates/lex-front/tests/lx/rmsnorm.lx) is held to emitting
+  MSL byte-identical to the Rust that built it. What exists is `algo`
+  declarations, parameters, `let` bindings over the elementwise and
+  reduction ops, and `store`. What does not: `schedule` blocks, loops, the
+  grid, layouts and memory spaces in the type, the autotuner's `?` — which
+  is to say the half that makes it a *language* rather than a notation.
+  Most kernels are still Rust that builds the typed IR; see
+  [`llama.rs`](crates/lex-front/src/llama.rs).
+  [`docs/design.md`](docs/design.md) has the rest of the intended syntax.
 - **The type system's case is still an argument.** Linear tiles and effects
   are supposed to catch across targets what each target's own tooling
   catches only on that target. Two backends now exist, so that is testable
