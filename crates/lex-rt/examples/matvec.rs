@@ -56,6 +56,14 @@ fn main() -> Result<(), String> {
         ("down (Q4_K)", 14336, 4096, QLayout::Q4_K),
         ("down (Q6_K)", 14336, 4096, QLayout::Q6_K),
         ("lm head (Q6_K)", 4096, 128256, QLayout::Q6_K),
+        // Llama-3.2 1B (Q8_0). Narrower than anything above, and the one
+        // model that got *slower* when `bo` was raised for Ada -- so the
+        // rows-per-simdgroup optimum is not a property of the machine
+        // alone, and these are the shapes that say so.
+        ("1b q/o (Q8_0)", 2048, 2048, QLayout::Q8_0),
+        ("1b gate/up (Q8_0)", 2048, 8192, QLayout::Q8_0),
+        ("1b down (Q8_0)", 8192, 2048, QLayout::Q8_0),
+        ("1b lm head (Q8_0)", 2048, 128256, QLayout::Q8_0),
     ];
     for (label, n_in, n_out, layout) in shapes {
         let prog = matvec_q(n_in, n_out, bo, n_in, layout, false)?;

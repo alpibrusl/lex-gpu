@@ -194,7 +194,7 @@ for th in 128 256; do
     # No `head`: the whole table goes to the log. Truncating it is how
     # the rows that mattered were lost last time.
     THREADS=$th BO=$bo cargo run --release -p lex-rt --example matvec 2>&1 \
-      | tee -a "$R/matvec-cuda.log" | grep -E "qwen (gate|down|qkv|lm)"
+      | tee -a "$R/matvec-cuda.log" | grep -E "qwen (gate|down)|1b (gate|down)"
     [ "${PIPESTATUS[0]}" = 0 ] || fail=1
   done
 done
