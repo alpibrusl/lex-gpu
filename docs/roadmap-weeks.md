@@ -25,16 +25,34 @@ model" — which is the failure that would make this project pointless.
 
 ## Where things actually stand
 
-| | lex | Ollama |
-| --- | --- | --- |
-| decode, no context | 27.4 (39.5 speculating) | 42.7 |
-| decode, 1440 context | 27.0 (15.3 speculating) | 53.1 |
-| prefill, 512 | 75 | 247 |
-| CUDA | three kernels, verified on an L4 | — |
+| | lex | Ollama | |
+| --- | --- | --- | --- |
+| Qwen decode, ctx 0 (speculating) | 42.9 | 42.7 | parity |
+| Qwen decode, 512, real prose | 34.8 | 45.0 | 77% |
+| Qwen decode, 1440, real prose | 34.4 | 39.7 | 87% |
+| Qwen prefill, 512 | 90 | ~250 | 36% |
+| llama3.1:8b decode, Metal | 77-80 | 83-87 | ~92% |
+| llama3.2:1b decode, L4 | 124 | 163 | 76% |
+| CUDA | a model, token-identical to Metal | — | |
 
-Decode is flat with context now, which it was not this morning — M1. What
-is left is that speculation still *loses* as context grows, and that
-prefill is 3.3x off. Both are measured below rather than guessed at.
+**The Ollama decode figures here are not the ones this document used to
+quote**, which were 56.8 and 53.1. Those came from `ollama_bench.py`,
+which prompts with random words -- correct for timing prefill, because it
+defeats the prompt cache, and wrong for timing decode on a model that
+speculates. What the model writes after noise is more predictable than
+prose, its draft head accepts more of it, and the rate that comes back is
+of an easier text than anyone runs. Measured both ways on the same
+machine:
+
+| context | Ollama, random words | Ollama, real prose |
+| --- | --- | --- |
+| 512 | 53.5 | 45.0 |
+| 1440 | 57.8 | 39.7 |
+
+So the gap at length is 13%, not 35%. Use `--prompt-file` for decode
+comparisons and random words for prefill. The same caution applies to
+every acceptance figure here: they move several points with content, and
+`scripts/ollama_context.py` exists to supply prose rather than noise.
 
 ## M1 — decode stops degrading with context (days)
 

@@ -29,6 +29,7 @@ be thrown away if it looks degenerate.
 
 import argparse
 import json
+import pathlib
 import urllib.request
 
 PROMPT = (
@@ -55,32 +56,79 @@ def generate(host, model, prompt, steps, temperature):
         return json.load(f)
 
 
+def tokenise(host, model, text):
+    """The ids Ollama gives this exact text, so both engines see one thing.
+
+    There is no tokenizer in this repository and no tokenise endpoint, but
+    a `raw` generate returns `context` -- the ids of the prompt plus what
+    it produced -- so one token of output and a trim gives the prompt's.
+    `raw` skips the chat template, which is the point: a templated prompt
+    would put markup in front of the text and the two engines would be
+    reading different things.
+    """
+    req = {
+        "model": model,
+        "prompt": text,
+        "raw": True,
+        "stream": False,
+        "options": {"temperature": 0, "num_predict": 1},
+    }
+    r = urllib.request.Request(
+        f"{host}/api/generate",
+        json.dumps(req).encode(),
+        {"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(r, timeout=1800) as f:
+        return json.load(f).get("context") or []
+
+
 def main():
+    import sys
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen3.8:27b-mlx")
     ap.add_argument("--host", default="http://localhost:11434")
     ap.add_argument("--tokens", type=int, default=1440, help="ids to emit")
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--prompt", default=PROMPT)
+    ap.add_argument("--text-out", help="write the passage here, for a raw prompt")
     a = ap.parse_args()
 
-    # Ask for more than wanted: `context` includes the prompt, and the
-    # model may stop early.
-    r = generate(a.host, a.model, a.prompt, a.tokens, a.temperature)
-    ids = r.get("context") or []
+    # Generate a passage, then ask for the ids of that passage alone. The
+    # `context` of the generating call would also carry the instruction
+    # that produced it, which is not what the other engine would be given.
+    r = generate(a.host, a.model, a.prompt, a.tokens + 200, a.temperature)
+    text = r.get("response") or ""
+    if not text:
+        raise SystemExit("the model returned nothing")
+
+    ids = tokenise(a.host, a.model, text)[:-1]
     if len(ids) < a.tokens:
         raise SystemExit(
-            f"only {len(ids)} ids came back for {a.tokens} asked; "
-            "raise --tokens or check the model is loaded"
+            f"only {len(ids)} ids for the passage, {a.tokens} asked; raise --tokens"
         )
     ids = ids[: a.tokens]
 
-    repeats = sum(1 for i in range(1, len(ids)) if ids[i] == ids[i - 1])
+    # Trim the text to the same ids, so the two engines read one passage.
+    # Bisect on characters: tokenising is the only length oracle there is.
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if len(tokenise(a.host, a.model, text[:mid])) - 1 < a.tokens:
+            lo = mid + 1
+        else:
+            hi = mid
+    cut = text[:lo]
+    if a.text_out:
+        pathlib.Path(a.text_out).write_text(cut)
+
     print(",".join(str(i) for i in ids))
+    repeats = sum(1 for i in range(1, len(ids)) if ids[i] == ids[i - 1])
     print(
         f"# {len(ids)} ids, {len(set(ids))} distinct, "
-        f"{100.0 * repeats / max(1, len(ids) - 1):.1f}% immediate repeats",
-        file=__import__("sys").stderr,
+        f"{100.0 * repeats / max(1, len(ids) - 1):.1f}% immediate repeats, "
+        f"{len(cut)} chars of text",
+        file=sys.stderr,
     )
 
 
