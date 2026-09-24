@@ -321,8 +321,22 @@ impl Dialect for Cuda {
     /// several hundred body sites, and they keep the emitted CUDA readable
     /// next to the emitted MSL when the two are diffed.
     fn includes(&self) -> String {
-        "\n#include <cuda_fp16.h>\n\ntypedef unsigned int uint;\ntypedef unsigned char uchar;\n\n"
-            .to_string()
+        // `INFINITY` the emitter writes for an online softmax's running
+        // max comes from MSL's `metal_math`, and CUDA has it in `math.h`
+        // -- which NVRTC does not give you, because it compiles without
+        // system headers. `nvcc` has them, so the emitted text compiles
+        // perfectly well under the check and then fails at load time in
+        // the runtime, which is NVRTC. Defining it here costs nothing and
+        // keeps the emitter free of a dialect split for one token.
+        concat!(
+            "\n#include <cuda_fp16.h>\n\n",
+            "typedef unsigned int uint;\n",
+            "typedef unsigned char uchar;\n",
+            "#ifndef INFINITY\n",
+            "#define INFINITY __int_as_float(0x7f800000)\n",
+            "#endif\n\n",
+        )
+        .to_string()
     }
 
     fn max_static_shared(&self) -> usize {

@@ -30,6 +30,7 @@ IMAGE="${IMAGE:-nvidia/cuda:12.6.3-devel-ubuntu24.04}"
 WORK="$(mktemp -d "$HOME/.cache/lex-cuda-check.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 cp "$@" "$WORK/"
+cp "$(dirname "${BASH_SOURCE[0]}")/nvrtc_check.c" "$WORK/"
 
 docker run --rm --platform linux/arm64 -v "$WORK":/w -w /w "$IMAGE" bash -c '
   set -e
@@ -43,5 +44,10 @@ docker run --rm --platform linux/arm64 -v "$WORK":/w -w /w "$IMAGE" bash -c '
       fail=1
     fi
   done
+  echo "=== nvrtc (what the runtime actually uses)"
+  nvcc -o /tmp/nvrtc_check nvrtc_check.c -lnvrtc
+  # `compute_*`, not `sm_*`: the runtime asks NVRTC for PTX and the
+  # driver assembles it, so this has to be the same request.
+  NVRTC_ARCH=--gpu-architecture='"${ARCH/sm_/compute_}"' /tmp/nvrtc_check *.cu || fail=1
   exit $fail
 ' 2>&1 | grep -vE "NVIDIA Driver was not detected|Container Toolkit|docs.nvidia.com|^=*$|CUDA Version|Container image|NVIDIA Deep Learning|developer.nvidia.com|A copy of this license|^== CUDA ==|By pulling|^$"

@@ -8,6 +8,9 @@
 
 typedef unsigned int uint;
 typedef unsigned char uchar;
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
 
 __constant__ float FP4_V[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
