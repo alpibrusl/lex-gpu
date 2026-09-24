@@ -296,7 +296,60 @@ and bulk loads. That is kernel work, not a sweep, and it should be done
 in `gemm_probe` before any of it reaches the IR. **The bar is 6.95, and
 five configuration hypotheses have already died against it.**
 
-## M4 — a model runs on CUDA — done
+## M4 — a model runs on CUDA — done, and so does the hard one
+
+`qwen3.8:27b-mlx` -- 48 of 64 layers carrying a recurrent state, NVFP4
+weights, a multi-token-prediction head -- runs on an NVIDIA L4 and passes
+the whole golden suite there, against the same f32 reference the Metal
+tests are held to:
+
+```text
+24 steps over 3 prompts on NVIDIA L4: worst |dlogprob| 0.00064  (tol 0.02)
+batch vs sequence                      2.95e-4 of scale
+prefill vs stepping                    3.27e-4
+split vs serial at 1200 positions      8.0e-5
+batch split vs serial                  0e0
+MTP acceptance                         87.1%
+```
+
+The port was three lines -- the cfg gate, the device import, and the
+dialect -- and then the module type-checked against CUDA unchanged. All
+109 kernels it builds lowered for CUDA and compiled under NVRTC first
+try. The part that looked hard, a 4-bit format with a per-16 scale on a
+card with no hardware for it, was never in question: the NVFP4 matvec has
+been passing against the interpreter on a real L4 since the backend
+existed.
+
+Ollama cannot pull this model on Linux -- "this model requires MLX
+support, but the MLX runtime is not available" -- but that is the
+client's check, not the registry's, and `lex-rt` reads the store rather
+than asking Ollama to run anything. `scripts/ollama_fetch.py` takes the
+blobs over plain HTTP. There is consequently **no like-for-like Ollama
+baseline for Qwen on NVIDIA**: the non-MLX `qwen3.8:27b` is a 16.8 GB
+GGUF against our 14.5 GB NVFP4, a different quantisation of the same
+weights, so any comparison would be of two different models.
+
+**Speed is where the CUDA backend shows its age.** 6.4 tok/s against
+26.3 on an M4 Max:
+
+| | tok/s | GB/s | of its read roof |
+| --- | --- | --- | --- |
+| M4 Max (~507 GB/s) | 26.3 | 381 | 75% |
+| L4 (~300 GB/s) | 6.4 | 93 | 31% |
+
+Bandwidth alone would put the L4 at 15.6. The missing 2.4x is not a
+mystery and is documented where it was made: `lex_cuda`'s `run_launches`
+issues every dispatch on the default stream in order, because that stream
+orders its launches and correctness came free. Metal runs a concurrent
+encoder with hazard barriers, so independent kernels -- q, k and v, gate
+and up, every small one -- share the GPU there and queue here. Qwen
+dispatches a great many small kernels per step, which is exactly the
+shape that punishes.
+
+So the next CUDA work is streams and events, and it now has a number to
+beat rather than a principle behind it.
+
+## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`
 programs the Mac runs, and produces the same tokens:
