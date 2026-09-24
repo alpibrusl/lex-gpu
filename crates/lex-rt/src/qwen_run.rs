@@ -115,7 +115,8 @@ mod gpu {
         QLayout, kv_append, kv_append_rows, matmul_q_x, matvec_q, rmsnorm, rmsnorm_rows,
     };
     use lex_front::qwen::{
-        DeltaNet, build_conv_silu_rows, build_delta_qk_rows, build_gated_norm_rows,
+        DeltaNet, build_conv_silu_rows, build_conv_silu_rows_snap, build_delta_qk_rows,
+        build_gated_norm_rows,
         build_gates_rows, build_matvec_dense_rows, build_mul, build_qk_rope_rows,
     };
     use lex_front::{Program, check};
@@ -146,6 +147,14 @@ mod gpu {
         Vec<&'a Buffer>,
         Option<[usize; 2]>,
     );
+
+    /// Batch sizes a speculative verify keeps per-token snapshots for.
+    ///
+    /// The snapshots are what make a rejection a copy instead of a replay,
+    /// and they cost `SPEC_MAX` copies of the recurrent state -- 3.1 MB a
+    /// layer, 48 layers, so 604 MB at four. Prefill runs at MAX_BATCH and
+    /// never rolls back, so it does not pay this.
+    const SPEC_MAX: usize = 4;
 
     const ATTN_BPS: usize = 2;
     /// Splits below which the serial kernel is used instead.
@@ -303,6 +312,17 @@ mod gpu {
         copy_state: Pipeline,
         copy_conv: Pipeline,
         pos: usize,
+        /// Per-token state and window, written by a snapshotting verify:
+        /// `SPEC_MAX` blocks each, of which a batch of `t` fills the first
+        /// `t`. Rolling back to the last token the model agreed with is
+        /// then one copy out of these, not a replay of the whole pass.
+        rows_state: Vec<Buffer>,
+        rows_conv: Vec<Buffer>,
+        /// `copy_block` per rollback target. The block is baked into the
+        /// pipeline, so picking the wrong one is a visible wrong dispatch
+        /// rather than a wrong number in a buffer.
+        roll_state: Vec<Pipeline>,
+        roll_conv: Vec<Pipeline>,
     }
 
     /// The checkpoint's multi-token-prediction head.
@@ -373,6 +393,10 @@ mod gpu {
         attn_combine: Pipeline,
         mul: Pipeline,
         silu: Pipeline,
+        /// The same delta and conv kernels, writing per-token snapshots.
+        /// Only for batches a speculative verify can use.
+        delta_snap: Option<Pipeline>,
+        conv_snap: Option<Pipeline>,
     }
 
     /// Activation buffers, reused every step.
@@ -767,12 +791,24 @@ mod gpu {
                     .iter()
                     .filter(|l| matches!(l.mixer, Mixer::Linear(_)))
                     .count();
+                let block = |rows: usize, cols: usize| -> Result<Vec<Pipeline>, String> {
+                    (0..SPEC_MAX)
+                        .map(|w| {
+                            let p = lex_front::qwen::copy_block(SPEC_MAX, rows, cols, w)?;
+                            compile(&gpu, &p, THREADS)
+                        })
+                        .collect()
+                };
                 Some(Snapshot {
                     state: (0..delta).map(|_| gpu.zeroed::<f32>(sn)).collect(),
                     conv: (0..delta).map(|_| gpu.zeroed::<f32>(cn)).collect(),
                     copy_state: build(sn)?,
                     copy_conv: build(cn)?,
                     pos: 0,
+                    rows_state: (0..delta).map(|_| gpu.zeroed::<f32>(SPEC_MAX * sn)).collect(),
+                    rows_conv: (0..delta).map(|_| gpu.zeroed::<f32>(SPEC_MAX * cn)).collect(),
+                    roll_state: block(hv * dv, dk)?,
+                    roll_conv: block(cfg.conv_kernel - 1, ch)?,
                 })
             } else {
                 None
@@ -876,6 +912,45 @@ mod gpu {
             self.pos = s.pos;
         }
 
+        /// Put every gated-delta layer back to where it stood after token
+        /// `kept` of the batch just run, and the position with it.
+        ///
+        /// This replaces `restore()` plus a replay of the accepted prefix.
+        /// The replay was a whole extra pass over the weights -- 38.6 ms
+        /// against a 42.8 ms verify -- on every round the model disagreed
+        /// with a draft. This is two copies a layer.
+        ///
+        /// Returns false when the batch was not run with snapshots, and
+        /// the caller has to fall back to restoring and replaying.
+        fn roll_back_to(&mut self, kept: usize, t: usize) -> bool {
+            let Some(s) = &self.snap else { return false };
+            if kept + 1 >= t || t > SPEC_MAX || kept >= s.roll_state.len() {
+                return false;
+            }
+            let mut steps: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
+            let mut i = 0;
+            for l in &self.layers {
+                if let Mixer::Linear(d) = &l.mixer {
+                    steps.push((&s.roll_state[kept], vec![&s.rows_state[i], &d.state]));
+                    steps.push((&s.roll_conv[kept], vec![&s.rows_conv[i], &d.conv_state]));
+                    i += 1;
+                }
+            }
+            let launches: Vec<Step<'_>> = steps
+                .iter()
+                .map(|(p, b)| (*p, b.as_slice(), None))
+                .collect();
+            self.gpu.run_launches(&launches);
+            drop(launches);
+            drop(steps);
+            // The batch advanced the position by `t`; only `kept + 1` of
+            // those tokens were really said. An attention layer needs
+            // nothing -- its cache is overwritten as positions are
+            // refilled -- which is the same reason `restore` gives.
+            self.pos = self.pos - t + kept + 1;
+            true
+        }
+
         /// One speculative round, greedy.
         ///
         /// `last` is the token to be fed next; it is not yet in the state.
@@ -912,7 +987,7 @@ mod gpu {
             let mut fed = vec![last];
             fed.extend(&drafts);
             let mark = std::time::Instant::now();
-            let logits = self.forward(&fed, true)?;
+            let logits = self.forward_with(&fed, true, true)?;
             let t_verify = mark.elapsed().as_secs_f64() * 1e3;
 
             // How many drafts the model agrees with, longest prefix only.
@@ -932,11 +1007,15 @@ mod gpu {
             if kept < drafts.len() {
                 // The pass ran further than the model agreed with, so the
                 // delta states carry tokens that were never really said.
-                self.restore();
-                if kept > 0 {
-                    self.forward(&committed, false)?;
-                } else {
-                    self.step(last)?;
+                // With snapshots that is a copy; without, the only way
+                // back is the pre-batch state and a replay of the prefix.
+                if !self.roll_back_to(kept, fed.len()) {
+                    self.restore();
+                    if kept > 0 {
+                        self.forward(&committed, false)?;
+                    } else {
+                        self.step(last)?;
+                    }
                 }
             }
             self.spec_h = Some(carry);
@@ -1433,6 +1512,19 @@ mod gpu {
         /// kernel, so the batch lands exactly where the same tokens would
         /// have one at a time.
         pub fn forward(&mut self, tokens: &[u32], all: bool) -> Result<Vec<Vec<f32>>, String> {
+            self.forward_with(tokens, all, false)
+        }
+
+        /// [`Self::forward`] recording where each gated-delta layer stood
+        /// after every token, so a rejected speculative batch can be undone
+        /// with a copy instead of a replay. Prefill does not ask for this:
+        /// it never rolls back, and the snapshots are 3.1 MB a layer.
+        fn forward_with(
+            &mut self,
+            tokens: &[u32],
+            all: bool,
+            snap: bool,
+        ) -> Result<Vec<Vec<f32>>, String> {
             let t = tokens.len();
             if t == 0 || t > MAX_BATCH {
                 return Err(format!("a batch is 1..={MAX_BATCH} tokens, not {t}"));
@@ -1470,7 +1562,7 @@ mod gpu {
                 &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
             );
 
-            let mut plan = self.batch_plan(t);
+            let mut plan = self.batch_plan_with(t, snap);
             if !self.skip.is_empty() {
                 // Exact labels, not prefixes. `"matvec qkv"` starts with
                 // `"matvec q"`, so a prefix match silently ablates two call
@@ -1609,6 +1701,7 @@ mod gpu {
                 heads: c.kv_heads,
                 kv_cap: self.cap,
             };
+            let want_snap = t <= SPEC_MAX && self.snap.is_some();
             let b = Batch {
                 rms: compile(
                     gpu,
@@ -1694,6 +1787,21 @@ mod gpu {
                     &lex_front::llama::silu_mul(t * c.ffn, THREADS, X_DTYPE)?,
                     THREADS,
                 )?,
+                // Only a batch a verify can roll back from, and only when
+                // there is a draft head to reject anything in the first
+                // place. Prefill runs at MAX_BATCH and skips both.
+                delta_snap: (want_snap)
+                    .then(|| compile(gpu, &delta.build_steps_snap(t)?, 128))
+                    .transpose()?,
+                conv_snap: (want_snap)
+                    .then(|| {
+                        compile(
+                            gpu,
+                            &build_conv_silu_rows_snap(t, ch, c.conv_kernel, 256)?,
+                            THREADS,
+                        )
+                    })
+                    .transpose()?,
             };
             self.batches.insert(t, b);
             Ok(())
@@ -1720,9 +1828,24 @@ mod gpu {
         }
 
         /// Every dispatch of a batch of `t`, in order.
-        fn batch_plan(&self, t: usize) -> Vec<Dispatch<'_>> {
+        /// [`Self::batch_plan`], optionally writing per-token snapshots of
+        /// each gated-delta layer's memory.
+        ///
+        /// `snap` is what a speculative verify asks for: the layers whose
+        /// state a rejected batch would otherwise have to replay record
+        /// where they were after every token, so the undo becomes a copy.
+        /// It falls back to the ordinary kernels when the batch is larger
+        /// than `SPEC_MAX` or the checkpoint has no draft head, and the
+        /// caller then pays the replay as before.
+        fn batch_plan_with(&self, t: usize, snap: bool) -> Vec<Dispatch<'_>> {
             let a = &self.bacts;
             let k = &self.batches[&t];
+            // The gated-delta layers in order, for indexing the snapshots.
+            let mut li = 0usize;
+            let snap = self
+                .snap
+                .as_ref()
+                .filter(|_| snap && k.delta_snap.is_some() && k.conv_snap.is_some());
             let mut d: Vec<Dispatch<'_>> = vec![];
             for layer in &self.layers {
                 d.push((
@@ -1747,12 +1870,26 @@ mod gpu {
                         ));
                         d.push(("matvec a/b", &k.dense, vec![&a.h, &l.a, &a.a], None));
                         d.push(("matvec a/b", &k.dense, vec![&a.h, &l.b, &a.b], None));
-                        d.push((
-                            "conv",
-                            &k.conv,
-                            vec![&l.conv_state, &a.qkv, &l.conv_w, &a.conv],
-                            None,
-                        ));
+                        d.push(match snap {
+                            Some(s) => (
+                                "conv",
+                                k.conv_snap.as_ref().expect("checked"),
+                                vec![
+                                    &l.conv_state,
+                                    &a.qkv,
+                                    &l.conv_w,
+                                    &a.conv,
+                                    &s.rows_conv[li],
+                                ],
+                                None,
+                            ),
+                            None => (
+                                "conv",
+                                &k.conv,
+                                vec![&l.conv_state, &a.qkv, &l.conv_w, &a.conv],
+                                None,
+                            ),
+                        });
                         d.push(("delta q/k", &k.qk_q, vec![&a.conv, &a.qe], None));
                         d.push(("delta q/k", &k.qk_k, vec![&a.conv, &a.ke], None));
                         d.push((
@@ -1761,12 +1898,30 @@ mod gpu {
                             vec![&a.a, &a.b, &l.amp, &l.dt_bias, &a.g, &a.beta],
                             None,
                         ));
-                        d.push((
-                            "delta step",
-                            &k.delta,
-                            vec![&l.state, &a.qe, &a.ke, &a.conv, &a.g, &a.beta, &a.y],
-                            None,
-                        ));
+                        d.push(match snap {
+                            Some(s) => (
+                                "delta step",
+                                k.delta_snap.as_ref().expect("checked"),
+                                vec![
+                                    &l.state,
+                                    &a.qe,
+                                    &a.ke,
+                                    &a.conv,
+                                    &a.g,
+                                    &a.beta,
+                                    &a.y,
+                                    &s.rows_state[li],
+                                ],
+                                None,
+                            ),
+                            None => (
+                                "delta step",
+                                &k.delta,
+                                vec![&l.state, &a.qe, &a.ke, &a.conv, &a.g, &a.beta, &a.y],
+                                None,
+                            ),
+                        });
+                        li += 1;
                         d.push((
                             "gated norm",
                             &k.gated_norm,

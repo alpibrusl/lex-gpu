@@ -479,3 +479,81 @@ fn prefill_lands_where_the_same_tokens_land_one_by_one() {
     );
     eprintln!("prefill vs stepping: worst {worst:e} of scale");
 }
+
+/// Speculation lands where greedy lands *when drafts are rejected*.
+///
+/// `speculation_lands_exactly_where_greedy_lands` runs on a short, easy
+/// prompt where every draft is accepted, so it never exercises the undo
+/// at all -- it passes with the rollback deleted outright, which is how
+/// this test came to exist. A rejected round is the only one that has to
+/// put the gated-delta layers back, and that is what is checked here.
+///
+/// The prompt is deliberately arbitrary so the head misses sometimes, and
+/// the test fails if it never does: a run with no rejection proves
+/// nothing and must not be allowed to look like a pass.
+#[test]
+fn speculation_survives_rejected_drafts() {
+    let _lock = one_at_a_time();
+    let (model, _) = parse(include_str!("data/qwen35_27b_golden.txt"));
+    const STEPS: usize = 24;
+    let prompt: Vec<u32> = (0..32).map(|i| 1000 + (i as u32 * 7919) % 200000).collect();
+    let mut rt = match Runner::load(&model, prompt.len() + STEPS + 16) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+    if !rt.has_mtp() {
+        eprintln!("SKIPPED: {model} carries no draft head");
+        return;
+    }
+    let top = |v: &[f32]| {
+        (0..v.len())
+            .max_by(|&a, &b| v[a].total_cmp(&v[b]))
+            .expect("logits") as u32
+    };
+
+    // Greedy, one token at a time.
+    rt.reset();
+    let mut logits = vec![];
+    for &t in &prompt {
+        logits = rt.step(t).expect("step");
+    }
+    let mut greedy = vec![];
+    for _ in 0..STEPS {
+        let t = top(&logits);
+        greedy.push(t);
+        logits = rt.step(t).expect("step");
+    }
+
+    // The same, speculating.
+    rt.reset();
+    let mut logits = vec![];
+    for &t in &prompt {
+        logits = rt.step(t).expect("step");
+    }
+    let mut spec = vec![];
+    let mut next = top(&logits);
+    let mut rejected = 0;
+    while spec.len() < STEPS {
+        let (committed, after) = rt.speculate(next, 1).expect("speculate");
+        if committed.len() < 2 {
+            rejected += 1;
+        }
+        spec.extend(committed);
+        next = after;
+    }
+    spec.truncate(STEPS);
+
+    assert!(
+        rejected > 0,
+        "no draft was rejected in {STEPS} tokens, so the undo was never \
+         exercised and this test proves nothing -- pick a harder prompt"
+    );
+    assert_eq!(
+        spec, greedy,
+        "speculation diverged from greedy after {rejected} rejected drafts"
+    );
+    eprintln!("{rejected} of {} rounds rejected, output identical", spec.len());
+}

@@ -113,23 +113,46 @@ own reply, so no tokenizer is needed in the repo. It reports the share of
 immediate repeats so a degenerate passage can be thrown away (this one:
 1440 ids, 628 distinct, 0.0%).
 
-**What is actually left is the undo.** With the verify fixed the trace
-at 1440 reads:
+**The undo is fixed too.** A rejected round used to restore the
+pre-batch state and replay the accepted prefix -- a whole extra pass over
+the weights, 38.6 ms against a 42.8 ms verify, on 28% of rounds.
 
-    draft 3.5  save 0.8  verify 42.8  undo 18.0 (avg)  -> 1.68 tokens
+The batched delta and conv kernels now write where they stood after
+*every* token (`DeltaNet::build_steps_snap`, `build_conv_silu_rows_snap`),
+so the undo is `copy_block` out of those snapshots: two copies a layer.
 
-Every rejection restores the gated-delta state and replays the accepted
-prefix — a whole extra pass, 38.6 ms, on 32% of rounds. That is 30% of
-the round and the entire remaining gap: without it the same acceptance
-gives 35.7 tok/s (1.34x) instead of 28.3 (1.06x).
+| | before | after |
+| --- | --- | --- |
+| verify | 42.8 ms | 44.3 ms |
+| undo, on a rejected round | 38.6 ms | 2.8 ms |
+| round | 57.9 ms | 49.6 ms |
 
-The fix is not more acceptance, it is a cheaper rollback. The batched
-delta kernel already walks the `t` tokens in order; if it wrote its state
-after each one, rolling back to row `kept` would be the 0.8 ms copy
-`save` already costs instead of a replay.
+The verify pays 1.5 ms for the snapshot writes on every round and the
+undo saves 36 ms on a third of them. Snapshots are kept for batches up to
+`SPEC_MAX = 4` and only when the checkpoint has a draft head; prefill runs
+at `MAX_BATCH` and never rolls back, so it does not pay this. The memory
+is 604 MB, 4% on top of a 14.5 GB model.
 
-**Done when:** speculation is a win at 0, 512 and 1440, measured on
-coherent context rather than on random tokens.
+**M2 is met.** Speculation is a win at all three contexts, on coherent
+text, and flat from 512 to 1440:
+
+| context | acceptance | plain | speculating | Ollama |
+| --- | --- | --- | --- | --- |
+| 0, real prompt | 93.7% | 27.1 | **42.9** (1.58x) | 42.7 |
+| 512, coherent | 66.3% | 26.9 | **34.8** (1.29x) | 56.8 |
+| 1440, coherent | 70.5% | 26.4 | **34.0** (1.28x) | 53.1 |
+
+At no context this is parity with Ollama. At length it is 61-64% of it,
+and the gap is now acceptance rather than anything in the schedule: the
+verify is flat, the undo is nearly free, and 70% acceptance on prose at
+1440 against 94% on a short prompt is what is left to explain.
+
+A caution on the testing. `speculation_lands_exactly_where_greedy_lands`
+runs on a short easy prompt where every draft is accepted, so it passes
+with the rollback deleted outright -- it was never exercising the undo.
+`speculation_survives_rejected_drafts` uses a prompt the head misses on,
+and fails if no draft is rejected, because a run with no rejection proves
+nothing and must not look like a pass.
 
 ## M3 — prefill attention — done, by M2's kernel
 
