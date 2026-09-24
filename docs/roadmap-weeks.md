@@ -355,11 +355,36 @@ there, so Metal is unchanged by construction.
 
 **Two things went the other way, and both are honest costs.**
 
-`llama3.2:1b` on the same card went 124.4 to 116.9 tok/s, −6%. The sweep
-was on Qwen's `5120 -> 17408` in NVFP4 and the 1B's matvecs are
-`2048 -> 8192` in Q8_0, so the optimum is probably a function of shape
-as well as of machine — which would make one number per target the wrong
-home for it, or at least too coarse a one. It belongs in the planner.
+`llama3.2:1b` on the same card went 124.4 to 116.9 tok/s, −6%. Sweeping
+both models' shapes over the same ten configurations says why, and says
+the target table is the wrong home for this:
+
+| rows per warp | qwen `5120 -> 17408` | 1b `2048 -> 8192` |
+| --- | --- | --- |
+| 0.5 | 105 | **243** |
+| 1 | 107, 112 | **241, 242** |
+| 2 | **181, 182** | 225, 226 |
+| 4 | 169, 166 | 181 |
+| 8 | 103, 105 | 104, 100 |
+
+Rows per warp is the right metric for both — it predicts the number
+where neither knob does alone — but they peak in different places, and
+no rule fits both. Threadgroup count does not: Qwen at 2,176 is bad
+(107) where the 1B at 2,048 is its best (243). Bytes per threadgroup
+points the opposite way for the two. Values per warp is not constant.
+Two shapes do not determine a rule, and one fitted to two points would
+be a guess wearing a formula.
+
+**So `bo` should be searched, not tabulated.** `docs/design.md` already
+says this — "in P0 the planner computes it from two constants; in P3 it
+searches for it" — and this is the first measurement that makes the
+case concrete rather than architectural. Timing two or three candidates
+per distinct matvec shape at load costs a second and would take Qwen's
++42% *and* keep the 1B's 124, on any card, without a constant to be
+wrong about.
+
+Until then the target value stays at 2, which is right for the model in
+daily use and wrong by 6% for the 1B.
 
 Speculation on CUDA is now a loss: 6.2 tok/s against 9.1 plain, where
 before the change it was 6.4 against 6.4. Nothing about it got slower —
