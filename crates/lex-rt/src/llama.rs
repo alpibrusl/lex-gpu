@@ -294,6 +294,7 @@ mod gpu {
             let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
             format!("`{}` does not check:\n{}", prog.name, msgs.join("\n"))
         })?;
+        crate::dev::dump_cuda(prog, threads);
         gpu.build_lowered(&lower_with(prog, target, threads, crate::dev::dialect())?)
     }
 

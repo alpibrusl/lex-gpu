@@ -36,3 +36,42 @@ pub fn dialect() -> &'static dyn lex_msl::dialect::Dialect {
         &lex_msl::dialect::Cuda
     }
 }
+
+/// Write the CUDA form of every program the runtime compiles, when
+/// `LEX_DUMP_CUDA` names a directory.
+///
+/// `examples/emit_cuda` does the same job from a list of kernels written
+/// out by hand, and says in its own docstring that a kernel added to the
+/// runtime and not to the list is simply not covered. This cannot drift,
+/// because the runtime building the model is what feeds it:
+///
+/// ```text
+/// LEX_DUMP_CUDA=out cargo run --release -p lex-rt --example qwen -- --steps 2
+/// scripts/cuda_check.sh out/*.cu
+/// ```
+///
+/// Run on a Mac it emits CUDA for a Metal run, which is the point: the
+/// question is whether the *other* backend would accept these programs,
+/// and that is answerable without one. A program that will not lower at
+/// all leaves a `.err` file rather than passing quietly.
+pub fn dump_cuda(prog: &lex_front::Program, threads: usize) {
+    let Some(dir) = std::env::var_os("LEX_DUMP_CUDA") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    // Ada rather than the host's target: a threadgroup budget of 32 KiB
+    // would reject schedules the machine being checked for allows.
+    let target = lex_ir::Target::nvidia_ada();
+    match lex_msl::program::lower_with(prog, &target, threads, &lex_msl::dialect::Cuda) {
+        Ok(l) => {
+            let _ = std::fs::write(dir.join(format!("{}.cu", l.entry)), &l.source);
+        }
+        Err(e) => {
+            eprintln!("LEX_DUMP_CUDA: `{}` does not lower for CUDA: {e}", prog.name);
+            let _ = std::fs::write(dir.join(format!("{}.err", prog.name)), e);
+        }
+    }
+}

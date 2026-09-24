@@ -102,10 +102,10 @@ pub fn rope_tables(pos: usize, rot: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
     (cos, sin)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use gpu::{MAX_BATCH, Runner};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gpu {
     use std::collections::HashMap;
 
@@ -121,8 +121,8 @@ mod gpu {
     };
     use lex_front::{Program, check};
     use lex_ir::{DType, Kernel, Space, Target, plan};
-    use lex_metal::{Buffer, Gpu, Pipeline, Step};
-    use lex_msl::program::lower;
+    use crate::dev::{Buffer, Gpu, Pipeline, Step};
+    use lex_msl::program::lower_with;
 
     use super::{Config, rope_tables};
     use crate::qwen::Store;
@@ -192,7 +192,8 @@ mod gpu {
             let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
             format!("`{}` does not check:\n{}", prog.name, msgs.join("\n"))
         })?;
-        gpu.build_lowered(&lower(prog, target, threads)?)
+        crate::dev::dump_cuda(prog, threads);
+        gpu.build_lowered(&lower_with(prog, target, threads, crate::dev::dialect())?)
     }
 
     /// An NVFP4 matrix on the GPU, as the matvec binds it.

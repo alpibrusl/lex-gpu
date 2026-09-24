@@ -18,6 +18,10 @@
 #                GPUs are often out of stock in one zone and free in the next.
 #   SPOT=1       Spot VM: ~60-70% cheaper, can be preempted mid-run.
 #   MODELS       Ollama models for the baseline (default: llama3.2:1b llama3.1:8b).
+#   QWEN=1       also run qwen3.8:27b-mlx on the GPU -- the hybrid
+#                gated-delta / NVFP4 / draft-head model. 14.5 GB to pull,
+#                and Ollama cannot run it here to compare against (MLX is
+#                macOS-only), so the check is our own golden file.
 #   MAX_RUN      hard cap on the VM's life (default 2h). GCE deletes the VM
 #                when it expires, even if this script is killed.
 #   KEEP=1       leave the VM running afterwards (debugging); you delete it.
@@ -108,7 +112,7 @@ gc compute scp --zone "$ZONE" "$OUT/src.tar.gz" "$NAME:~/src.tar.gz"
 # A failing run must still bring its logs home: no errexit from here on.
 set +e
 gc compute ssh "$NAME" --zone "$ZONE" --command \
-  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' bash lex-gpu/scripts/gcp/remote.sh" \
+  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' QWEN='${QWEN:-}' bash lex-gpu/scripts/gcp/remote.sh" \
   2>&1 | tee "$OUT/remote.log"
 status=${PIPESTATUS[0]}
 gc compute scp --zone "$ZONE" --recurse "$NAME:~/results/*" "$OUT/" || true

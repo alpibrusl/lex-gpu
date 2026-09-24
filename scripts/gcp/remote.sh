@@ -126,5 +126,24 @@ cargo run --release -p lex-rt --example generate -- \
   2>&1 | tee "$R/cuda-generate.txt" | tail -20
 [ "${PIPESTATUS[0]}" = 0 ] || fail=1
 
+# The hard model on the other backend: 48 of 64 layers carry a recurrent
+# state instead of a KV cache, the weights are NVFP4, and there is a
+# multi-token-prediction head. Ollama cannot run it on this machine --
+# it is an MLX build and that engine is macOS-only -- so there is no
+# baseline here and the check is the golden file, an f32 reference the
+# Metal tests are held to as well. Opt-in: 14.5 GB to pull.
+if [ -n "${QWEN:-}" ]; then
+  step "the hard model on CUDA"
+  ollama pull qwen3.8:27b-mlx >/dev/null 2>&1 || echo "pull failed; trying the store"
+  sudo chmod a+rX /usr/share/ollama /usr/share/ollama/.ollama 2>/dev/null || true
+  sudo chmod -R a+rX "${OLLAMA_MODELS:-/usr/share/ollama/.ollama/models}" 2>/dev/null || true
+  nvidia-smi --query-gpu=memory.total,memory.used --format=csv | tee -a "$R/machine.txt"
+  cargo test --release -p lex-rt --test qwen_golden -- --nocapture 2>&1 \
+    | tee "$R/qwen-cuda.log" | grep -E "test result|worst|SKIPPED|panicked|differs"
+  [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+  cargo run --release -p lex-rt --example mtp -- --steps 32 --depth 1 2>&1 \
+    | tee -a "$R/qwen-cuda.log" | grep -E "tok/s|offset 1"
+fi
+
 step "done (failures: $fail)"
 exit $fail
