@@ -16,15 +16,37 @@ honesty:**
   [`llama.rs`](crates/lex-front/src/llama.rs) for what a kernel looks like
   today. [`docs/design.md`](docs/design.md) has the intended syntax, with the
   algorithm/schedule split; it is a design, not an implementation.
-- **Only Metal exists.** The claim that matters here is portability, and
-  nothing demonstrates it until a second backend does. Until then the type
-  system's case — that linear tiles and effects catch across targets what
-  each target's own tooling catches only on that target — is an argument,
-  not a result.
+- **The type system's case is still an argument.** Linear tiles and effects
+  are supposed to catch across targets what each target's own tooling
+  catches only on that target. Two backends now exist, so that is testable
+  — but the bugs found porting to the second were caught by NVRTC, by
+  golden tests and by deleting fixes to watch tests go red, not by the
+  checker. That may be what was touched rather than what it is worth, and
+  it is not yet a result.
+
+**Metal is no longer the only backend.** `llama3.2:1b` and
+`qwen3.8:27b-mlx` both run on an NVIDIA L4 from the same `lex-front`
+programs the Mac runs: the Llama gives Metal's tokens exactly, and Qwen
+passes the whole golden suite there against the f32 reference. Qwen is
+the one that matters — 48 of its 64 layers carry a recurrent state
+instead of a KV cache, its weights are NVFP4, and it has a
+multi-token-prediction head. Porting the runtime to CUDA took three
+lines.
 
 What *is* real: the linear type system, the checker, the reference
-interpreter, the MSL backend, and a 27.8B model that runs end to end on the
-kernels it generates and answers with the same tokens as Ollama.
+interpreter, two backends, a 27.8B model that runs end to end on the
+kernels it generates and answers with the same tokens as Ollama, and an
+OpenAI-compatible endpoint so something other than a benchmark can use
+it:
+
+```bash
+cargo run --release -p lex-rt --example serve -- --model qwen3.8:27b-mlx
+curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"lex","messages":[{"role":"user","content":"hello"}]}'
+```
+
+Streaming and non-streaming both work, and the official OpenAI Python
+client drives it unmodified.
 
 The full design is in [`docs/design.md`](docs/design.md). The plan for getting
 there is in [`docs/roadmap.md`](docs/roadmap.md).
