@@ -141,8 +141,13 @@ if [ -n "${QWEN:-}" ]; then
   # directly, so Ollama's opinion about what this machine can execute is
   # not one we need. Into our own home, which also skips the permission
   # dance the service user's store needs.
+  # Point the resolver at the store we are about to fill, rather than
+  # trusting them to agree: the earlier step exported OLLAMA_MODELS to
+  # the service user's store, which takes priority over $HOME, so the
+  # first attempt fetched 18 GB into one place and looked in another.
+  export OLLAMA_MODELS="$HOME/.ollama/models"
   python3 scripts/ollama_fetch.py qwen3.8:27b-mlx \
-    --root "$HOME/.ollama/models" 2>&1 | tail -4 | tee -a "$R/qwen-cuda.log"
+    --root "$OLLAMA_MODELS" 2>&1 | tail -4 | tee -a "$R/qwen-cuda.log"
   [ "${PIPESTATUS[0]}" = 0 ] || fail=1
   # Ollama holds the baseline models on the GPU -- 6.6 GB of a 23 GB
   # card after llama3.1:8b -- and this one needs about 15.5.
@@ -168,6 +173,7 @@ if [ -n "${QWEN:-}" ]; then
   fi
   cargo run --release -p lex-rt --example mtp -- --steps 32 --depth 1 2>&1 \
     | tee -a "$R/qwen-cuda.log" | grep -E "tok/s|offset 1"
+  [ "${PIPESTATUS[0]}" = 0 ] || fail=1
 fi
 
 step "done (failures: $fail)"
