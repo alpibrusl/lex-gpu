@@ -1,4 +1,4 @@
-"""An f32 reference for Qwen3.5 (qwen3.8:27b-mlx), straight from Ollama's store.
+"""An f32 reference for Qwen3.8 (qwen3.8:27b-mlx), straight from Ollama's store.
 
     python3 scripts/qwen_ref.py --steps 8
     python3 scripts/qwen_ref.py --prompt "The capital of France is" --compare
@@ -77,7 +77,7 @@ def softplus(x):
 class Weights:
     """Tensors by name, dequantised on demand and not held."""
 
-    #: Qwen3.5 stores these norm weights as deltas from 1: the norm is
+    #: Qwen3.8 stores these norm weights as deltas from 1: the norm is
     #: `x * (1 + w)` (`Qwen3_5RMSNorm` in transformers, `sanitize` in
     #: mlx_lm). The gated norm inside a linear-attention layer is not one
     #: of them and multiplies by `w` directly. Missing this is silent: the

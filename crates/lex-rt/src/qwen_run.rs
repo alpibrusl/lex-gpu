@@ -1,4 +1,4 @@
-//! A Qwen3.5 decode step on the GPU, over tile kernels.
+//! A Qwen3.8 decode step on the GPU, over tile kernels.
 //!
 //! Sixty-four layers, of which every fourth is grouped attention over a
 //! KV cache and the rest are gated-delta layers whose whole memory is a
@@ -110,12 +110,13 @@ mod gpu {
     use std::collections::HashMap;
 
     use half::f16;
-    use lex_front::flash::FlashDecode;
+    use lex_front::flash::{COMBINE_CHUNK, FlashDecode};
     use lex_front::llama::{
         QLayout, kv_append, kv_append_rows, matmul_q_x, matvec_q, rmsnorm, rmsnorm_rows,
     };
     use lex_front::qwen::{
-        DeltaNet, build_conv_silu_rows, build_delta_qk_rows, build_gated_norm_rows,
+        DeltaNet, build_conv_silu_rows, build_conv_silu_rows_snap, build_delta_qk_rows,
+        build_gated_norm_rows,
         build_gates_rows, build_matvec_dense_rows, build_mul, build_qk_rope_rows,
     };
     use lex_front::{Program, check};
@@ -129,6 +130,48 @@ mod gpu {
     const THREADS: usize = 256;
     const BO: usize = 8;
     const ATTN_BK: usize = 16;
+    /// Cache blocks per split, and the fewest splits worth splitting for.
+    ///
+    /// Without this the decode attention scans the cache in one
+    /// threadgroup per KV head, and a step at 1440 positions costs 52.16 ms
+    /// against 35.55 with the attention left out -- 16.6 ms in one kernel,
+    /// against 0.58 ms at zero context. Everything else on this model is
+    /// flat with context, because 48 of its 64 layers carry a fixed-size
+    /// state. The Llama path has had this since P3; the Qwen path never
+    /// got it.
+    /// One dispatch: a label for ablation, the pipeline, its buffers, and
+    /// a launch shape when the kernel wants one other than its own.
+    type Dispatch<'a> = (
+        &'static str,
+        &'a Pipeline,
+        Vec<&'a Buffer>,
+        Option<[usize; 2]>,
+    );
+
+    /// Batch sizes a speculative verify keeps per-token snapshots for.
+    ///
+    /// The snapshots are what make a rejection a copy instead of a replay,
+    /// and they cost `SPEC_MAX` copies of the recurrent state -- 3.1 MB a
+    /// layer, 48 layers, so 604 MB at four. Prefill runs at MAX_BATCH and
+    /// never rolls back, so it does not pay this.
+    const SPEC_MAX: usize = 4;
+
+    const ATTN_BPS: usize = 2;
+    /// Splits below which the serial kernel is used instead.
+    ///
+    /// Read fresh every time on purpose: the golden test builds one Runner,
+    /// decodes with splits, then sets `LEX_MIN_SPLITS` and decodes again to
+    /// compare against the serial kernel. Caching this in a `OnceLock` would
+    /// pin the first value and leave that test comparing the split path
+    /// against itself -- passing while checking nothing. It costs one lookup
+    /// per attention layer per step, about 0.04% of a step, which is below
+    /// the noise in every measurement here.
+    fn attn_min_splits() -> usize {
+        std::env::var("LEX_MIN_SPLITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    }
     /// State rows per instance of the delta step.
     const DELTA_ROWS: usize = 8;
     /// The dtype the *batched* path keeps normalised activations in.
@@ -269,6 +312,17 @@ mod gpu {
         copy_state: Pipeline,
         copy_conv: Pipeline,
         pos: usize,
+        /// Per-token state and window, written by a snapshotting verify:
+        /// `SPEC_MAX` blocks each, of which a batch of `t` fills the first
+        /// `t`. Rolling back to the last token the model agreed with is
+        /// then one copy out of these, not a replay of the whole pass.
+        rows_state: Vec<Buffer>,
+        rows_conv: Vec<Buffer>,
+        /// `copy_block` per rollback target. The block is baked into the
+        /// pipeline, so picking the wrong one is a visible wrong dispatch
+        /// rather than a wrong number in a buffer.
+        roll_state: Vec<Pipeline>,
+        roll_conv: Vec<Pipeline>,
     }
 
     /// The checkpoint's multi-token-prediction head.
@@ -308,6 +362,9 @@ mod gpu {
         kv_k: Pipeline,
         kv_v: Pipeline,
         attn: Pipeline,
+        /// Split-KV: many threadgroups over the cache, then a reduce.
+        attn_split: Pipeline,
+        attn_combine: Pipeline,
         mul: Pipeline,
         silu: Pipeline,
     }
@@ -332,8 +389,14 @@ mod gpu {
         kv_k: Pipeline,
         kv_v: Pipeline,
         attn: Pipeline,
+        attn_split: Pipeline,
+        attn_combine: Pipeline,
         mul: Pipeline,
         silu: Pipeline,
+        /// The same delta and conv kernels, writing per-token snapshots.
+        /// Only for batches a speculative verify can use.
+        delta_snap: Option<Pipeline>,
+        conv_snap: Option<Pipeline>,
     }
 
     /// Activation buffers, reused every step.
@@ -368,9 +431,15 @@ mod gpu {
         logits: Buffer,
         scalars_pos: Buffer,
         scalars_attn: Buffer,
+        scalars_len: Buffer,
+        scalars_nsplit: Buffer,
+        /// Per-split partial softmax: max, denominator, accumulator.
+        part_m: Buffer,
+        part_l: Buffer,
+        part_acc: Buffer,
     }
 
-    /// A Qwen3.5 model on the GPU.
+    /// A Qwen3.8 model on the GPU.
     pub struct Runner {
         gpu: Gpu,
         pub cfg: Config,
@@ -383,11 +452,26 @@ mod gpu {
         mtp: Option<Mtp>,
         /// `fc`'s input: the two normalised halves, embedding first.
         mtp_in: Buffer,
+        /// The same, for `MAX_BATCH` rows at once.
+        mtp_in_b: Buffer,
         /// The draft head's own cache length.
         mtp_pos: usize,
         snap: Option<Snapshot>,
         /// The hidden state a verify left, for the next draft.
         spec_h: Option<Vec<f32>>,
+        /// Call sites to leave out, by label prefix.
+        ///
+        /// For ablation: run without a kernel and the difference is what it
+        /// costs *on the critical path*, in a normally-scheduled pass. That
+        /// is not what `LEX_SYNC` measures -- serialised, the per-kernel
+        /// times sum to 210% of the real elapsed time, because the whole
+        /// point of the concurrent encoder is that they overlap. The
+        /// answers are wrong in different directions and only this one is
+        /// a share of anything.
+        ///
+        /// The results are nonsense once a kernel is missing. The shapes,
+        /// the dispatch count and the scheduling are not.
+        pub skip: Vec<String>,
         acts: Acts,
         /// Activations for a batch, and the kernels for each size seen.
         bacts: Acts,
@@ -406,7 +490,10 @@ mod gpu {
             let store = Store::open(model)?;
             let cfg = Config::read(&store, max_seq)?;
             let gpu = Gpu::open()?;
-            let cap = max_seq.next_multiple_of(ATTN_BK);
+            // Whole splits, and whole chunks of splits for the combine
+            // kernel: the split pair indexes them directly and refuses a
+            // capacity that does not divide.
+            let cap = max_seq.next_multiple_of(ATTN_BK * ATTN_BPS * COMBINE_CHUNK);
             let (hv, dv, dk) = (cfg.v_heads, cfg.v_dim, cfg.k_dim);
             let ch = cfg.conv_channels();
 
@@ -542,6 +629,8 @@ mod gpu {
                     64,
                 )?,
                 attn: compile(&gpu, &attn.build_dynamic()?, 128)?,
+                attn_split: compile(&gpu, &attn.build_split(ATTN_BPS)?, 128)?,
+                attn_combine: compile(&gpu, &attn.build_combine(ATTN_BPS)?, 128)?,
                 mul: compile(&gpu, &build_mul(cfg.heads * cfg.head_dim, 256)?, THREADS)?,
                 silu: compile(
                     &gpu,
@@ -632,6 +721,8 @@ mod gpu {
             };
 
             let (embed, _) = store.floats("model.language_model.embed_tokens.weight")?;
+            // Whole splits of the cache, as the split kernel indexes them.
+            let splits = cap.div_ceil(ATTN_BK * ATTN_BPS);
             let acts_for = |t: usize, narrow: bool| {
                 let f = |n: usize| gpu.zeroed::<f32>(t * n);
                 Acts {
@@ -674,6 +765,11 @@ mod gpu {
                     logits: f(cfg.vocab),
                     scalars_pos: gpu.zeroed::<u32>(1),
                     scalars_attn: gpu.zeroed::<u32>(2),
+                    scalars_len: gpu.zeroed::<u32>(1),
+                    scalars_nsplit: gpu.zeroed::<u32>(2),
+                    part_m: f(splits * cfg.heads),
+                    part_l: f(splits * cfg.heads),
+                    part_acc: f(splits * cfg.heads * cfg.head_dim),
                 }
             };
             let acts = acts_for(1, false);
@@ -681,6 +777,7 @@ mod gpu {
             let out_norm = floats(&gpu, &store, "model.language_model.norm.weight")?;
             let lm_head = QBuf::load(&gpu, &store, "lm_head.weight")?;
             let mtp_in = gpu.zeroed::<f32>(2 * cfg.hidden);
+            let mtp_in_b = gpu.zeroed::<f32>(MAX_BATCH * 2 * cfg.hidden);
 
             // Only a checkpoint with a draft head can reject anything.
             let snap = if mtp.is_some() {
@@ -694,12 +791,24 @@ mod gpu {
                     .iter()
                     .filter(|l| matches!(l.mixer, Mixer::Linear(_)))
                     .count();
+                let block = |rows: usize, cols: usize| -> Result<Vec<Pipeline>, String> {
+                    (0..SPEC_MAX)
+                        .map(|w| {
+                            let p = lex_front::qwen::copy_block(SPEC_MAX, rows, cols, w)?;
+                            compile(&gpu, &p, THREADS)
+                        })
+                        .collect()
+                };
                 Some(Snapshot {
                     state: (0..delta).map(|_| gpu.zeroed::<f32>(sn)).collect(),
                     conv: (0..delta).map(|_| gpu.zeroed::<f32>(cn)).collect(),
                     copy_state: build(sn)?,
                     copy_conv: build(cn)?,
                     pos: 0,
+                    rows_state: (0..delta).map(|_| gpu.zeroed::<f32>(SPEC_MAX * sn)).collect(),
+                    rows_conv: (0..delta).map(|_| gpu.zeroed::<f32>(SPEC_MAX * cn)).collect(),
+                    roll_state: block(hv * dv, dk)?,
+                    roll_conv: block(cfg.conv_kernel - 1, ch)?,
                 })
             } else {
                 None
@@ -714,9 +823,11 @@ mod gpu {
                 lm_head,
                 mtp,
                 mtp_in,
+                mtp_in_b,
                 mtp_pos: 0,
                 snap,
                 spec_h: None,
+                skip: vec![],
                 acts,
                 bacts,
                 batches: HashMap::new(),
@@ -735,6 +846,11 @@ mod gpu {
             self.pos
         }
 
+        /// Splits the cache is cut into at this length.
+        fn nsplit(&self, len: usize) -> usize {
+            len.div_ceil(ATTN_BK * ATTN_BPS)
+        }
+
         /// The residual stream after the last layer and *before* the final
         /// norm, as it stands after the most recent step.
         ///
@@ -744,7 +860,12 @@ mod gpu {
         /// measured without a second forward pass.
         /// Copy every gated-delta layer's memory aside, with the position
         /// it belongs to.
-        fn save(&mut self) {
+        ///
+        /// Public because a rollback is also the only honest way to time
+        /// the same work twice: 48 layers carry a recurrent state that a
+        /// forward pass mutates, so a second pass at "the same context" is
+        /// not at the same context unless the state goes back too.
+        pub fn save(&mut self) {
             let Some(s) = &self.snap else { return };
             let mut steps: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
             let mut i = 0;
@@ -770,7 +891,7 @@ mod gpu {
 
         /// Put it back, and with it the position. An attention layer needs
         /// nothing: its cache is overwritten as positions are refilled.
-        fn restore(&mut self) {
+        pub fn restore(&mut self) {
             let Some(s) = &self.snap else { return };
             let mut steps: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
             let mut i = 0;
@@ -789,6 +910,45 @@ mod gpu {
             drop(launches);
             drop(steps);
             self.pos = s.pos;
+        }
+
+        /// Put every gated-delta layer back to where it stood after token
+        /// `kept` of the batch just run, and the position with it.
+        ///
+        /// This replaces `restore()` plus a replay of the accepted prefix.
+        /// The replay was a whole extra pass over the weights -- 38.6 ms
+        /// against a 42.8 ms verify -- on every round the model disagreed
+        /// with a draft. This is two copies a layer.
+        ///
+        /// Returns false when the batch was not run with snapshots, and
+        /// the caller has to fall back to restoring and replaying.
+        fn roll_back_to(&mut self, kept: usize, t: usize) -> bool {
+            let Some(s) = &self.snap else { return false };
+            if kept + 1 >= t || t > SPEC_MAX || kept >= s.roll_state.len() {
+                return false;
+            }
+            let mut steps: Vec<(&Pipeline, Vec<&Buffer>)> = vec![];
+            let mut i = 0;
+            for l in &self.layers {
+                if let Mixer::Linear(d) = &l.mixer {
+                    steps.push((&s.roll_state[kept], vec![&s.rows_state[i], &d.state]));
+                    steps.push((&s.roll_conv[kept], vec![&s.rows_conv[i], &d.conv_state]));
+                    i += 1;
+                }
+            }
+            let launches: Vec<Step<'_>> = steps
+                .iter()
+                .map(|(p, b)| (*p, b.as_slice(), None))
+                .collect();
+            self.gpu.run_launches(&launches);
+            drop(launches);
+            drop(steps);
+            // The batch advanced the position by `t`; only `kept + 1` of
+            // those tokens were really said. An attention layer needs
+            // nothing -- its cache is overwritten as positions are
+            // refilled -- which is the same reason `restore` gives.
+            self.pos = self.pos - t + kept + 1;
+            true
         }
 
         /// One speculative round, greedy.
@@ -827,7 +987,7 @@ mod gpu {
             let mut fed = vec![last];
             fed.extend(&drafts);
             let mark = std::time::Instant::now();
-            let logits = self.forward(&fed, true)?;
+            let logits = self.forward_with(&fed, true, true)?;
             let t_verify = mark.elapsed().as_secs_f64() * 1e3;
 
             // How many drafts the model agrees with, longest prefix only.
@@ -847,11 +1007,15 @@ mod gpu {
             if kept < drafts.len() {
                 // The pass ran further than the model agreed with, so the
                 // delta states carry tokens that were never really said.
-                self.restore();
-                if kept > 0 {
-                    self.forward(&committed, false)?;
-                } else {
-                    self.step(last)?;
+                // With snapshots that is a copy; without, the only way
+                // back is the pre-batch state and a replay of the prefix.
+                if !self.roll_back_to(kept, fed.len()) {
+                    self.restore();
+                    if kept > 0 {
+                        self.forward(&committed, false)?;
+                    } else {
+                        self.step(last)?;
+                    }
                 }
             }
             self.spec_h = Some(carry);
@@ -946,6 +1110,263 @@ mod gpu {
         /// its feed-forward, then the shared norm and `lm_head`. The same
         /// shape as any attention layer in the model, which is why it needs
         /// no kernels of its own.
+        /// Every row of the last batched pass, before the head overwrites
+        /// them. One download, because `batch_hidden` of the last row
+        /// moves every earlier row anyway.
+        fn batch_hidden_all(&self, t: usize) -> Vec<f32> {
+            let mut all = vec![0.0f32; t * self.cfg.hidden];
+            self.gpu.download(&self.bacts.x, &mut all);
+            all
+        }
+
+        /// Feed a prompt, keeping the draft head's cache in step with the
+        /// model's.
+        ///
+        /// The head drafts token `t+2` from the model's hidden state at
+        /// `t` and the embedding of token `t+1`. Those hidden states exist
+        /// only while the prompt is being fed, which makes this the only
+        /// place the head can be warmed: afterwards they are gone, and
+        /// `mtp_pos` sits at 0 while the model is at 1440. The head then
+        /// drafts from a position the text never passed through, and
+        /// acceptance falls from 0.89 to 0.54 -- which costs more than the
+        /// verify does, because every rejection replays a whole pass.
+        ///
+        /// Returns the logits after the last token, as `step` would.
+        pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+            if tokens.is_empty() {
+                return Err("nothing to prefill".into());
+            }
+            let n = tokens.len();
+            let c = self.cfg.clone();
+            let mut logits = vec![];
+            let mut done = 0;
+            while done < n {
+                let t = MAX_BATCH.min(n - done);
+                let out = self.forward(&tokens[done..done + t], true)?;
+                logits = out.last().cloned().expect("a batch is never empty");
+                let hs = self.batch_hidden_all(t);
+                // The last prompt position pairs with a token the prompt
+                // does not have -- the one the model is about to generate.
+                // That row is the first real draft's, so it is left for it.
+                let warm = t.min(n - 1 - done);
+                if self.mtp.is_some() && warm > 0 {
+                    self.mtp_warm(&hs, &tokens[done + 1..done + 1 + warm])?;
+                }
+                // `forward` leaves the state in `bacts`, and `draft` reads
+                // the single-row `acts`. Handing the last row over is what
+                // keeps the first draft from guessing off a stale step.
+                if done + t == n {
+                    let h = c.hidden;
+                    self.spec_h = Some(hs[(t - 1) * h..t * h].to_vec());
+                }
+                done += t;
+            }
+            Ok(logits)
+        }
+
+        /// Advance the head's cache over `next.len()` positions at once.
+        ///
+        /// `hs` is the model's hidden state per row and `next[j]` is the
+        /// token after row `j` -- the pair the head predicts from. The
+        /// two halves are normalised on the host, as the single-row draft
+        /// does: 10240 values per row against the 239 MB the head reads.
+        fn mtp_warm(&mut self, hs: &[f32], next: &[u32]) -> Result<(), String> {
+            let t = next.len();
+            self.batch(t)?;
+            let c = self.cfg.clone();
+            let m = self.mtp.as_ref().expect("checked by the caller");
+            let (pre_e, pre_h) = (m.pre_e.clone(), m.pre_h.clone());
+            let mut fused = vec![0.0f32; t * 2 * c.hidden];
+            for (j, &tok) in next.iter().enumerate() {
+                let row = tok as usize * c.hidden;
+                let at = j * 2 * c.hidden;
+                rms_into(
+                    &self.embed[row..row + c.hidden],
+                    &pre_e,
+                    c.eps,
+                    &mut fused[at..at + c.hidden],
+                );
+                rms_into(
+                    &hs[j * c.hidden..(j + 1) * c.hidden],
+                    &pre_h,
+                    c.eps,
+                    &mut fused[at + c.hidden..at + 2 * c.hidden],
+                );
+            }
+            self.gpu.write(&self.mtp_in_b, 0, &fused);
+
+            let pos0 = self.mtp_pos;
+            if pos0 + t > self.cap {
+                return Err(format!("the head's cache is full ({} positions)", self.cap));
+            }
+            for j in 0..t {
+                let (cos, sin) = rope_tables(pos0 + j, c.rot, c.theta);
+                self.gpu.write(&self.bacts.cos, j * c.rot / 2, &cos);
+                self.gpu.write(&self.bacts.sin, j * c.rot / 2, &sin);
+            }
+            self.gpu.write(&self.bacts.scalars_pos, 0, &[pos0 as u32]);
+            self.gpu.write(
+                &self.bacts.scalars_attn,
+                0,
+                &[pos0 as u32, (pos0 + t).div_ceil(ATTN_BK) as u32],
+            );
+            let nsplit = self.nsplit(pos0 + t);
+            self.gpu.write(
+                &self.bacts.scalars_nsplit,
+                0,
+                &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
+            );
+
+            let plan = self.mtp_batch_plan(t);
+            let steps: Vec<Step<'_>> = plan
+                .iter()
+                .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
+                .collect();
+            self.gpu.run_launches(&steps);
+            drop(steps);
+            drop(plan);
+            self.mtp_pos += t;
+            Ok(())
+        }
+
+        /// The draft head over `t` rows at once, stopping before the
+        /// final norm and `lm_head`.
+        ///
+        /// Warming the head only needs its KV cache filled; the drafts it
+        /// would have made for tokens the model has already read are of no
+        /// use to anyone. Leaving `lm_head` out drops the most expensive
+        /// dispatch in the plan and a `t x vocab` download with it.
+        fn mtp_batch_plan(&self, t: usize) -> Vec<Dispatch<'_>> {
+            let (m, a, k) = (
+                self.mtp.as_ref().expect("checked by the caller"),
+                &self.bacts,
+                &self.batches[&t],
+            );
+            let at = match &m.layer.mixer {
+                Mixer::Attn(at) => at,
+                Mixer::Linear(_) => unreachable!("the draft head is an attention layer"),
+            };
+            let f = &m.layer.ffn;
+            let mut d: Vec<Dispatch<'_>> = vec![
+                (
+                    "mtp fc",
+                    &k.mv[&(m.fc.cols, m.fc.rows, false)],
+                    m.fc.bind(&self.mtp_in_b, None, &a.x),
+                    None,
+                ),
+                ("mtp rmsnorm", &k.rms, vec![&a.x, &at.norm, &a.h], None),
+                (
+                    "mtp matvec q",
+                    &k.mv[&(at.q.cols, at.q.rows, false)],
+                    at.q.bind(&a.h, None, &a.q32),
+                    None,
+                ),
+                (
+                    "mtp matvec k/v",
+                    &k.mv[&(at.k.cols, at.k.rows, false)],
+                    at.k.bind(&a.h, None, &a.k32),
+                    None,
+                ),
+                (
+                    "mtp matvec k/v",
+                    &k.mv[&(at.v.cols, at.v.rows, false)],
+                    at.v.bind(&a.h, None, &a.v32),
+                    None,
+                ),
+                (
+                    "mtp rope",
+                    &k.rope_q,
+                    vec![&a.q32, &at.q_norm, &a.cos, &a.sin, &a.q16, &a.gate],
+                    None,
+                ),
+                (
+                    "mtp rope",
+                    &k.rope_k,
+                    vec![&a.k32, &at.k_norm, &a.cos, &a.sin, &a.k16],
+                    None,
+                ),
+                (
+                    "mtp kv append",
+                    &k.kv_k,
+                    vec![&a.k16, &at.kcache, &a.scalars_pos],
+                    None,
+                ),
+                (
+                    "mtp kv append",
+                    &k.kv_v,
+                    vec![&a.v32, &at.vcache, &a.scalars_pos],
+                    None,
+                ),
+            ];
+            // The head's cache is its own and shorter than the model's, so
+            // it crosses the split threshold later -- but it crosses it.
+            let nsplit = self.nsplit(self.mtp_pos + t);
+            if nsplit >= attn_min_splits() {
+                d.push((
+                    "mtp attention",
+                    &k.attn_split,
+                    vec![
+                        &a.q16,
+                        &at.kcache,
+                        &at.vcache,
+                        &a.part_m,
+                        &a.part_l,
+                        &a.part_acc,
+                        &a.scalars_pos,
+                    ],
+                    Some([self.cfg.kv_heads, nsplit]),
+                ));
+                d.push((
+                    "mtp attention",
+                    &k.attn_combine,
+                    vec![&a.part_m, &a.part_l, &a.part_acc, &a.attn, &a.scalars_nsplit],
+                    None,
+                ));
+            } else {
+                d.push((
+                    "mtp attention",
+                    &k.attn,
+                    vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
+                    None,
+                ));
+            }
+            d.extend([
+                ("mtp gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated], None),
+                (
+                    "mtp matvec o_proj",
+                    &k.mv[&(at.o.cols, at.o.rows, true)],
+                    at.o.bind(&a.gated, Some(&a.x), &a.x2),
+                    None,
+                ),
+                ("mtp rmsnorm", &k.rms, vec![&a.x2, &f.norm, &a.h], None),
+                (
+                    "mtp matvec gate/up",
+                    &k.mv[&(f.gate.cols, f.gate.rows, false)],
+                    f.gate.bind(&a.h, None, &a.ffn_g),
+                    None,
+                ),
+                (
+                    "mtp matvec gate/up",
+                    &k.mv[&(f.up.cols, f.up.rows, false)],
+                    f.up.bind(&a.h, None, &a.ffn_u),
+                    None,
+                ),
+                (
+                    "mtp silu_mul",
+                    &k.silu,
+                    vec![&a.ffn_g, &a.ffn_u, &a.ffn_a],
+                    None,
+                ),
+                (
+                    "mtp matvec down",
+                    &k.mv[&(f.down.cols, f.down.rows, true)],
+                    f.down.bind(&a.ffn_a, Some(&a.x2), &a.x),
+                    None,
+                ),
+            ]);
+            d
+        }
+
         fn mtp_plan(&self) -> Vec<(&Pipeline, Vec<&Buffer>)> {
             let (m, a, k) = (
                 self.mtp.as_ref().expect("checked by the caller"),
@@ -1043,11 +1464,25 @@ mod gpu {
                 0,
                 &[len as u32, len.div_ceil(ATTN_BK) as u32],
             );
+            self.gpu.write(&a.scalars_len, 0, &[len as u32]);
+            // The combine takes the live split count and how many chunks
+            // of COMBINE_CHUNK they make -- not the head count. Writing the
+            // wrong second scalar makes it reduce a prefix of the splits
+            // and quietly drop the rest of the cache.
+            let nsplit = self.nsplit(len);
+            self.gpu.write(
+                &a.scalars_nsplit,
+                0,
+                &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
+            );
 
-            let plan = self.plan();
+            let mut plan = self.plan();
+            if !self.skip.is_empty() {
+                plan.retain(|d| !self.skip.iter().any(|s| d.0 == s));
+            }
             if self.sync {
-                for (label, p, b) in &plan {
-                    let (_, t) = self.gpu.run_launches(&[(p, b.as_slice(), None)]);
+                for (label, p, b, g) in &plan {
+                    let (_, t) = self.gpu.run_launches(&[(p, b.as_slice(), *g)]);
                     let mut prof = self.prof.borrow_mut();
                     let e = prof.entry(label).or_insert((0, 0.0));
                     e.0 += 1;
@@ -1056,7 +1491,7 @@ mod gpu {
             } else {
                 let steps: Vec<Step<'_>> = plan
                     .iter()
-                    .map(|(_, p, b)| (*p, b.as_slice(), None))
+                    .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
                     .collect();
                 self.gpu.run_launches(&steps);
             }
@@ -1077,6 +1512,19 @@ mod gpu {
         /// kernel, so the batch lands exactly where the same tokens would
         /// have one at a time.
         pub fn forward(&mut self, tokens: &[u32], all: bool) -> Result<Vec<Vec<f32>>, String> {
+            self.forward_with(tokens, all, false)
+        }
+
+        /// [`Self::forward`] recording where each gated-delta layer stood
+        /// after every token, so a rejected speculative batch can be undone
+        /// with a copy instead of a replay. Prefill does not ask for this:
+        /// it never rolls back, and the snapshots are 3.1 MB a layer.
+        fn forward_with(
+            &mut self,
+            tokens: &[u32],
+            all: bool,
+            snap: bool,
+        ) -> Result<Vec<Vec<f32>>, String> {
             let t = tokens.len();
             if t == 0 || t > MAX_BATCH {
                 return Err(format!("a batch is 1..={MAX_BATCH} tokens, not {t}"));
@@ -1104,15 +1552,33 @@ mod gpu {
                 0,
                 &[pos0 as u32, (pos0 + t).div_ceil(ATTN_BK) as u32],
             );
+            // The split path's two scalars: live splits, and the chunks of
+            // COMBINE_CHUNK they make. The last token of the batch is the
+            // one that reaches furthest, so it sets the count.
+            let nsplit = self.nsplit(pos0 + t);
+            self.gpu.write(
+                &self.bacts.scalars_nsplit,
+                0,
+                &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
+            );
 
-            let plan = self.batch_plan(t);
+            let mut plan = self.batch_plan_with(t, snap);
+            if !self.skip.is_empty() {
+                // Exact labels, not prefixes. `"matvec qkv"` starts with
+                // `"matvec q"`, so a prefix match silently ablates two call
+                // sites and attributes both to one -- which is how the
+                // query projection came to look like it cost 9% of prefill
+                // when its own shape runs at 213 GB/s, the same as the
+                // feed-forward's.
+                plan.retain(|d| !self.skip.iter().any(|s| d.0 == s));
+            }
             // Same as `step`: with LEX_SYNC, dispatch one at a time and
             // record where the time went. Without it prefill can only be
             // measured in total, which is enough to see a chunk size cost
             // more than the one below it and not enough to say why.
             if self.sync {
-                for (label, p, b) in &plan {
-                    let (_, ms) = self.gpu.run_launches(&[(p, b.as_slice(), None)]);
+                for (label, p, b, g) in &plan {
+                    let (_, ms) = self.gpu.run_launches(&[(p, b.as_slice(), *g)]);
                     let mut prof = self.prof.borrow_mut();
                     let e = prof.entry(label).or_insert((0, 0.0));
                     e.0 += 1;
@@ -1121,7 +1587,7 @@ mod gpu {
             } else {
                 let steps: Vec<Step<'_>> = plan
                     .iter()
-                    .map(|(_, p, b)| (*p, b.as_slice(), None))
+                    .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
                     .collect();
                 self.gpu.run_launches(&steps);
             }
@@ -1134,9 +1600,11 @@ mod gpu {
                 self.gpu.download(&self.bacts.logits, &mut flat);
                 Ok(flat.chunks(v).map(<[f32]>::to_vec).collect())
             } else {
-                let mut flat = vec![0.0f32; t * v];
-                self.gpu.download(&self.bacts.logits, &mut flat);
-                Ok(vec![flat[(t - 1) * v..].to_vec()])
+                // Only the last row is wanted, so only the last row moves.
+                let mut last = vec![0.0f32; v];
+                self.gpu
+                    .download_at(&self.bacts.logits, (t - 1) * v, &mut last);
+                Ok(vec![last])
             }
         }
 
@@ -1181,6 +1649,11 @@ mod gpu {
                     want.push((c.heads * c.head_dim, c.hidden, true));
                 }
             }
+            // `fc` is the only shape the draft head adds, and warming the
+            // head over a prompt runs it batched like everything else.
+            if self.mtp.is_some() {
+                want.push((2 * c.hidden, c.hidden, false));
+            }
             for key in want {
                 if let std::collections::hash_map::Entry::Vacant(slot) = mv.entry(key) {
                     let (n_in, n_out, res) = key;
@@ -1189,7 +1662,15 @@ mod gpu {
                     // and gated, not `h`, so they keep f32 inputs.
                     // Every batched matmul now reads a narrowed buffer
                     // except o_proj, which reads `gated`.
-                    let xt = if res && n_in == c.heads * c.head_dim {
+                    // The draft head's `fc` is the exception: it reads a
+                    // fused input built on the host rather than a narrowed
+                    // `h`, and the decode path's `fc` reads it in f32. The
+                    // two write the same cache -- the batched one warming
+                    // it over a prompt, the decode one drafting from it --
+                    // so they have to agree. Handed f16 it reads the f32
+                    // bytes as half pairs, and the head answers with one
+                    // constant token whatever it is asked.
+                    let xt = if n_in == 2 * c.hidden || (res && n_in == c.heads * c.head_dim) {
                         DType::F32
                     } else {
                         X_DTYPE
@@ -1220,6 +1701,7 @@ mod gpu {
                 heads: c.kv_heads,
                 kv_cap: self.cap,
             };
+            let want_snap = t <= SPEC_MAX && self.snap.is_some();
             let b = Batch {
                 rms: compile(
                     gpu,
@@ -1297,12 +1779,29 @@ mod gpu {
                     64,
                 )?,
                 attn: compile(gpu, &attn.build_causal(t)?, 128)?,
+                attn_split: compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128)?,
+                attn_combine: compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128)?,
                 mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
                 silu: compile(
                     gpu,
                     &lex_front::llama::silu_mul(t * c.ffn, THREADS, X_DTYPE)?,
                     THREADS,
                 )?,
+                // Only a batch a verify can roll back from, and only when
+                // there is a draft head to reject anything in the first
+                // place. Prefill runs at MAX_BATCH and skips both.
+                delta_snap: (want_snap)
+                    .then(|| compile(gpu, &delta.build_steps_snap(t)?, 128))
+                    .transpose()?,
+                conv_snap: (want_snap)
+                    .then(|| {
+                        compile(
+                            gpu,
+                            &build_conv_silu_rows_snap(t, ch, c.conv_kernel, 256)?,
+                            THREADS,
+                        )
+                    })
+                    .transpose()?,
             };
             self.batches.insert(t, b);
             Ok(())
@@ -1329,15 +1828,31 @@ mod gpu {
         }
 
         /// Every dispatch of a batch of `t`, in order.
-        fn batch_plan(&self, t: usize) -> Vec<(&'static str, &Pipeline, Vec<&Buffer>)> {
+        /// [`Self::batch_plan`], optionally writing per-token snapshots of
+        /// each gated-delta layer's memory.
+        ///
+        /// `snap` is what a speculative verify asks for: the layers whose
+        /// state a rejected batch would otherwise have to replay record
+        /// where they were after every token, so the undo becomes a copy.
+        /// It falls back to the ordinary kernels when the batch is larger
+        /// than `SPEC_MAX` or the checkpoint has no draft head, and the
+        /// caller then pays the replay as before.
+        fn batch_plan_with(&self, t: usize, snap: bool) -> Vec<Dispatch<'_>> {
             let a = &self.bacts;
             let k = &self.batches[&t];
-            let mut d: Vec<(&'static str, &Pipeline, Vec<&Buffer>)> = vec![];
+            // The gated-delta layers in order, for indexing the snapshots.
+            let mut li = 0usize;
+            let snap = self
+                .snap
+                .as_ref()
+                .filter(|_| snap && k.delta_snap.is_some() && k.conv_snap.is_some());
+            let mut d: Vec<Dispatch<'_>> = vec![];
             for layer in &self.layers {
                 d.push((
                     "rmsnorm",
                     &k.rms,
                     vec![&a.x, layer_norm(&layer.mixer), &a.h],
+                    None,
                 ));
                 match &layer.mixer {
                     Mixer::Linear(l) => {
@@ -1345,40 +1860,79 @@ mod gpu {
                             "matvec qkv",
                             &k.mv[&(l.qkv.cols, l.qkv.rows, false)],
                             l.qkv.bind(&a.h, None, &a.qkv),
+                            None,
                         ));
                         d.push((
                             "matvec z",
                             &k.mv[&(l.z.cols, l.z.rows, false)],
                             l.z.bind(&a.h, None, &a.z),
+                            None,
                         ));
-                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.a, &a.a]));
-                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.b, &a.b]));
-                        d.push((
-                            "conv",
-                            &k.conv,
-                            vec![&l.conv_state, &a.qkv, &l.conv_w, &a.conv],
-                        ));
-                        d.push(("delta q/k", &k.qk_q, vec![&a.conv, &a.qe]));
-                        d.push(("delta q/k", &k.qk_k, vec![&a.conv, &a.ke]));
+                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.a, &a.a], None));
+                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.b, &a.b], None));
+                        d.push(match snap {
+                            Some(s) => (
+                                "conv",
+                                k.conv_snap.as_ref().expect("checked"),
+                                vec![
+                                    &l.conv_state,
+                                    &a.qkv,
+                                    &l.conv_w,
+                                    &a.conv,
+                                    &s.rows_conv[li],
+                                ],
+                                None,
+                            ),
+                            None => (
+                                "conv",
+                                &k.conv,
+                                vec![&l.conv_state, &a.qkv, &l.conv_w, &a.conv],
+                                None,
+                            ),
+                        });
+                        d.push(("delta q/k", &k.qk_q, vec![&a.conv, &a.qe], None));
+                        d.push(("delta q/k", &k.qk_k, vec![&a.conv, &a.ke], None));
                         d.push((
                             "gates",
                             &k.gates,
                             vec![&a.a, &a.b, &l.amp, &l.dt_bias, &a.g, &a.beta],
+                            None,
                         ));
-                        d.push((
-                            "delta step",
-                            &k.delta,
-                            vec![&l.state, &a.qe, &a.ke, &a.conv, &a.g, &a.beta, &a.y],
-                        ));
+                        d.push(match snap {
+                            Some(s) => (
+                                "delta step",
+                                k.delta_snap.as_ref().expect("checked"),
+                                vec![
+                                    &l.state,
+                                    &a.qe,
+                                    &a.ke,
+                                    &a.conv,
+                                    &a.g,
+                                    &a.beta,
+                                    &a.y,
+                                    &s.rows_state[li],
+                                ],
+                                None,
+                            ),
+                            None => (
+                                "delta step",
+                                &k.delta,
+                                vec![&l.state, &a.qe, &a.ke, &a.conv, &a.g, &a.beta, &a.y],
+                                None,
+                            ),
+                        });
+                        li += 1;
                         d.push((
                             "gated norm",
                             &k.gated_norm,
                             vec![&a.y, &l.gnorm, &a.z, &a.mixed],
+                            None,
                         ));
                         d.push((
                             "matvec out_proj",
                             &k.mv[&(l.out.cols, l.out.rows, true)],
                             l.out.bind(&a.mixed, Some(&a.x), &a.x2),
+                            None,
                         ));
                     }
                     Mixer::Attn(at) => {
@@ -1386,90 +1940,147 @@ mod gpu {
                             "matvec q",
                             &k.mv[&(at.q.cols, at.q.rows, false)],
                             at.q.bind(&a.h, None, &a.q32),
+                            None,
                         ));
                         d.push((
                             "matvec k/v",
                             &k.mv[&(at.k.cols, at.k.rows, false)],
                             at.k.bind(&a.h, None, &a.k32),
+                            None,
                         ));
                         d.push((
                             "matvec k/v",
                             &k.mv[&(at.v.cols, at.v.rows, false)],
                             at.v.bind(&a.h, None, &a.v32),
+                            None,
                         ));
                         d.push((
                             "rope",
                             &k.rope_q,
                             vec![&a.q32, &at.q_norm, &a.cos, &a.sin, &a.q16, &a.gate],
+                            None,
                         ));
                         d.push((
                             "rope",
                             &k.rope_k,
                             vec![&a.k32, &at.k_norm, &a.cos, &a.sin, &a.k16],
+                            None,
                         ));
                         d.push((
                             "kv append",
                             &k.kv_k,
                             vec![&a.k16, &at.kcache, &a.scalars_pos],
+                            None,
                         ));
                         d.push((
                             "kv append",
                             &k.kv_v,
                             vec![&a.v32, &at.vcache, &a.scalars_pos],
+                            None,
                         ));
-                        d.push((
-                            "attention",
-                            &k.attn,
-                            vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
-                        ));
-                        d.push(("gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated]));
+                        // The serial causal kernel scans the cache with one
+                        // threadgroup per KV head, so a verify of two tokens
+                        // went from 40.6 ms at no context to 67.9 ms at 1440
+                        // -- 1.84 passes, which is why speculation lost as
+                        // context grew. Past the threshold the cache is cut
+                        // across threadgroups instead, each query still
+                        // masked to its own position, and a second kernel
+                        // merges the partials per query row.
+                        let nsplit = self.nsplit(self.pos + t);
+                        if nsplit >= attn_min_splits() {
+                            d.push((
+                                "attention",
+                                &k.attn_split,
+                                vec![
+                                    &a.q16,
+                                    &at.kcache,
+                                    &at.vcache,
+                                    &a.part_m,
+                                    &a.part_l,
+                                    &a.part_acc,
+                                    &a.scalars_pos,
+                                ],
+                                Some([self.cfg.kv_heads, nsplit]),
+                            ));
+                            d.push((
+                                "attention",
+                                &k.attn_combine,
+                                vec![
+                                    &a.part_m,
+                                    &a.part_l,
+                                    &a.part_acc,
+                                    &a.attn,
+                                    &a.scalars_nsplit,
+                                ],
+                                None,
+                            ));
+                        } else {
+                            d.push((
+                                "attention",
+                                &k.attn,
+                                vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
+                                None,
+                            ));
+                        }
+                        d.push(("gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated], None));
                         d.push((
                             "matvec o_proj",
                             &k.mv[&(at.o.cols, at.o.rows, true)],
                             at.o.bind(&a.gated, Some(&a.x), &a.x2),
+                            None,
                         ));
                     }
                 }
                 let f = &layer.ffn;
-                d.push(("rmsnorm", &k.rms, vec![&a.x2, &f.norm, &a.h]));
+                d.push(("rmsnorm", &k.rms, vec![&a.x2, &f.norm, &a.h], None));
                 d.push((
                     "matvec gate/up",
                     &k.mv[&(f.gate.cols, f.gate.rows, false)],
                     f.gate.bind(&a.h, None, &a.ffn_g),
+                    None,
                 ));
                 d.push((
                     "matvec gate/up",
                     &k.mv[&(f.up.cols, f.up.rows, false)],
                     f.up.bind(&a.h, None, &a.ffn_u),
+                    None,
                 ));
-                d.push(("silu_mul", &k.silu, vec![&a.ffn_g, &a.ffn_u, &a.ffn_a]));
+                d.push((
+                    "silu_mul",
+                    &k.silu,
+                    vec![&a.ffn_g, &a.ffn_u, &a.ffn_a],
+                    None,
+                ));
                 d.push((
                     "matvec down",
                     &k.mv[&(f.down.cols, f.down.rows, true)],
                     f.down.bind(&a.ffn_a, Some(&a.x2), &a.x),
+                    None,
                 ));
             }
             // Every token's logits: a verify needs them all, and the head
             // is 0.7 GB against the 14.5 the batch has already moved.
             let out = &self.lm_head;
-            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h]));
+            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
             d.push((
                 "matvec lm head",
                 &k.mv[&(out.cols, out.rows, false)],
                 out.bind(&a.h, None, &a.logits),
+                None,
             ));
             d
         }
 
         /// Every dispatch of one step, in order.
-        fn plan(&self) -> Vec<(&'static str, &Pipeline, Vec<&Buffer>)> {
+        fn plan(&self) -> Vec<Dispatch<'_>> {
             let (a, k) = (&self.acts, &self.k);
-            let mut d: Vec<(&'static str, &Pipeline, Vec<&Buffer>)> = vec![];
+            let mut d: Vec<Dispatch<'_>> = vec![];
             for layer in &self.layers {
                 d.push((
                     "rmsnorm",
                     &k.rms,
                     vec![&a.x, layer_norm(&layer.mixer), &a.h],
+                    None,
                 ));
                 match &layer.mixer {
                     Mixer::Linear(l) => {
@@ -1477,36 +2088,47 @@ mod gpu {
                             "matvec qkv",
                             self.mv(&l.qkv, false),
                             l.qkv.bind(&a.h, None, &a.qkv),
+                            None,
                         ));
-                        d.push(("matvec z", self.mv(&l.z, false), l.z.bind(&a.h, None, &a.z)));
-                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.a, &a.a]));
-                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.b, &a.b]));
+                        d.push((
+                            "matvec z",
+                            self.mv(&l.z, false),
+                            l.z.bind(&a.h, None, &a.z),
+                            None,
+                        ));
+                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.a, &a.a], None));
+                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.b, &a.b], None));
                         d.push((
                             "conv",
                             &k.conv,
                             vec![&l.conv_state, &a.qkv, &l.conv_w, &a.conv],
+                            None,
                         ));
-                        d.push(("delta q/k", &k.qk_q, vec![&a.conv, &a.qe]));
-                        d.push(("delta q/k", &k.qk_k, vec![&a.conv, &a.ke]));
+                        d.push(("delta q/k", &k.qk_q, vec![&a.conv, &a.qe], None));
+                        d.push(("delta q/k", &k.qk_k, vec![&a.conv, &a.ke], None));
                         d.push((
                             "gates",
                             &k.gates,
                             vec![&a.a, &a.b, &l.amp, &l.dt_bias, &a.g, &a.beta],
+                            None,
                         ));
                         d.push((
                             "delta step",
                             &k.delta,
                             vec![&l.state, &a.qe, &a.ke, &a.conv, &a.g, &a.beta, &a.y],
+                            None,
                         ));
                         d.push((
                             "gated norm",
                             &k.gated_norm,
                             vec![&a.y, &l.gnorm, &a.z, &a.mixed],
+                            None,
                         ));
                         d.push((
                             "matvec out_proj",
                             self.mv(&l.out, true),
                             l.out.bind(&a.mixed, Some(&a.x), &a.x2),
+                            None,
                         ));
                     }
                     Mixer::Attn(at) => {
@@ -1514,74 +2136,129 @@ mod gpu {
                             "matvec q",
                             self.mv(&at.q, false),
                             at.q.bind(&a.h, None, &a.q32),
+                            None,
                         ));
                         d.push((
                             "matvec k/v",
                             self.mv(&at.k, false),
                             at.k.bind(&a.h, None, &a.k32),
+                            None,
                         ));
                         d.push((
                             "matvec k/v",
                             self.mv(&at.v, false),
                             at.v.bind(&a.h, None, &a.v32),
+                            None,
                         ));
                         d.push((
                             "rope",
                             &k.rope_q,
                             vec![&a.q32, &at.q_norm, &a.cos, &a.sin, &a.q16, &a.gate],
+                            None,
                         ));
                         d.push((
                             "rope",
                             &k.rope_k,
                             vec![&a.k32, &at.k_norm, &a.cos, &a.sin, &a.k16],
+                            None,
                         ));
                         d.push((
                             "kv append",
                             &k.kv_k,
                             vec![&a.k16, &at.kcache, &a.scalars_pos],
+                            None,
                         ));
                         d.push((
                             "kv append",
                             &k.kv_v,
                             vec![&a.v32, &at.vcache, &a.scalars_pos],
+                            None,
                         ));
-                        d.push((
-                            "attention",
-                            &k.attn,
-                            vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
-                        ));
-                        d.push(("gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated]));
+                        // One threadgroup per KV head scanning the whole
+                        // cache is fine while the cache is short, and most
+                        // of a step once it is not: 16.6 ms of a 52.16 ms
+                        // step at 1440 positions against 0.58 ms at zero.
+                        // Past ATTN_MIN_SPLITS the cache is cut into splits
+                        // attended in parallel, their partial softmaxes
+                        // merged by a second kernel.
+                        let nsplit = self.nsplit(self.pos + 1);
+                        if nsplit >= attn_min_splits() {
+                            d.push((
+                                "attention",
+                                &k.attn_split,
+                                vec![
+                                    &a.q16,
+                                    &at.kcache,
+                                    &at.vcache,
+                                    &a.part_m,
+                                    &a.part_l,
+                                    &a.part_acc,
+                                    &a.scalars_len,
+                                ],
+                                Some([self.cfg.kv_heads, nsplit]),
+                            ));
+                            d.push((
+                                "attention",
+                                &k.attn_combine,
+                                vec![
+                                    &a.part_m,
+                                    &a.part_l,
+                                    &a.part_acc,
+                                    &a.attn,
+                                    &a.scalars_nsplit,
+                                ],
+                                None,
+                            ));
+                        } else {
+                            d.push((
+                                "attention",
+                                &k.attn,
+                                vec![&a.q16, &at.kcache, &at.vcache, &a.attn, &a.scalars_attn],
+                                None,
+                            ));
+                        }
+                        d.push(("gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated], None));
                         d.push((
                             "matvec o_proj",
                             self.mv(&at.o, true),
                             at.o.bind(&a.gated, Some(&a.x), &a.x2),
+                            None,
                         ));
                     }
                 }
                 let f = &layer.ffn;
-                d.push(("rmsnorm", &k.rms, vec![&a.x2, &f.norm, &a.h]));
+                d.push(("rmsnorm", &k.rms, vec![&a.x2, &f.norm, &a.h], None));
                 d.push((
                     "matvec gate/up",
                     self.mv(&f.gate, false),
                     f.gate.bind(&a.h, None, &a.ffn_g),
+                    None,
                 ));
                 d.push((
                     "matvec gate/up",
                     self.mv(&f.up, false),
                     f.up.bind(&a.h, None, &a.ffn_u),
+                    None,
                 ));
-                d.push(("silu_mul", &k.silu, vec![&a.ffn_g, &a.ffn_u, &a.ffn_a]));
+                d.push((
+                    "silu_mul",
+                    &k.silu,
+                    vec![&a.ffn_g, &a.ffn_u, &a.ffn_a],
+                    None,
+                ));
                 d.push((
                     "matvec down",
                     self.mv(&f.down, true),
                     f.down.bind(&a.ffn_a, Some(&a.x2), &a.x),
+                    None,
                 ));
             }
-            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h]));
+            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
             d.push((
                 "matvec lm head",
                 self.mv(&self.lm_head, false),
                 self.lm_head.bind(&a.h, None, &a.logits),
+                None,
             ));
             d
         }

@@ -1,4 +1,4 @@
-"""Read Qwen3.5 (MLX, nvfp4) tensors out of the local Ollama store.
+"""Read Qwen3.8 (MLX, nvfp4) tensors out of the local Ollama store.
 
     python3 scripts/qwen_nvfp4.py --model qwen3.8:27b-mlx --tensor model.language_model.layers.0.mlp.gate_proj.weight
 

@@ -29,7 +29,7 @@ fn main() -> Result<(), String> {
         "matrix", "n_in", "n_out", "MB", "us", "GB/s"
     );
     let shapes = [
-        // Qwen3.5-27B (MLX, nvfp4), the decode matvecs by size.
+        // Qwen3.8-27B (MLX, nvfp4), the decode matvecs by size.
         ("qwen gate/up (nvfp4)", 5120, 17408, QLayout::NVFP4),
         ("qwen down (nvfp4)", 17408, 5120, QLayout::NVFP4),
         ("qwen qkv-in (nvfp4)", 5120, 12288, QLayout::NVFP4),
@@ -129,7 +129,14 @@ fn main() -> Result<(), String> {
         "  {:<16} {:>6} {:>4} {:>6} {:>9} {:>10} {:>9}",
         "gate/up, batched", "tokens", "bo", "x", "us", "GB/s", "ms/token"
     );
-    let (n_in, n_out) = (5120usize, 17408usize);
+    // The feed-forward by default; LEX_MV_SHAPE=q measures the query
+    // projection instead, which ablation says costs ~9% of prefill at
+    // every prompt length -- a constant, so not the quadratic attention
+    // term, and worth checking against its own shape.
+    let (n_in, n_out) = match std::env::var("LEX_MV_SHAPE").as_deref() {
+        Ok("q") => (5120usize, 12288usize),
+        _ => (5120usize, 17408usize),
+    };
     // One set of weights for every configuration: allocating a gigabyte
     // per configuration made the numbers wander by 3x between runs.
     let probe = matmul_q(2, n_in, n_out, 16, n_in, QLayout::NVFP4, false)?;

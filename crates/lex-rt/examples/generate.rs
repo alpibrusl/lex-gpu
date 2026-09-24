@@ -15,7 +15,7 @@
 //! time prefill_s <s> decode_tok_s <tok/s> dispatches <n>
 //! ```
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn main() -> Result<(), String> {
     use std::time::Instant;
 
@@ -75,7 +75,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn main() {
     eprintln!("generate needs a Metal device");
     std::process::exit(1);

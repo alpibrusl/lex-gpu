@@ -75,7 +75,7 @@ pub struct QLayout {
     pub six: bool,
     /// NVFP4 (see [`Op::DequantFp4`]): 4-bit E2M1 values two per byte, an
     /// FP8 E4M3 scale per group, and one f32 scale for the whole tensor,
-    /// held per row. 4.5 bits per weight, what Qwen3.5's MLX build uses.
+    /// held per row. 4.5 bits per weight, what Qwen3.8's MLX build uses.
     pub fp4: bool,
 }
 

@@ -202,10 +202,10 @@ pub fn log_softmax(logits: &[f32]) -> Vec<f64> {
     logits.iter().map(|&x| x as f64 - lz).collect()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use gpu::{Attention, Runner};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gpu {
     use std::cell::RefCell;
     use std::collections::hash_map::Entry;
@@ -220,8 +220,8 @@ mod gpu {
     };
     use lex_front::{Program, check};
     use lex_ir::{DType, Space, Target};
-    use lex_metal::{Buffer, Gpu, Pipeline, Step};
-    use lex_msl::program::lower;
+    use crate::dev::{Buffer, Gpu, Pipeline, Step};
+    use lex_msl::program::lower_with;
 
     use super::{Config, QMat, Weights};
 
@@ -294,7 +294,7 @@ mod gpu {
             let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
             format!("`{}` does not check:\n{}", prog.name, msgs.join("\n"))
         })?;
-        gpu.build_lowered(&lower(prog, target, threads)?)
+        gpu.build_lowered(&lower_with(prog, target, threads, crate::dev::dialect())?)
     }
 
     /// Which matvec pipeline a matrix needs: (cols, rows, layout, residual).

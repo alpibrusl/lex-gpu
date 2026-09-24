@@ -37,6 +37,18 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // Decode speed against context, the way scripts/ollama_bench.py
+    // measures Ollama: fill N positions, then time the tokens after them.
+    // Qwen should barely move -- 48 of its 64 layers carry a fixed-size
+    // state rather than a cache -- and that is a claim worth checking
+    // rather than repeating.
+    let context: usize = std::env::var("LEX_CONTEXT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if context > ids.len() {
+        ids.extend((ids.len()..context).map(|i| 1000 + (i as u32 * 7919) % 200000));
+    }
     let mut rt = Runner::load(&model, ids.len() + steps + depth + 8)?;
     if !rt.has_mtp() {
         return Err(format!("{model} carries no mtp head"));
@@ -47,9 +59,46 @@ fn main() -> Result<(), String> {
             .expect("logits") as u32
     };
 
-    let mut logits = vec![];
-    for &t in &ids {
-        logits = rt.step(t)?;
+    // LEX_SKIP=attention leaves that call site out, so the difference
+    // says what it costs at this context. Decode on this model should
+    // barely move with context -- 48 of 64 layers carry a fixed-size
+    // state -- so whatever does move is in the other 16.
+    if let Ok(s) = std::env::var("LEX_SKIP") {
+        rt.skip = s.split(',').map(String::from).collect();
+    }
+
+    // `prefill` feeds the prompt batched *and* runs the draft head over
+    // it, so the head's cache ends up holding the same history the model's
+    // does. LEX_NOWARM feeds it a token at a time instead, which is what
+    // left the head drafting from position 0 at a context of 1440.
+    fn fill(rt: &mut Runner, ids: &[u32]) -> Result<Vec<f32>, String> {
+        if std::env::var_os("LEX_NOWARM").is_some() {
+            let mut logits = vec![];
+            for &t in ids {
+                logits = rt.step(t)?;
+            }
+            return Ok(logits);
+        }
+        rt.prefill(ids)
+    }
+
+    let mut logits = fill(&mut rt, &ids)?;
+
+    // The draft head's attention cache only advances when it drafts, so
+    // after a prompt fed with `step` it is empty while the model is deep
+    // into a sequence: it guesses from a state the text never passed
+    // through. LEX_WARM drafts (and throws away) this many tokens first,
+    // to find out how much history the head actually needs -- if a short
+    // window recovers acceptance, warming is cheap; if only the whole
+    // prompt does, the head has to be run over the prompt properly.
+    let warm: usize = std::env::var("LEX_WARM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for _ in 0..warm {
+        let next = argmax(&logits);
+        rt.draft(1, next)?;
+        logits = rt.step(next)?;
     }
 
     // Record first, score afterwards: the draft made at step `s` is only
@@ -69,6 +118,20 @@ fn main() -> Result<(), String> {
         let t = Instant::now();
         logits = rt.step(next)?;
         step_ms += t.elapsed().as_secs_f64() * 1e3;
+    }
+
+    // One line per round: whether the first draft was right.
+    //
+    // `actual` is the model's own greedy continuation and does not depend
+    // on the drafts at all, so two runs over the same ids predict exactly
+    // the same positions. That makes the comparison paired, and a paired
+    // test settles in 191 rounds what an unpaired one leaves at 1.5 sigma.
+    if std::env::var_os("LEX_PAIRS").is_some() {
+        for (s, d) in drafts.iter().enumerate() {
+            if let (Some(&g), Some(&want)) = (d.first(), actual.get(s + 1)) {
+                println!("PAIR {s} {} {g} {want}", u8::from(g == want));
+            }
+        }
     }
 
     // A draft counts only while every draft before it was right, because a
@@ -92,10 +155,7 @@ fn main() -> Result<(), String> {
 
     // What it is all for: the same tokens, in less time.
     rt.reset();
-    let mut logits = vec![];
-    for &t in &ids {
-        logits = rt.step(t)?;
-    }
+    let logits = fill(&mut rt, &ids)?;
     let mut got = 0usize;
     let mut next = argmax(&logits);
     let t = Instant::now();

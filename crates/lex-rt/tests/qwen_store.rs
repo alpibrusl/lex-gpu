@@ -1,4 +1,4 @@
-//! Reading Qwen3.5 out of the local Ollama store.
+//! Reading Qwen3.8 out of the local Ollama store.
 //!
 //! Skips itself when the model is not pulled, as the Llama tests do.
 

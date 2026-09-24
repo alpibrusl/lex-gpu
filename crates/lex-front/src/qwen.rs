@@ -1,4 +1,4 @@
-//! Qwen3.5's linear-attention layers, as typed tile programs.
+//! Qwen3.8's linear-attention layers, as typed tile programs.
 //!
 //! Three quarters of the model's 64 layers are "gated delta" layers rather
 //! than attention: instead of a growing KV cache they carry a fixed state
@@ -30,7 +30,7 @@ fn reg(shape: &[usize]) -> TileTy {
 /// Shape of one linear-attention layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeltaNet {
-    /// Value heads (Qwen3.5-27B: 48).
+    /// Value heads (Qwen3.8-27B: 48).
     pub v_heads: usize,
     /// Key heads; each serves `v_heads / k_heads` value heads (16).
     pub k_heads: usize,
@@ -74,6 +74,25 @@ impl DeltaNet {
         self.build_steps(1)
     }
 
+    /// [`DeltaNet::build_steps`] that also writes the state after *every*
+    /// token to `snap`, a `[tokens * v_heads * v_dim, k_dim]` buffer.
+    ///
+    /// This is what makes a rejected speculative batch cheap. The state is
+    /// recurrent, so a verify that runs further than the model agreed with
+    /// has to be undone; without a record of the intermediate states the
+    /// only way back is to restore the pre-batch copy and replay the
+    /// accepted prefix, which is a whole extra pass over the weights --
+    /// 38.6 ms against a 42.8 ms verify, on 28% of rounds.
+    ///
+    /// Every token is written, including the last, whose block simply
+    /// duplicates what goes to `state`. Skipping it would need the loop
+    /// body to know it is on the final iteration, which a `for_range` over
+    /// a register carry cannot express, and the write is 1/`tokens` of a
+    /// cost that is already small beside what it removes.
+    pub fn build_steps_snap(&self, tokens: usize) -> Result<Program, String> {
+        self.steps(tokens, true)
+    }
+
     /// `tokens` steps of the delta rule in one pass over the state.
     ///
     /// The recurrence is sequential — token `t + 1` sees the state token
@@ -89,6 +108,10 @@ impl DeltaNet {
     /// rows, values at `v_base`), `g`, `beta` and `y`, each
     /// `[tokens * v_heads * v_dim]`.
     pub fn build_steps(&self, tokens: usize) -> Result<Program, String> {
+        self.steps(tokens, false)
+    }
+
+    fn steps(&self, tokens: usize, snap: bool) -> Result<Program, String> {
         use Arg::{Borrow, Move};
         let c = *self;
         if c.v_heads == 0 || c.k_heads == 0 || !c.v_heads.is_multiple_of(c.k_heads) {
@@ -112,7 +135,8 @@ impl DeltaNet {
         let (hv, dk, dv, rows) = (c.v_heads, c.k_dim, c.v_dim, c.rows);
         let gates = hv * dv;
         let mut b = Builder::new(&format!(
-            "delta_step{tokens}_h{hv}k{}_d{dk}x{dv}_r{rows}",
+            "delta_step{tokens}{}_h{hv}k{}_d{dk}x{dv}_r{rows}",
+            if snap { "s" } else { "" },
             c.k_heads
         ));
         let ps = b.param("state", DType::F32, &[hv * dv, dk], true);
@@ -122,6 +146,9 @@ impl DeltaNet {
         let pg = b.param("g", DType::F32, &[tokens * gates], false);
         let pb = b.param("beta", DType::F32, &[tokens * gates], false);
         let py = b.param("y", DType::F32, &[tokens * gates], true);
+        // Last, so a caller that does not want snapshots binds the same
+        // buffers in the same order.
+        let psnap = snap.then(|| b.param("snap", DType::F32, &[tokens * hv * dv, dk], true));
         let chunk = b.grid(dv / rows);
         let head = b.grid2(hv);
 
@@ -184,6 +211,22 @@ impl DeltaNet {
                 let y = b.op("y", Op::Binary(BinOp::Mul, Borrow(s), Move(q)));
                 let y = b.op("y", Op::RowReduce(Reduce::Sum, Move(y)));
                 b.effect(Op::Store(Move(y), gate(py)));
+                // Borrowed, not moved: the tile carries on to the next
+                // token. The lowering reads the operand's location and
+                // does not care which it was; the checker does.
+                if let Some(psnap) = psnap {
+                    b.effect(Op::Store(
+                        Borrow(s),
+                        View {
+                            param: psnap,
+                            offset: vec![
+                                first.clone().plus(tok, hv * dv),
+                                IdxExpr::lit(0),
+                            ],
+                            shape: vec![rows, dk],
+                        },
+                    ));
+                }
                 vec![s]
             },
         );
@@ -296,17 +339,53 @@ pub fn build_conv_silu_rows(
     kernel: usize,
     chunk: usize,
 ) -> Result<Program, String> {
+    conv_silu_rows(tokens, channels, kernel, chunk, false)
+}
+
+/// [`build_conv_silu_rows`] that also writes the window after *every*
+/// token to `snap`, a `[tokens * (kernel - 1), channels]` buffer.
+///
+/// The companion to [`DeltaNet::build_steps_snap`]: a layer carries both
+/// a delta state and a convolution window, and a speculative rollback has
+/// to put back both or the next token is computed from a window that saw
+/// tokens the model never said.
+///
+/// The window is `kernel - 1` rows and this loop is unrolled over literal
+/// token indices, so each block is written from exactly the rows that
+/// would have been the state had the batch stopped there.
+pub fn build_conv_silu_rows_snap(
+    tokens: usize,
+    channels: usize,
+    kernel: usize,
+    chunk: usize,
+) -> Result<Program, String> {
+    conv_silu_rows(tokens, channels, kernel, chunk, true)
+}
+
+fn conv_silu_rows(
+    tokens: usize,
+    channels: usize,
+    kernel: usize,
+    chunk: usize,
+    snap: bool,
+) -> Result<Program, String> {
     use Arg::{Borrow, Move};
     if kernel < 2 || chunk == 0 || !channels.is_multiple_of(chunk) {
         return Err(format!(
             "conv of {channels} channels in chunks of {chunk}, kernel {kernel}"
         ));
     }
-    let mut b = Builder::new(&format!("conv_silu_c{channels}k{kernel}_x{chunk}"));
+    let mut b = Builder::new(&format!(
+        "conv_silu{}_c{channels}k{kernel}_x{chunk}",
+        if snap { "s" } else { "" }
+    ));
     let ps = b.param("state", DType::F32, &[kernel - 1, channels], true);
     let px = b.param("x", DType::F32, &[tokens, channels], false);
     let pw = b.param("w", DType::F32, &[kernel, channels], false);
     let py = b.param("y", DType::F32, &[tokens, channels], true);
+    let psnap = snap.then(|| {
+        b.param("snap", DType::F32, &[tokens * (kernel - 1), channels], true)
+    });
     let col = b.grid(channels / chunk);
 
     let tile = TileTy::new(DType::F32, &[1, chunk], Space::Reg);
@@ -340,6 +419,16 @@ pub fn build_conv_silu_rows(
         let sg = b.op("sg", Op::Unary(UnOp::Sigmoid, Borrow(acc)));
         let y = b.op("y", Op::Binary(BinOp::Mul, Move(acc), Move(sg)));
         b.effect(Op::Store(Move(y), slice(py, t)));
+        // The window as it stands having consumed tokens 0..=t, which is
+        // the same expression the final store below uses with t + 1.
+        if let Some(psnap) = psnap {
+            for i in 0..kernel - 1 {
+                let (param, r) =
+                    source(t as isize + 1 + i as isize - (kernel as isize - 1));
+                let v = b.op("v", Op::Load(slice(param, r), tile.clone()));
+                b.effect(Op::Store(Move(v), slice(psnap, t * (kernel - 1) + i)));
+            }
+        }
     }
 
     // The window the batch leaves: its own last `kernel - 1` rows, which
@@ -365,7 +454,7 @@ enum Rows {
     PerHead,
 }
 
-/// Qwen3.5's attention prologue: normalise each head, rotate the first
+/// Qwen3.8's attention prologue: normalise each head, rotate the first
 /// `rot` of its dimensions, and (for queries) take the sigmoid of the gate
 /// the projection carries alongside them.
 ///
@@ -608,7 +697,7 @@ pub fn build_delta_qk_rows(
     Ok(b.finish())
 }
 
-/// `y = W x` for a small dense matrix: Qwen3.5's `in_proj_a` and
+/// `y = W x` for a small dense matrix: Qwen3.8's `in_proj_a` and
 /// `in_proj_b` are 48 rows of bf16, too small to be worth quantising and
 /// the only unquantised matrices in a layer.
 pub fn build_matvec_dense(
@@ -679,7 +768,7 @@ pub fn build_matvec_dense_rows(
 /// The gated norm that ends a linear-attention layer: normalise each value
 /// head's output with a weight, then multiply by `silu(z)`.
 ///
-/// This norm is *not* one of the ones Qwen3.5 stores as a delta from 1:
+/// This norm is *not* one of the ones Qwen3.8 stores as a delta from 1:
 /// its weight is used as it comes.
 ///
 /// Parameters: `y [v_heads, v_dim]`, the norm weight `[1, v_dim]`,
@@ -800,4 +889,45 @@ pub fn reference(
         }
     }
     y
+}
+
+/// Copy block `which` of a `[blocks * rows, cols]` buffer over a
+/// `[rows, cols]` one.
+///
+/// What a rejected speculative batch does with the snapshots
+/// [`DeltaNet::build_steps_snap`] and [`build_conv_silu_rows_snap`] leave:
+/// putting back the state as of the last token the model agreed with.
+///
+/// `which` is baked in rather than passed as a runtime scalar. A batch has
+/// at most a handful of rollback targets, so compiling one pipeline per
+/// block costs nothing and keeps the addressing affine and checkable --
+/// and a wrong block is then a wrong *pipeline*, which the plan makes
+/// visible, rather than a wrong number in a buffer.
+pub fn copy_block(blocks: usize, rows: usize, cols: usize, which: usize) -> Result<Program, String> {
+    if which >= blocks || rows == 0 || cols == 0 {
+        return Err(format!("block {which} of {blocks} x [{rows}, {cols}]"));
+    }
+    let chunk = gcd(cols, 256).max(1);
+    let mut b = Builder::new(&format!("copy_block{which}of{blocks}_{rows}x{cols}"));
+    let src = b.param("src", DType::F32, &[blocks * rows, cols], false);
+    let dst = b.param("dst", DType::F32, &[rows, cols], true);
+    let row = b.grid(rows);
+    let tile = TileTy::new(DType::F32, &[1, chunk], Space::Reg);
+    for c in 0..cols / chunk {
+        let at = |param, base: usize| View {
+            param,
+            offset: vec![
+                IdxExpr::scaled(row, 1, base),
+                IdxExpr::lit(c * chunk),
+            ],
+            shape: vec![1, chunk],
+        };
+        let v = b.op("v", Op::Load(at(src, which * rows), tile.clone()));
+        b.effect(Op::Store(Arg::Move(v), at(dst, 0)));
+    }
+    Ok(b.finish())
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
 }

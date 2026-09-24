@@ -1,4 +1,4 @@
-//! Reading a Qwen3.5 (MLX) model out of Ollama's store.
+//! Reading a Qwen3.8 (MLX) model out of Ollama's store.
 //!
 //! Ollama keeps one blob per tensor, each headed by a safetensors header:
 //! an 8-byte length, that much JSON, then the bytes. A quantised weight is
@@ -9,7 +9,7 @@
 //! to the GPU as they lie on disk.
 //!
 //! What this module does change, it changes once, at load:
-//! - **Norm weights gain 1.** Qwen3.5's RMSNorm is `x * (1 + w)` and the
+//! - **Norm weights gain 1.** Qwen3.8's RMSNorm is `x * (1 + w)` and the
 //!   checkpoint stores the delta ([`SHIFTED`]). The gated norm inside a
 //!   linear-attention layer is not one of them.
 //! - **`A_log` becomes `A = exp(A_log)`**, the form the decay gate needs.
@@ -237,7 +237,7 @@ impl Store {
     }
 
     /// A tensor as f32, with the load-time folds applied: `1 +` for the
-    /// norm weights Qwen3.5 stores as deltas, `exp` for `A_log`, and the
+    /// norm weights Qwen3.8 stores as deltas, `exp` for `A_log`, and the
     /// convolution weight transposed to `[kernel, channels]`.
     pub fn floats(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
         let (bytes, e) = self.raw(name)?;

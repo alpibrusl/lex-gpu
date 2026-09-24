@@ -1,10 +1,8 @@
-//! Qwen3.5's gated-delta state update, against the rule it implements.
+//! Qwen3.8's gated-delta state update, against the rule it implements.
 
-use lex_front::qwen::{
-    DeltaNet, build_conv_silu, build_conv_silu_rows, build_delta_qk, build_delta_qk_rows,
+use lex_front::qwen::{DeltaNet, build_conv_silu, build_conv_silu_rows, build_delta_qk, build_delta_qk_rows,
     build_gated_norm, build_gated_norm_rows, build_gates, build_gates_rows, build_matvec_dense,
-    build_qk_rope, build_qk_rope_rows, reference,
-};
+    build_qk_rope, build_qk_rope_rows, reference, build_conv_silu_rows_snap, copy_block};
 use lex_front::{Tensor, check, run};
 use lex_ir::reference::fill_pattern_f32;
 use lex_ir::{DType, Target};
@@ -19,7 +17,7 @@ fn pattern(n: usize, seed: u32) -> Vec<f32> {
 /// the decay or the rank-one update compounds instead of cancelling.
 #[test]
 fn delta_state_matches_the_rule_over_successive_steps() {
-    // Qwen3.5-27B's shape, shrunk: the same 3:1 value/key head ratio.
+    // Qwen3.8-27B's shape, shrunk: the same 3:1 value/key head ratio.
     let c = DeltaNet::packed(6, 2, 32, 16, 4);
     let prog = c.build_step().unwrap();
     check(&prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
@@ -606,5 +604,155 @@ fn every_batched_kernel_equals_the_tokens_one_by_one() {
                 &st[out].data,
             );
         }
+    }
+}
+
+/// Every snapshot block holds the state as of that token.
+///
+/// This is what a rejected speculative batch rolls back to, so "block `t`
+/// is exactly the state after token `t`" is the whole contract. Checked
+/// against the one-token kernel run `t + 1` times, not against the batch
+/// kernel's own final state -- an off-by-one in the block index would
+/// agree with itself.
+#[test]
+fn every_delta_snapshot_is_the_state_after_that_token() {
+    let tokens = 4usize;
+    let c = DeltaNet::packed(6, 2, 32, 16, 4);
+    let (hv, dk, dv) = (c.v_heads, c.k_dim, c.v_dim);
+    let gates = hv * dv;
+    let one = c.build_step().unwrap();
+    let many = c.build_steps_snap(tokens).unwrap();
+    check(&many, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+
+    let q = pattern(tokens * hv * dk, 200);
+    let k = pattern(tokens * hv * dk, 201);
+    let v = pattern(tokens * gates, 202);
+    let g: Vec<f32> = pattern(tokens * gates, 203)
+        .iter()
+        .map(|x| 0.5 + 0.5 * x.abs().min(1.0))
+        .collect();
+    let beta: Vec<f32> = pattern(tokens * gates, 204)
+        .iter()
+        .map(|x| 0.5 * (1.0 + x.abs().min(1.0)))
+        .collect();
+    let start = pattern(hv * dv * dk, 205);
+
+    let mut batch = vec![
+        Tensor::new(DType::F32, &[hv * dv, dk], &start),
+        Tensor::new(DType::F32, &[tokens * hv, dk], &q),
+        Tensor::new(DType::F32, &[tokens * hv, dk], &k),
+        Tensor::new(DType::F32, &[tokens * gates], &v),
+        Tensor::new(DType::F32, &[tokens * gates], &g),
+        Tensor::new(DType::F32, &[tokens * gates], &beta),
+        Tensor::zeros(DType::F32, &[tokens * gates]),
+        Tensor::zeros(DType::F32, &[tokens * hv * dv, dk]),
+    ];
+    run(&many, &mut batch).expect("batch");
+
+    let block = hv * dv * dk;
+    let mut state = start.clone();
+    for t in 0..tokens {
+        let slice = |v: &[f32], n: usize| v[t * n..(t + 1) * n].to_vec();
+        let mut step = vec![
+            Tensor::new(DType::F32, &[hv * dv, dk], &state),
+            Tensor::new(DType::F32, &[hv, dk], &slice(&q, hv * dk)),
+            Tensor::new(DType::F32, &[hv, dk], &slice(&k, hv * dk)),
+            Tensor::new(DType::F32, &[gates], &slice(&v, gates)),
+            Tensor::new(DType::F32, &[gates], &slice(&g, gates)),
+            Tensor::new(DType::F32, &[gates], &slice(&beta, gates)),
+            Tensor::zeros(DType::F32, &[gates]),
+        ];
+        run(&one, &mut step).expect("step");
+        state = step[0].data.clone();
+        let got = &batch[7].data[t * block..(t + 1) * block];
+        let d = got
+            .iter()
+            .zip(&state)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(d == 0.0, "snapshot {t} differs from the state after {t} by {d:e}");
+    }
+    // The last block and `state` are the same thing by construction; if
+    // they ever disagree the carry is not what is being written out.
+    let last = &batch[7].data[(tokens - 1) * block..];
+    let d = last
+        .iter()
+        .zip(&batch[0].data)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(d == 0.0, "the last snapshot differs from the final state by {d:e}");
+}
+
+/// Every conv snapshot block is the window as of that token.
+///
+/// Same contract as the delta snapshots and checked the same way: against
+/// the one-token kernel run `t + 1` times, so an off-by-one cannot agree
+/// with itself.
+#[test]
+fn every_conv_snapshot_is_the_window_after_that_token() {
+    let (tokens, ch, kern, chunk) = (4usize, 16usize, 4usize, 8usize);
+    let many = build_conv_silu_rows_snap(tokens, ch, kern, chunk).unwrap();
+    check(&many, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+    let one = build_conv_silu_rows(1, ch, kern, chunk).unwrap();
+
+    let x = pattern(tokens * ch, 300);
+    let w = pattern(kern * ch, 301);
+    let start = pattern((kern - 1) * ch, 302);
+
+    let mut batch = vec![
+        Tensor::new(DType::F32, &[kern - 1, ch], &start),
+        Tensor::new(DType::F32, &[tokens, ch], &x),
+        Tensor::new(DType::F32, &[kern, ch], &w),
+        Tensor::zeros(DType::F32, &[tokens, ch]),
+        Tensor::zeros(DType::F32, &[tokens * (kern - 1), ch]),
+    ];
+    run(&many, &mut batch).expect("batch");
+
+    let block = (kern - 1) * ch;
+    let mut state = start.clone();
+    for t in 0..tokens {
+        let mut step = vec![
+            Tensor::new(DType::F32, &[kern - 1, ch], &state),
+            Tensor::new(DType::F32, &[1, ch], &x[t * ch..(t + 1) * ch]),
+            Tensor::new(DType::F32, &[kern, ch], &w),
+            Tensor::zeros(DType::F32, &[1, ch]),
+        ];
+        run(&one, &mut step).expect("step");
+        state = step[0].data.clone();
+        let got = &batch[4].data[t * block..(t + 1) * block];
+        let d = got
+            .iter()
+            .zip(&state)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(d == 0.0, "conv snapshot {t} differs from the window after {t} by {d:e}");
+    }
+    let last = &batch[4].data[(tokens - 1) * block..];
+    let d = last
+        .iter()
+        .zip(&batch[0].data)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(d == 0.0, "the last conv snapshot differs from the final window by {d:e}");
+}
+
+/// `copy_block` takes the block it is asked for, and only that block.
+#[test]
+fn copy_block_takes_the_block_it_names() {
+    let (blocks, rows, cols) = (4usize, 6usize, 8usize);
+    let src = pattern(blocks * rows * cols, 400);
+    for which in 0..blocks {
+        let prog = copy_block(blocks, rows, cols, which).unwrap();
+        check(&prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+        let mut t = vec![
+            Tensor::new(DType::F32, &[blocks * rows, cols], &src),
+            Tensor::zeros(DType::F32, &[rows, cols]),
+        ];
+        run(&prog, &mut t).expect("copy");
+        let want = &src[which * rows * cols..(which + 1) * rows * cols];
+        assert!(
+            t[1].data == want,
+            "block {which} came back as something else"
+        );
     }
 }

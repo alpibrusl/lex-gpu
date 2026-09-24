@@ -289,3 +289,99 @@ fn split_kv_attention_matches_the_reference_at_every_length() {
         }
     }
 }
+
+/// The causal split pair — partial softmaxes per cache split, merged —
+/// equals the whole-cache causal kernel, for every token in the batch.
+///
+/// A batched verify scans the cache in one threadgroup per head, which is
+/// what a decode step did before split-KV. At 1440 positions a two-token
+/// verify costs 67.9 ms where two separate decode steps cost 74, so
+/// batching has stopped buying anything; speculation needs the verify
+/// cheaper than the steps it replaces. This is the kernel that makes it so,
+/// and the only thing worth asserting about it is that it changes nothing.
+#[test]
+fn causal_split_equals_the_whole_cache_causal() {
+    use lex_front::run_dyn;
+    let (heads, group, bk, bps) = (2usize, 4usize, 16usize, 2usize);
+    // Whole chunks of splits, as the split kernel requires.
+    let cap = bk * bps * lex_front::flash::COMBINE_CHUNK * 2;
+    let hg = heads * group;
+    let cfg = FlashDecode {
+        q_rows: group,
+        d: D,
+        seq: cap,
+        bq: group,
+        bk,
+        stages: 1,
+        dtype: DType::F16,
+        kv_space: Space::Threadgroup,
+        consumers: 0,
+        heads,
+        kv_cap: cap,
+    };
+    let splits = cap / (bk * bps);
+
+    for (tokens, pos0) in [(1usize, 0usize), (2, 100), (4, 37), (8, 200)] {
+        let split = cfg.build_causal_split(tokens, bps).unwrap();
+        let combine = cfg.build_combine_rows(tokens, bps).unwrap();
+        for p in [&split, &combine] {
+            check(p, &Target::apple_m_series()).expect("check");
+        }
+        let mk = |rows: usize, seed: u32| {
+            let mut x = vec![0.0; rows * D];
+            fill_pattern_f32(&mut x, seed);
+            Tensor::new(DType::F16, &[rows, D], &x)
+        };
+        let (q, k, v) = (mk(tokens * hg, 1), mk(heads * cap, 2), mk(heads * cap, 3));
+
+        // Splits the live length actually covers; the rest are never
+        // launched, exactly as the runtime launches them.
+        let nsplit = (pos0 + tokens).div_ceil(bk * bps);
+        let mut s = vec![
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            Tensor::zeros(DType::F32, &[tokens * hg, splits]),
+            Tensor::zeros(DType::F32, &[tokens * hg, splits]),
+            Tensor::zeros(DType::F32, &[tokens * hg, splits * D]),
+        ];
+        run_dyn(&split, &mut s, &[pos0 as u32]).expect("split");
+
+        let mut m = vec![
+            s[3].clone(),
+            s[4].clone(),
+            Tensor::new(DType::F32, &[tokens * hg * splits, D], &s[5].data),
+            Tensor::zeros(DType::F32, &[tokens * hg, D]),
+        ];
+        run_dyn(
+            &combine,
+            &mut m,
+            &[
+                nsplit as u32,
+                nsplit.div_ceil(lex_front::flash::COMBINE_CHUNK) as u32,
+            ],
+        )
+        .expect("combine");
+
+        for tok in 0..tokens {
+            let len = pos0 + tok + 1;
+            for h in 0..heads {
+                let r0 = tok * hg + h * group;
+                let want = flash::reference(
+                    &q.data[r0 * D..(r0 + group) * D],
+                    &k.data[h * cap * D..(h * cap + len) * D],
+                    &v.data[h * cap * D..(h * cap + len) * D],
+                    group,
+                    len,
+                    D,
+                );
+                let got = &m[3].data[r0 * D..(r0 + group) * D];
+                let err = max_rel_err(got, &want);
+                assert!(
+                    err < TOL,
+                    "tokens {tokens} pos0 {pos0} token {tok} head {h}: {err:e}"
+                );
+            }
+        }
+    }
+}
