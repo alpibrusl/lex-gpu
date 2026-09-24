@@ -8,6 +8,8 @@
 pub mod dev;
 pub mod gguf;
 pub mod json;
+pub mod nfc_table;
 pub mod llama;
 pub mod qwen;
 pub mod qwen_run;
+pub mod tokenizer;

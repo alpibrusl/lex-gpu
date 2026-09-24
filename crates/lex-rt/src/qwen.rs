@@ -142,6 +142,20 @@ impl Store {
     }
 
     /// A blob's bytes and its header entries.
+    /// A named layer's bytes, unparsed.
+    ///
+    /// The store carries the checkpoint's own `tokenizer.json` beside its
+    /// tensors, which is the only place a tokenizer for this model exists
+    /// -- there is no copy in this repository, and one that drifted from
+    /// the weights would be worse than none.
+    pub fn file(&self, name: &str) -> Result<Vec<u8>, String> {
+        let path = self
+            .blobs
+            .get(name)
+            .ok_or_else(|| format!("{} has no `{name}`", self.model))?;
+        fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     fn blob(&self, name: &str) -> Result<(Vec<u8>, BTreeMap<String, Entry>), String> {
         let path = self
             .blobs
