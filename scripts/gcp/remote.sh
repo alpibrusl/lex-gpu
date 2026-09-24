@@ -53,6 +53,9 @@ step "Ollama baseline"
 if ! command -v ollama >/dev/null; then
   curl -fsSL https://ollama.com/install.sh | sh >/dev/null
 fi
+# The installer enables a systemd service, so this usually loses the port
+# to it and exits -- which is fine, the service answers. It stays for the
+# case where the binary was already present and no service was set up.
 (ollama serve >"$R/ollama-serve.log" 2>&1 &)
 for i in $(seq 1 30); do curl -s localhost:11434 >/dev/null && break; sleep 2; done
 ollama --version | tee -a "$R/machine.txt"
@@ -67,17 +70,18 @@ done
 # Everything up to here says the emitted CUDA compiles; only a real device
 # says the numbers are right.
 step "a model on CUDA"
-if ollama pull llama3.2:1b >/dev/null 2>&1; then
-  # "The capital of France is" -- greedy, so the continuation is fixed and
-  # `scripts/lex_vs_ollama.py` has the reference this is checked against.
-  cargo run --release -p lex-rt --example generate -- \
-    --model llama3.2:1b --ids 128000,791,6864,315,9822,374 --steps 16 --top 5 \
-    2>&1 | tee "$R/cuda-generate.txt" | tail -20
-  [ "${PIPESTATUS[0]}" = 0 ] || fail=1
-else
-  echo "could not pull llama3.2:1b" | tee "$R/cuda-generate.txt"
-  fail=1
-fi
+# The baseline step already pulled this, and the runtime reads the model
+# store directly -- it needs no server. So the pull here is a fallback for
+# a run that skipped the baseline, and its failure must not block the
+# milestone: one run died on exactly that, `ollama pull` refusing because
+# the server had fallen over, with the model sitting in the store.
+ollama pull llama3.2:1b >/dev/null 2>&1 || echo "pull failed; using whatever is in the store"
+# "The capital of France is" -- greedy, so the continuation is fixed and
+# `scripts/lex_vs_ollama.py` has the reference this is checked against.
+cargo run --release -p lex-rt --example generate -- \
+  --model llama3.2:1b --ids 128000,791,6864,315,9822,374 --steps 16 --top 5 \
+  2>&1 | tee "$R/cuda-generate.txt" | tail -20
+[ "${PIPESTATUS[0]}" = 0 ] || fail=1
 
 step "done (failures: $fail)"
 exit $fail
