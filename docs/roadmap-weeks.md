@@ -235,11 +235,50 @@ GB/s against 141, because it needs a chunked reduction). Those numbers
 predate a kernel that is now 2.4x faster, so the result is stale rather
 than wrong, but it is not the obvious win either.
 
-So there is no easy multiple here. What is left in this kernel is the
-load-to-weight ratio of 2 at r=4, and breaking it needs either a
-different accumulator layout or the matrix unit -- and
-`examples/gemm_probe` already measured `simdgroup_matrix` losing to this
-matvec, by more now than when it was written.
+So there is no easy multiple in *this* kernel at eight tokens. But eight
+tokens is the wrong question for prefill.
+
+## M3c — prefill wants a GEMM, and the probe that said otherwise was broken
+
+Prefill reads the weights once per chunk. At `MAX_BATCH = 8` a 512-token
+prompt reads 14.5 GB **sixty-four times**, about 928 GB on top of the
+2.08 s of arithmetic the pass actually needs. Ollama prefills in large
+batches and pays only the arithmetic: 28.5 TFLOP at the measured 13.7
+TFLOP/s is 246 tok/s, which is what it gets. We pay both and get 90.
+
+Raising the chunk with the current kernel is not possible -- `r x tokens`
+accumulators spill and the matvec collapses to 258 ms/token past 16. The
+kernel for large batches is a tiled GEMM on the matrix units, and
+`examples/gemm_probe` was supposed to have ruled that out.
+
+**It had not.** The probe fixed `BM = 32` and gave its grid no token
+dimension, so it could not compute more than 32 tokens; asking for 64 gave
+a 32-token result with 64 in the denominator. Three token counts all took
+about 1,040 µs, which is the tell. It now asserts both kernels wrote every
+row, because two kernels that stop early agree perfectly.
+
+| tokens | batched matvec | simdgroup_matrix |
+| --- | --- | --- |
+| 8 | **8.49** | 28.32 |
+| 16 | 20.00 | 15.01 |
+| 32 | 258.32 | 9.98 |
+| 64 | 258.57 | 7.99 |
+| 128 | 258.76 | **6.95** |
+
+The crossover is 16 tokens, and at 128 the GEMM beats the matvec's
+best-ever point by 18%. That is a real result and a thin reason to spend
+weeks on matrix fragments in the IR.
+
+What makes it worth pursuing is the gap above it. 6.95 ms/token is 144
+tok/s of a notional pass against the 246 the arithmetic allows: this
+kernel reaches 59% of the compute roof, and it stages through threadgroup
+memory with no double buffering and no vectorised loads.
+
+**So the next step is another afternoon in `gemm_probe`, not weeks in the
+IR:** double-buffer the staging, vectorise the loads, and see whether 6.95
+moves toward 4. If it does, prefill has its 2.5x and the IR work is
+justified. If it does not, the ceiling belongs to this kernel's shape and
+the answer is elsewhere.
 
 ## M4 — a model runs on CUDA — done
 
