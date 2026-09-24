@@ -17,7 +17,7 @@ algo rmsnorm(n, eps)
   let x  = load x
   let sq = &x * &x
   let ss = rowsum sq
-  let ms = ss * 0.000244140625   // 1/n at n = 4096
+  let ms = ss * (1 / n)
   let t  = ms + eps
   let r  = rsqrt t
   let xn = x * r

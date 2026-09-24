@@ -9,7 +9,7 @@
 
 use lex_front::syntax;
 
-const RMSNORM: &str = include_str!("lx/rmsnorm.lx");
+const RMSNORM: &str = include_str!("../lx/rmsnorm.lx");
 const N: usize = 4096;
 const EPS: f32 = 1e-5;
 
@@ -151,7 +151,7 @@ fn a_missing_schedule_is_an_error() {
     );
 }
 
-const SILU: &str = include_str!("lx/silu_mul.lx");
+const SILU: &str = include_str!("../lx/silu_mul.lx");
 
 /// A second kernel, which is what says the first was not a coincidence.
 ///

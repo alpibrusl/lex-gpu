@@ -778,11 +778,30 @@ fn substitute(e: &Expr, vals: &HashMap<&str, f64>) -> Expr {
             None => e.clone(),
         },
         Expr::Call(f, x) => Expr::Call(f.clone(), Box::new(substitute(x, vals))),
-        Expr::Bin(op, l, r) => Expr::Bin(
-            *op,
-            Box::new(substitute(l, vals)),
-            Box::new(substitute(r, vals)),
-        ),
+        Expr::Bin(op, l, r) => {
+            let (l, r) = (substitute(l, vals), substitute(r, vals));
+            // Fold once both sides are numbers, so `1 / n` is a constant
+            // the multiply can become a `Scale` of, rather than a divide
+            // of two filled tiles.
+            //
+            // In f32, because that is where the answer lands and where
+            // the Rust computes it. Dividing in f64 and narrowing rounds
+            // twice, which for most `n` gives the same bits and for some
+            // gives a different last one -- and "the same program" here
+            // means the same constant in the emitted text.
+            if let (Expr::Num(a), Expr::Num(b)) = (&l, &r) {
+                let (a, b) = (*a as f32, *b as f32);
+                let v = match op {
+                    BinOp::Add => a + b,
+                    BinOp::Sub => a - b,
+                    BinOp::Mul => a * b,
+                    BinOp::Div => a / b,
+                    _ => return Expr::Bin(*op, Box::new(l), Box::new(r)),
+                };
+                return Expr::Num(v as f64);
+            }
+            Expr::Bin(*op, Box::new(l), Box::new(r))
+        }
         _ => e.clone(),
     }
 }

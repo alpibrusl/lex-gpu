@@ -112,7 +112,7 @@ mod gpu {
     use half::f16;
     use lex_front::flash::{COMBINE_CHUNK, FlashDecode};
     use lex_front::llama::{
-        QLayout, kv_append, kv_append_rows, matmul_q_x, matvec_q, rmsnorm, rmsnorm_rows,
+        QLayout, kv_append, kv_append_rows, matmul_q_x, matvec_q, rmsnorm_rows,
     };
     use lex_front::qwen::{
         DeltaNet, build_conv_silu_rows, build_conv_silu_rows_snap, build_delta_qk_rows,
@@ -163,6 +163,24 @@ mod gpu {
     /// layer, 48 layers, so 604 MB at four. Prefill runs at MAX_BATCH and
     /// never rolls back, so it does not pay this.
     const SPEC_MAX: usize = 4;
+
+    /// The decode RMSNorm, parsed from `lex-front/lx/rmsnorm.lx`.
+    ///
+    /// Embedded at build time rather than read from disk: a runtime that
+    /// needed a source file beside it to start would be a worse runtime,
+    /// and the file is 600 bytes.
+    ///
+    /// The Rust `rmsnorm` it replaces is still there and still tested
+    /// against this one for byte-identical MSL
+    /// (`lex-front/tests/syntax.rs`). Two ways to build the same kernel
+    /// is one more than necessary, and the second one goes when the
+    /// surface can express the rest of them.
+    fn surface_rmsnorm(n: usize, eps: f32) -> Result<Program, String> {
+        const SRC: &str = include_str!("../../lex-front/lx/rmsnorm.lx");
+        lex_front::syntax::parse(SRC)?
+            .algo
+            .build(&[("n", n as f64), ("eps", eps as f64)])
+    }
 
     const ATTN_BPS: usize = 2;
     /// Splits below which the serial kernel is used instead.
@@ -558,7 +576,14 @@ mod gpu {
                 kv_cap: cap,
             };
             let k = Kernels {
-                rms: compile(&gpu, &rmsnorm(cfg.hidden, cfg.eps), THREADS)?,
+                // From `.lx`, not from Rust. The decode path's RMSNorm is
+                // the first kernel in the model to come out of the surface
+                // language, and `qwen_golden` is what says it is the same
+                // kernel -- the model's tokens are checked against an f32
+                // reference, so a parser that built something subtly
+                // different would show up as wrong output rather than as
+                // a passing parse.
+                rms: compile(&gpu, &surface_rmsnorm(cfg.hidden, cfg.eps)?, THREADS)?,
                 mv,
                 dense: compile(
                     &gpu,
