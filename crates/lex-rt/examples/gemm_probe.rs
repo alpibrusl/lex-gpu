@@ -53,10 +53,34 @@
 //! it stages through threadgroup memory with no double buffering and no
 //! vectorised loads.
 //!
-//! The next step is therefore another afternoon here, not weeks in the IR:
-//! double-buffer the staging and vectorise the loads, and see whether 6.95
-//! moves toward 4. If it does, the case is made. If it does not, the
-//! ceiling is this kernel's shape and not the compiler's.
+//! ## The configuration knobs are exhausted
+//!
+//! All measured at 128 tokens, against 6.95 at `BN=32, BK=32`:
+//!
+//! ```text
+//!   BK=64                     7.46    (all 128 threads staging weights,
+//!                                      against BK=32 leaving half idle)
+//!   BN=64  (272 threadgroups) 7.06
+//!   BN=128 (136 threadgroups) 10.61
+//! ```
+//!
+//! Neither lever moves it. `BK=64` was meant to fix the weight staging,
+//! where `BN*BK/16 = 64` groups over 128 threads leaves half the
+//! threadgroup idle through the expensive part of the loop; the extra
+//! threadgroup memory costs more in occupancy than the idle threads cost.
+//! `BN` controls how many threadgroups re-read the activations -- 713 MB
+//! of them at `BN=32` -- and halving that changes nothing, which is the
+//! same answer the batched matvec gave to the same question. Those loads
+//! are cache-served and cheap in both kernels.
+//!
+//! So: 3.09 ms at 128 tokens against a 1.67 ms compute floor, 54% of peak,
+//! and it is not bandwidth, not threadgroup count, and not the idle
+//! threads. What is left is the shape of the loop -- double buffering, so
+//! the dequantise of the next tile overlaps the matrix ops on this one,
+//! and bulk loads -- and that is real kernel work rather than a sweep.
+//!
+//! Anyone picking this up: the bar is 6.95, and five configuration
+//! hypotheses have already died against it.
 //!
 //! The thing that made this look impossible earlier was NVFP4\'s per-16
 //! scale: it has nowhere to go inside an MMA accumulator. Staging solves
@@ -228,6 +252,14 @@ fn main() -> Result<(), String> {
 /// a 16x16 accumulator as four 8x8 fragments.
 #[cfg(target_os = "macos")]
 fn mma_kernel(m: usize, k: usize, n: usize, bn: usize) -> lex_msl::program::Lowered {
+    // The K tile. At BK=32 with BN=32 the weight staging has BN*BK/16 = 64
+    // groups for 128 threads, so half the threadgroup stands idle through
+    // the expensive part of the loop; BK=64 gives it all of them and
+    // halves the barrier count with it.
+    let bk: usize = std::env::var("LEX_BK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
     // Weights are 8 codes to a u32 word; scales are one byte per 16 values.
     let kw = k / 8;
     let ks = k / 16;
@@ -263,10 +295,10 @@ kernel void gemm_nvfp4(
     uint lane [[thread_index_in_simdgroup]])
 {{
     const uint M = {m}u, K = {k}u, N = {n}u;
-    const uint BM = 32u, BN = {bn}u, BK = 32u;
+    const uint BM = 32u, BN = {bn}u, BK = {bk}u;
     // Padded to keep a column read off one bank.
-    threadgroup half As[32][36];
-    threadgroup half Bs[{bn}][36];
+    threadgroup half As[32][{bkp}];
+    threadgroup half Bs[{bn}][{bkp}];
 
     const uint j0 = tgpos.x * BN;              // first output column block
     // Token tiles down the grid's second dimension. Without this the tile
@@ -314,10 +346,10 @@ kernel void gemm_nvfp4(
         for (uint kk = 0; kk < BK; kk += 8u) {{
             simdgroup_matrix<half, 8, 8> a[2], b[{nf}];
             for (uint i = 0; i < 2u; ++i)
-                simdgroup_load(a[i], &As[wm * 16u + i * 8u][kk], 36);
+                simdgroup_load(a[i], &As[wm * 16u + i * 8u][kk], {bkp});
             for (uint i = 0; i < NF; ++i)
                 // B is [row][k]; the fragment wants it transposed.
-                simdgroup_load(b[i], &Bs[wn * (NF * 8u) + i * 8u][kk], 36, ulong2(0, 0), true);
+                simdgroup_load(b[i], &Bs[wn * (NF * 8u) + i * 8u][kk], {bkp}, ulong2(0, 0), true);
             for (uint i = 0; i < 2u; ++i)
                 for (uint jj = 0; jj < NF; ++jj)
                     simdgroup_multiply_accumulate(acc[i][jj], a[i], b[jj], acc[i][jj]);
@@ -347,6 +379,8 @@ kernel void gemm_nvfp4(
         bn = bn,
         nf = nf,
         bnp = bnp,
+        bk = bk,
+        bkp = bk + 4,
     );
     lex_msl::program::Lowered {
         entry: "gemm_nvfp4".into(),
@@ -354,7 +388,7 @@ kernel void gemm_nvfp4(
         grid: n / bn,
         grid2: m.div_ceil(32),
         threads: 128,
-        threadgroup_bytes: 32 * 36 * 2 + bn * 36 * 2 + 32 * (bn + 4) * 4,
+        threadgroup_bytes: 32 * (bk + 4) * 2 + bn * (bk + 4) * 2 + 32 * (bn + 4) * 4,
         arena_bytes: 0,
         scratch_bytes: 0,
         barriers: 3,

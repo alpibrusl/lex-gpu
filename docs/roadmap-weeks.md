@@ -274,11 +274,27 @@ tok/s of a notional pass against the 246 the arithmetic allows: this
 kernel reaches 59% of the compute roof, and it stages through threadgroup
 memory with no double buffering and no vectorised loads.
 
-**So the next step is another afternoon in `gemm_probe`, not weeks in the
-IR:** double-buffer the staging, vectorise the loads, and see whether 6.95
-moves toward 4. If it does, prefill has its 2.5x and the IR work is
-justified. If it does not, the ceiling belongs to this kernel's shape and
-the answer is elsewhere.
+That afternoon has been spent on the configuration knobs, and they are
+exhausted. At 128 tokens, against 6.95 at `BN=32, BK=32`: `BK=64` gives
+7.46, `BN=64` gives 7.06, `BN=128` gives 10.61. `BK=64` was meant to fix
+the weight staging, where half the threadgroup stands idle; the extra
+threadgroup memory costs more in occupancy than the idle threads do.
+`BN` halves the activation re-reads and changes nothing -- **the same
+answer the batched matvec gave to the same question.**
+
+That is worth stating plainly, because it went the same way five times
+today: in both kernels, reducing the number of threadgroups to cut
+redundant activation traffic does nothing or hurts. Those loads are
+cache-served. The thing that moves either kernel is register pressure and
+occupancy, and the roofline arithmetic that kept predicting otherwise was
+counting DRAM traffic that never happens.
+
+So the GEMM sits at 3.09 ms against a 1.67 ms compute floor -- 54% of
+peak -- and the remaining work is the shape of the loop: double buffering
+so the dequantise of the next tile overlaps the matrix ops on this one,
+and bulk loads. That is kernel work, not a sweep, and it should be done
+in `gemm_probe` before any of it reaches the IR. **The bar is 6.95, and
+five configuration hypotheses have already died against it.**
 
 ## M4 — a model runs on CUDA — done
 
