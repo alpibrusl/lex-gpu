@@ -69,6 +69,23 @@ done
 # through the same `lex-front` programs the Mac runs, on an NVIDIA device.
 # Everything up to here says the emitted CUDA compiles; only a real device
 # says the numbers are right.
+# Where this Ollama version keeps its blobs is not worth another guess:
+# it is not $HOME/.ollama on Linux, and on 0.34.4 it is not the ollama
+# user's home either. Two runs went on guesses. Ask the filesystem.
+step "locate the Ollama model store"
+STORE=$(sudo find / -xdev -type d -path "*/manifests/registry.ollama.ai" 2>/dev/null | head -1)
+if [ -n "$STORE" ]; then
+  export OLLAMA_MODELS="$(dirname "$(dirname "$STORE")")"
+  echo "OLLAMA_MODELS=$OLLAMA_MODELS" | tee -a "$R/machine.txt"
+  # Recorded so the next change to this can be made from fact.
+  sudo ls -la "$OLLAMA_MODELS" 2>&1 | tee -a "$R/machine.txt"
+  # The service runs as its own user and may not have made the blobs
+  # readable to us.
+  sudo chmod -R a+rX "$OLLAMA_MODELS" 2>/dev/null || true
+else
+  echo "no Ollama model store anywhere on this disk" | tee -a "$R/machine.txt"
+fi
+
 step "a model on CUDA"
 # The baseline step already pulled this, and the runtime reads the model
 # store directly -- it needs no server. So the pull here is a fallback for
