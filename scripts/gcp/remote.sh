@@ -134,11 +134,16 @@ cargo run --release -p lex-rt --example generate -- \
 # Metal tests are held to as well. Opt-in: 14.5 GB to pull.
 if [ -n "${QWEN:-}" ]; then
   step "the hard model on CUDA"
-  # Keep the reason. `|| echo "pull failed"` threw away the only
-  # evidence of why, and the step then passed on an empty test run.
-  ollama pull qwen3.8:27b-mlx 2>&1 | tail -2 | tee -a "$R/qwen-cuda.log"
-  sudo chmod a+rX /usr/share/ollama /usr/share/ollama/.ollama 2>/dev/null || true
-  sudo chmod -R a+rX "${OLLAMA_MODELS:-/usr/share/ollama/.ollama/models}" 2>/dev/null || true
+  # Not `ollama pull`: the client refuses this one here -- "this model
+  # requires MLX support, but the MLX runtime is not available" -- and
+  # that is the client's check, not the registry's. The weights are
+  # ordinary blobs behind ordinary HTTP and `lex-rt` reads the store
+  # directly, so Ollama's opinion about what this machine can execute is
+  # not one we need. Into our own home, which also skips the permission
+  # dance the service user's store needs.
+  python3 scripts/ollama_fetch.py qwen3.8:27b-mlx \
+    --root "$HOME/.ollama/models" 2>&1 | tail -4 | tee -a "$R/qwen-cuda.log"
+  [ "${PIPESTATUS[0]}" = 0 ] || fail=1
   # Ollama holds the baseline models on the GPU -- 6.6 GB of a 23 GB
   # card after llama3.1:8b -- and this one needs about 15.5.
   sudo systemctl stop ollama 2>/dev/null || true
@@ -152,6 +157,13 @@ if [ -n "${QWEN:-}" ]; then
   # test file was still gated to macOS and compiled to nothing.
   if ! echo "$QOUT" | grep -qE "test result: ok\. [1-9]"; then
     echo "no qwen test actually ran -- gated out, or the model is missing"
+    fail=1
+  fi
+  # And a test that skips is not a test that ran. These print SKIPPED and
+  # return Ok when the model is absent, which is right for a laptop with
+  # no checkpoint and wrong here, where fetching it is the point.
+  if echo "$QOUT" | grep -q SKIPPED; then
+    echo "a qwen test skipped -- the model was asked for and is not there"
     fail=1
   fi
   cargo run --release -p lex-rt --example mtp -- --steps 32 --depth 1 2>&1 \
