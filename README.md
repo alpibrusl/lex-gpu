@@ -81,6 +81,29 @@ accepts more of it. Ollama's Qwen decode at 1,440 positions is 57.8 on
 random words and 39.7 on a real passage. The prose figure is the one
 above; use `--prompt-file` for decode comparisons.
 
+**Energy, measured the same way on both** (`scripts/energy.lex`, and
+`LEX_NO_PREFIX_CACHE` has no part in it — this is raw decode):
+
+| | | tok/s | W | mJ/token |
+| --- | --- | --- | --- | --- |
+| NVIDIA L4, `llama3.2:1b`, 4096 tokens | lex | 103.2 | 68.5 | 663.7 |
+| | Ollama | 152.0 | 70.8 | 465.5 |
+| M-series, `qwen3.8:27b-mlx`, 256 tokens | lex | 26.1 | 46.8 | 1788.9 |
+| | Ollama | 50.1 | 46.7 | 932.4 |
+
+The two engines draw the *same power* — 68.5 against 70.8 W on the L4,
+46.8 against 46.7 on the Mac. Both sit at the same hardware limit, so
+energy per token is time per token and nothing else: 1.47x slower is 1.43x
+the energy, 1.92x slower is 1.92x the energy. There is no separate
+efficiency story to chase, which is worth knowing before chasing one.
+
+The Mac row is lex *without speculation*: the checkpoint's own sampling
+defaults are on, and speculation verifies against the greedy token, so the
+two cannot both be true yet. Speculating, the same machine decodes at
+42.9 — which would be about 1090 mJ/token, most of the gap. Speculative
+sampling has an accept/reject rule that makes both work at once, and we
+do not have it.
+
 **Prefill is the weak point: 90 tok/s against Ollama's ~250.** Not a
 mystery. 512 tokens is 28.5 TFLOP, and at the measured 13.7 TFLOP/s that
 is 246 tok/s — which is what Ollama gets, because it prefills in large
