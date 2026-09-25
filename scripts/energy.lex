@@ -248,6 +248,28 @@ fn decode_ollama(text :: Str) -> Result[OllamaReply, Str] {
   json.parse(text)
 }
 
+# engine "cmd": `model` is a command line, and `tokens` is how many tokens
+# it was told to produce. For engines that are a binary rather than a
+# server -- lex-gpu's own `generate` takes token ids and a step count --
+# there is nothing to POST to, and wrapping one in a server to measure it
+# would measure the server too.
+fn run_command(line :: Str, tokens :: Int) -> [proc] Result[Int, Str] {
+  let words := list.filter(str.split(line, " "), fn (w :: Str) -> Bool { not str.is_empty(w) })
+  match list.head(words) {
+    None => Err("empty command"),
+    Some(bin) => {
+      match process.run(bin, list.tail(words)) {
+        Err(e) => Err(str.join(["cannot run ", bin, ": ", e], "")),
+        Ok(out) => if out.exit_code != 0 {
+          Err(str.join([bin, " exited ", int.to_str(out.exit_code), ": ", str.slice(out.stderr, 0, 300)], ""))
+        } else {
+          Ok(tokens)
+        },
+      }
+    },
+  }
+}
+
 fn generate(engine :: Str, host :: Str, model :: Str, tokens :: Int) -> [net] Result[Int, Str] {
   let body := if engine == "ollama" {
     str.join(["{\"model\":\"", model, "\",\"prompt\":\"", prompt(),
@@ -271,6 +293,10 @@ fn generate(engine :: Str, host :: Str, model :: Str, tokens :: Int) -> [net] Re
 # across calls: powermetrics' timeline is a running sum of its own elapsed
 # figures, so restarting it at zero for each window puts the second window
 # behind the first and the integral lands on nothing.
+fn drive(engine :: Str, host :: Str, model :: Str, tokens :: Int) -> [net, proc] Result[Int, Str] {
+  if engine == "cmd" { run_command(model, tokens) } else { generate(engine, host, model, tokens) }
+}
+
 fn sample_to(h :: ProcessHandle, apple :: Bool, until :: Float, budget :: Int, from :: Float) -> [proc] List[Sample] {
   if apple { drain_apple(h, until, budget, from, []) } else { drain(h, until, budget, []) }
 }
@@ -298,12 +324,16 @@ fn main(backend :: Str, engine :: Str, model :: Str, tokens :: Int, idle_s :: In
   } else {
     ["--query-gpu=timestamp,power.draw", "--format=csv,noheader,nounits", "--loop-ms=200"]
   }
+  # Warm up before the sampler exists. Spawning it first and warming up
+  # second leaves the warm-up's own samples sitting in the pipe, and the
+  # idle window reads them: with a three-second warm-up the baseline came
+  # back at 193 W against a 40 W idle rail, and `marginal` went negative.
+  let _w := io.print("warming up ...")
+  let _r := drive(engine, host, model, 16)
   match process.spawn(bin, args, opts) {
     Err(e) => str.join(["cannot start ", bin, ": ", e], ""),
     Ok(h) => {
       # Anchor the timeline on the sampler's own clock, not ours.
-      let _w := io.print("warming up ...")
-      let _r := generate(engine, host, model, 16)
       let first := sample_to(h, apple, 0.0, 200, 0.0)
       let t_start := match list.head(first) { Some(s) => s.t, None => 0.0 }
       let _n := io.print(str.join(["idle baseline for ", int.to_str(idle_s), "s ..."], ""))
@@ -314,7 +344,7 @@ fn main(backend :: Str, engine :: Str, model :: Str, tokens :: Int, idle_s :: In
       let _g := io.print(str.join(["generating ", int.to_str(tokens), " tokens on ", engine, " ..."], ""))
       let t0 := idle_end
       let m0 := time.mono_ns()
-      match generate(engine, host, model, tokens) {
+      match drive(engine, host, model, tokens) {
         Err(e) => {
           let _k := process.kill(h, "TERM")
           str.concat("generation failed: ", e)
