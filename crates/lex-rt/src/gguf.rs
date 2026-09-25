@@ -44,6 +44,11 @@ pub enum GgmlType {
     Q8_0,
     Q4_K,
     Q6_K,
+    /// Prism's ternary types, which are not in ggml: 128 values per block
+    /// against one f16 scale, codes in 2-bit slots or densely packed.
+    /// See `docs/ternary.md`.
+    PQ2_0,
+    PTQ1_0,
     Other(u32),
 }
 
@@ -55,6 +60,8 @@ impl GgmlType {
             8 => GgmlType::Q8_0,
             12 => GgmlType::Q4_K,
             14 => GgmlType::Q6_K,
+            142 => GgmlType::PQ2_0,
+            143 => GgmlType::PTQ1_0,
             x => GgmlType::Other(x),
         }
     }
@@ -67,6 +74,8 @@ impl GgmlType {
             GgmlType::Q8_0 => Some((32, 34)),
             GgmlType::Q4_K => Some((256, 144)),
             GgmlType::Q6_K => Some((256, 210)),
+            GgmlType::PQ2_0 => Some((128, 34)),
+            GgmlType::PTQ1_0 => Some((128, 28)),
             GgmlType::Other(_) => None,
         }
     }

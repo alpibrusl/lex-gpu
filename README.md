@@ -131,7 +131,7 @@ What runs where:
 - **Copy and RMSNorm** are hand-planned P0 kernels. They run on the GPU at
   parity with PyTorch (example 3).
 - **Llama inference** is typed `lex-front` programs: RMSNorm, quantised
-  matvec (Q8_0 / Q4_K / Q6_K), RoPE, flash-decode attention (serial and
+  matvec (Q8_0 / Q4_K / Q6_K / NVFP4 / ternary), RoPE, flash-decode attention (serial and
   split-KV), SiLU·mul. They are checked, run in the interpreter, and are
   lowered to MSL to run on the GPU.
 - **Host glue:** the embedding-row lookup and the RoPE tables are written by
@@ -417,7 +417,7 @@ in its smallest possible form.
 | `lex-metal` | Compile, allocate, dispatch, time | **no** |
 | `lex-cuda` | The same, on NVIDIA: NVRTC, driver API via `dlopen`, no link-time dependency on a driver | yes (device path is Linux-only) |
 | `lex-bench` | Harness: emit, verify, measure (`--flash` for decode attention) | yes (device path gated) |
-| `lex-rt` | Runtime: GGUF and safetensors readers, Q8_0/Q4_K/Q6_K/NVFP4 repacking, Llama and Qwen decode loops, tokenizer, OpenAI-compatible server | yes (device paths gated) |
+| `lex-rt` | Runtime: GGUF and safetensors readers, Q8_0/Q4_K/Q6_K/NVFP4/PQ2_0/PTQ1_0 repacking, Llama and Qwen decode loops, tokenizer, OpenAI-compatible server | yes (device paths gated) |
 
 That boundary is load-bearing. Everything except device dispatch is ordinary
 Rust with tests, so the compiler can be developed anywhere and only the numbers

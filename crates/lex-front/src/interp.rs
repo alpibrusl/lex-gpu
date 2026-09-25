@@ -613,6 +613,25 @@ impl Interp<'_> {
                     .collect();
                 Some(Val::Tile(self.fresh(DType::F32, &[r, c], out)))
             }
+            Op::DequantTernary(q, sc, group, trits) => {
+                let (tq, ts) = (self.arg(*q)?, self.arg(*sc)?);
+                let r = tq.ty.shape[0];
+                let per = trits.bytes();
+                let groups = tq.ty.shape[1] / per;
+                let c = groups * group;
+                let out = (0..r * c)
+                    .map(|i| {
+                        let (row, col) = (i / c, i % c);
+                        let g = col / group;
+                        let blk: Vec<u8> = (0..per)
+                            .map(|k| tq.data[row * groups * per + g * per + k] as i32 as u8)
+                            .collect();
+                        let code = trits.code(&blk, col % group);
+                        (code as f32 - 1.0) * ts.data[row * groups + g]
+                    })
+                    .collect();
+                Some(Val::Tile(self.fresh(DType::F32, &[r, c], out)))
+            }
             Op::Dequant6(lo, hi, s, group) => {
                 let (tl, th, ts) = (self.arg(*lo)?, self.arg(*hi)?, self.arg(*s)?);
                 let (r, c) = (tl.ty.shape[0], 2 * tl.ty.shape[1]);

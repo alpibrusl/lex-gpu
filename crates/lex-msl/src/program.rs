@@ -34,7 +34,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use lex_front::ir::{
-    Arg, BinOp, Block, IdxExpr, Nibbles, Op, Program, Reduce, Stmt, TileTy, UnOp, Var, View,
+    Arg, BinOp, Block, IdxExpr, Nibbles, Op, Program, Reduce, Stmt, TileTy, Trits, UnOp, Var,
+    View,
 };
 use lex_ir::{DType, Space, Target};
 
@@ -115,6 +116,8 @@ struct Gen<'a> {
     dq: HashMap<Var, Dq>,
     /// The kernel decodes NVFP4, so the source needs the decode tables.
     fp4: bool,
+    /// A dense-ternary decode needs its helper in the preamble.
+    tern: bool,
 }
 
 /// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
@@ -191,6 +194,7 @@ pub fn lower_with(
         barriers: 0,
         dq: HashMap::new(),
         fp4: false,
+        tern: false,
     };
     if let Some(pid) = prog.pid {
         g.locs.insert(pid, Loc::Index("gid".into()));
@@ -245,6 +249,9 @@ pub fn lower_with(
         target.max_threadgroup_bytes
     );
     s.push_str(&g.d.includes());
+    if g.tern {
+        s.push_str(&g.d.tern_preamble());
+    }
     if g.fp4 {
         s.push_str(&g.d.fp4_preamble());
     }
@@ -1024,6 +1031,121 @@ impl Gen<'_> {
                 let e = format!("({qv} * {sv})");
                 self.locs
                     .insert(x, Loc::Lazy(e, reg(DType::F32, &[tl.shape[0], c])));
+            }
+            Op::DequantTernary(q, sc, group, trits)
+                if [*q, *sc].iter().all(|a| self.lazy(*a).is_some()) =>
+            {
+                // Streaming, so a chunk of ternary weights never has to be
+                // staged: the owned form below would want a whole `[bo, kc]`
+                // f32 tile in threadgroup memory, which is the opposite of
+                // what a 1.75-bit format is for.
+                let x = dst.ok_or("op without a result")?;
+                let (qe, tq) = self.lazy(*q).expect("checked");
+                let (se, _) = self.lazy(*sc).expect("checked");
+                let per = trits.bytes();
+                let (r, groups) = (tq.shape[0], tq.shape[1] / per);
+                let c = groups * group;
+                // The element's block, and its column inside it.
+                let blk = format!(
+                    "(({AT} / {c}u) * {}u + (({AT} % {c}u) / {group}u) * {per}u)",
+                    groups * per
+                );
+                let cb = format!("(({AT} % {c}u) % {group}u)");
+                let byte = |off: &str| {
+                    format!(
+                        "((uint)(int)(0.0f + {}) & 0xFFu)",
+                        at_index(&qe, &format!("{blk} + {off}"))
+                    )
+                };
+                let qv = match trits {
+                    Trits::Slots2 => format!(
+                        "float(int(({} >> (({cb} % 4u) * 2u)) & 3u) - 1)",
+                        byte(&format!("{cb} / 4u"))
+                    ),
+                    Trits::Dense => {
+                        self.tern = true;
+                        // Which lane group the column falls in. Constant
+                        // per column, so it folds away in the unrolled loop.
+                        let off = format!(
+                            "({cb} < 80u ? {cb} % 16u : ({cb} < 120u ? 16u + ({cb} - 80u) % 8u                              : 24u + ({cb} - 120u) % 2u))"
+                        );
+                        let step = format!(
+                            "({cb} < 80u ? {cb} / 16u : ({cb} < 120u ? ({cb} - 80u) / 8u                              : ({cb} - 120u) / 2u))"
+                        );
+                        format!("float(int(tern_code({}, {step})) - 1)", byte(&off))
+                    }
+                };
+                let gidx = format!("({AT} / {c}u) * {groups}u + ({AT} % {c}u) / {group}u");
+                let e = format!("({qv} * float({}))", at_index(&se, &gidx));
+                self.dq.insert(
+                    x,
+                    Dq {
+                        v: qv,
+                        s: format!("float({se})"),
+                        m: None,
+                        cols: c,
+                        group: *group,
+                        row: None,
+                        pack: Pack::None,
+                    },
+                );
+                self.locs
+                    .insert(x, Loc::Lazy(e, reg(DType::F32, &[r, c])));
+            }
+            Op::DequantTernary(q, sc, group, trits) => {
+                let x = dst.ok_or("op without a result")?;
+                let tq = self.arg_ty(*q)?;
+                let per = trits.bytes();
+                let (r, groups) = (tq.shape[0], tq.shape[1] / per);
+                let (c, n) = (groups * group, r * groups * group);
+                let ops = self.operands(&[*q, *sc], &[false, false], n)?;
+                let sv = Self::read(
+                    &ops[1].0,
+                    &format!("(e / {c}u) * {groups}u + (e % {c}u) / {group}u"),
+                );
+                let name = self.declare_reg(x, &reg(DType::F32, &[r, c]));
+                // First byte of this element's block, and its column in it.
+                let mut body = vec![
+                    format!(
+                        "const uint tq_g = (e / {c}u) * {}u + ((e % {c}u) / {group}u) * {per}u;",
+                        groups * per
+                    ),
+                    format!("const uint tq_c = e % {group}u;"),
+                ];
+                // A byte is signed in the tile, so mask rather than cast:
+                // a negative i8 must come back as its unsigned value. The
+                // leading `0.0f +` is not arithmetic -- it forces expression
+                // context, or the reader's own `char(p)` cast parses as a
+                // declaration of `p` and the kernel will not compile.
+                let byte = |at: &str| {
+                    format!(
+                        "((uint)(int)(0.0f + {}) & 0xFFu)",
+                        Self::read(&ops[0].0, at)
+                    )
+                };
+                match trits {
+                    Trits::Slots2 => body.push(format!(
+                        "{name}[k] = float(int(({} >> ((tq_c % 4u) * 2u)) & 3u) - 1) * {sv};",
+                        byte("tq_g + tq_c / 4u")
+                    )),
+                    Trits::Dense => {
+                        body.extend([
+                            "uint tq_l; uint tq_s; uint tq_b;".into(),
+                            "if (tq_c < 80u) { tq_l = tq_c % 16u; tq_s = tq_c / 16u; tq_b = 0u; }"
+                                .into(),
+                            "else if (tq_c < 120u) { tq_l = (tq_c - 80u) % 8u;                              tq_s = (tq_c - 80u) / 8u; tq_b = 16u; }"
+                                .into(),
+                            "else { tq_l = (tq_c - 120u) % 2u; tq_s = (tq_c - 120u) / 2u;                              tq_b = 24u; }"
+                                .into(),
+                            format!("uint tq_v = {};", byte("tq_g + tq_b + tq_l")),
+                            "uint tq_t = 0u;".into(),
+                            "for (uint s = 0u; s <= tq_s; ++s)                              { tq_v *= 3u; tq_t = tq_v >> 8u; tq_v &= 0xFFu; }"
+                                .into(),
+                            format!("{name}[k] = float(int(tq_t) - 1) * {sv};"),
+                        ]);
+                    }
+                }
+                self.owned(n, &body);
             }
             Op::Dequant6(lo, hi, sc, group) => {
                 let x = dst.ok_or("op without a result")?;

@@ -24,7 +24,8 @@
 
 use std::path::Path;
 
-use lex_front::llama::{Split, split_q4_k, split_q6_k, split_q8_0};
+use lex_front::ir::Trits;
+use lex_front::llama::{Split, split_q4_k, split_q6_k, split_q8_0, split_ternary};
 
 use crate::gguf::{GgmlType, Gguf};
 
@@ -66,9 +67,11 @@ impl QMat {
             GgmlType::Q8_0 => split_q8_0(b),
             GgmlType::Q4_K => split_q4_k(b, t.dims[0]),
             GgmlType::Q6_K => split_q6_k(b),
+            GgmlType::PQ2_0 => split_ternary(b, Trits::Slots2),
+            GgmlType::PTQ1_0 => split_ternary(b, Trits::Dense),
             other => {
                 return Err(format!(
-                    "`{name}` is {other:?}; supported: Q8_0, Q4_K, Q6_K"
+                    "`{name}` is {other:?}; supported: Q8_0, Q4_K, Q6_K, PQ2_0, PTQ1_0"
                 ));
             }
         };

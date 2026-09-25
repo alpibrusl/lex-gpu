@@ -825,6 +825,34 @@ impl Checker<'_> {
                 }
                 Some(reg(DType::F32, &[r, c]))
             }
+            Op::DequantTernary(q, sc, group, trits) => {
+                let tys = self.args(&[*q, *sc])?;
+                let tq = self.tile(tys[0].clone(), "ternary codes")?;
+                let ts = self.tile(tys[1].clone(), "ternary scales")?;
+                if tq.dtype != DType::I8 {
+                    self.err(Kind::Type, "ternary codes must be I8".into());
+                    return None;
+                }
+                let r = tq.shape.first().copied().unwrap_or(0);
+                let bytes = tq.shape.get(1).copied().unwrap_or(0);
+                let groups = bytes / trits.bytes();
+                let c = groups * *group;
+                let ok = tq.shape.len() == 2
+                    && *group == 128
+                    && bytes.is_multiple_of(trits.bytes())
+                    && ts.shape == [r, groups];
+                if !ok {
+                    self.err(
+                        Kind::Shape,
+                        format!(
+                            "ternary of {:?} bytes with scales {:?} in groups of {group}",
+                            tq.shape, ts.shape
+                        ),
+                    );
+                    return None;
+                }
+                Some(reg(DType::F32, &[r, c]))
+            }
             Op::Dequant6(lo, hi, s, group) => {
                 let tys = self.args(&[*lo, *hi, *s])?;
                 let tl = self.tile(tys[0].clone(), "dequant6 low plane")?;

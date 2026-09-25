@@ -137,6 +137,17 @@ pub trait Dialect {
     /// the spelling of the reinterpretation differs.
     fn fp4_preamble(&self) -> String;
 
+    /// One dense-ternary byte's digits (see `docs/ternary.md`). Base 3
+    /// scaled across the byte range, so the digits come out by repeated
+    /// multiply-and-carry: no division, no table. Only the qualifier on a
+    /// device function differs between the two languages.
+    fn tern_preamble(&self) -> String {
+        TERN_FN.replace("$Q", self.device_fn())
+    }
+
+    /// How a non-entry function is declared.
+    fn device_fn(&self) -> &'static str;
+
     /// The entry point, from its name through the opening brace and the
     /// declarations that tell the body where this thread is.
     ///
@@ -216,6 +227,10 @@ impl Dialect for Msl {
 
     fn fp4_preamble(&self) -> String {
         FP4_TABLES_MSL.to_string()
+    }
+
+    fn device_fn(&self) -> &'static str {
+        "inline"
     }
 
     fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool, gid2: bool) -> String {
@@ -347,6 +362,10 @@ impl Dialect for Cuda {
         FP4_TABLES_CUDA.to_string()
     }
 
+    fn device_fn(&self) -> &'static str {
+        "__device__ __forceinline__"
+    }
+
     fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool, gid2: bool) -> String {
         let mut s = format!("extern \"C\" __global__ void {name}(\n");
         for p in params {
@@ -424,6 +443,15 @@ const FP4_TABLES_CUDA: &str = concat!(
     "    float r;\n",
     "    memcpy(&r, &out, sizeof(r));\n",
     "    return r;\n",
+    "}\n\n"
+);
+
+/// The dense-ternary digit extraction, shared by both dialects.
+const TERN_FN: &str = concat!(
+    "$Q uint tern_code(uint b, uint step) {\n",
+    "    uint t = 0u;\n",
+    "    for (uint s = 0u; s <= step; ++s) { b *= 3u; t = b >> 8u; b &= 0xFFu; }\n",
+    "    return t;\n",
     "}\n\n"
 );
 

@@ -253,6 +253,65 @@ pub enum Nibbles {
     Pairs,
 }
 
+/// How a ternary weight format packs trit codes, as Prism's two GGUF types
+/// do. Codes are `{0, 1, 2}` meaning `{-1, 0, +1}`; a block is 128 values
+/// against one f16 scale. See `docs/ternary.md` -- neither layout has a
+/// public specification, so both were derived from the weight files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Trits {
+    /// PQ2_0: one code per 2-bit slot, four per byte, little end first.
+    /// 32 bytes per block, 2.125 bits per weight with the scale.
+    Slots2,
+    /// PTQ1_0: 26 bytes per block, 1.75 bits per weight with the scale.
+    /// Three lane groups -- 16 bytes at stride 16, 8 at stride 8, 2 at
+    /// stride 2 -- each byte holding five codes (four in the last group)
+    /// as a base-3 number scaled across the whole byte range, so that
+    /// `(0,0,0,0,0)` is 0 and `(2,2,2,2,2)` is 255. Digits come out by
+    /// repeated `b *= 3; code = b >> 8; b &= 0xff`, most significant
+    /// first, which is why it needs no division and no table.
+    Dense,
+}
+
+impl Trits {
+    /// Bytes per 128-value block, values excluding the scale.
+    pub const fn bytes(self) -> usize {
+        match self {
+            Trits::Slots2 => 32,
+            Trits::Dense => 26,
+        }
+    }
+
+    /// Which byte of a block holds column `col`, and how many times the
+    /// decode must step to reach it.
+    pub const fn site(self, col: usize) -> (usize, usize) {
+        match self {
+            Trits::Slots2 => (col / 4, col % 4),
+            // The lane groups, widest first.
+            Trits::Dense if col < 80 => (col % 16, col / 16),
+            Trits::Dense if col < 120 => (16 + (col - 80) % 8, (col - 80) / 8),
+            Trits::Dense => (24 + (col - 120) % 2, (col - 120) / 2),
+        }
+    }
+
+    /// The code at `col` of a block whose bytes start at `b`.
+    pub fn code(self, b: &[u8], col: usize) -> u8 {
+        let (byte, step) = self.site(col);
+        match self {
+            Trits::Slots2 => (b[byte] >> (2 * step)) & 3,
+            Trits::Dense => {
+                let mut v = b[byte] as u32;
+                let mut code = 0;
+                for _ in 0..=step {
+                    v *= 3;
+                    code = (v >> 8) as u8;
+                    v &= 0xff;
+                }
+                code
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reduce {
     Max,
@@ -327,6 +386,15 @@ pub enum Op {
     /// Value `e2m1(q) * e4m3(s) * gs[row]`; output `[r, c]` in f32.
     /// `q: [r, c/2]`, `s: [r, c/group]`, `gs: [r]`.
     DequantFp4(Arg, Arg, Arg, usize),
+    /// Prism's ternary weights: trit codes in a [`Trits`] packing, meeting
+    /// one f16 scale per `group` values. Value `(code - 1) * s[r, c/group]`,
+    /// output `[r, c]` in f32. `q: [r, c/group * Trits::bytes]`,
+    /// `s: [r, c/group]`.
+    ///
+    /// The codes are near-uniform over the three values, so there is little
+    /// for a cheaper code to exploit -- which is what makes the dense
+    /// packing worth its arithmetic.
+    DequantTernary(Arg, Arg, usize, Trits),
     /// Unsigned 6-bit values split into bit planes, as Q6_K stores them: a
     /// 4-bit plane `lo: [r, c/2]` (column `2k` low nibble of byte `k`,
     /// `2k + 1` high) and a 2-bit plane `hi: [r, c/4]` (columns `4k..4k+3`

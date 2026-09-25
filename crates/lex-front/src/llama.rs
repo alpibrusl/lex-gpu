@@ -13,7 +13,8 @@
 use lex_ir::{DType, Space};
 
 use crate::ir::{
-    Arg, BinOp, Builder, IdxExpr, Nibbles, Op, Program, Reduce, TileTy, Ty, UnOp, Var, View,
+    Arg, BinOp, Builder, IdxExpr, Nibbles, Op, Program, Reduce, TileTy, Trits, Ty, UnOp, Var,
+    View,
 };
 
 fn reg(dt: DType, shape: &[usize]) -> TileTy {
@@ -77,6 +78,9 @@ pub struct QLayout {
     /// FP8 E4M3 scale per group, and one f32 scale for the whole tensor,
     /// held per row. 4.5 bits per weight, what Qwen3.8's MLX build uses.
     pub fp4: bool,
+    /// Prism's ternary formats: codes in a [`Trits`] packing against one
+    /// f16 scale per 128. `group` is 128 and no other flag applies.
+    pub ternary: Option<Trits>,
 }
 
 impl QLayout {
@@ -88,6 +92,7 @@ impl QLayout {
         packed4: false,
         six: false,
         fp4: false,
+        ternary: None,
     };
     /// Q6_K: 16 values per `i8` sub-block scale, 16 sub-blocks per f16 `d`;
     /// 6-bit values in a 4-bit and a 2-bit plane, centred at 0.
@@ -98,6 +103,7 @@ impl QLayout {
         packed4: false,
         six: true,
         fp4: false,
+        ternary: None,
     };
     /// Q4_K: 32 values per 6-bit scale and min, 8 per f16 `d` and `dmin`:
     /// `d * sc * q - dmin * m`, with the 4-bit values packed two per byte.
@@ -108,6 +114,7 @@ impl QLayout {
         packed4: true,
         six: false,
         fp4: false,
+        ternary: None,
     };
 
     /// NVFP4: 16 values, an FP8 E4M3 scale each, one f32 per tensor.
@@ -118,7 +125,35 @@ impl QLayout {
         packed4: true,
         six: false,
         fp4: true,
+        ternary: None,
     };
+
+    /// PQ2_0: 128 ternary codes in 2-bit slots, one f16 scale.
+    pub const PQ2_0: QLayout = QLayout::ternary_of(Trits::Slots2);
+    /// PTQ1_0: the same, densely packed. See `docs/ternary.md`.
+    pub const PTQ1_0: QLayout = QLayout::ternary_of(Trits::Dense);
+
+    const fn ternary_of(t: Trits) -> QLayout {
+        QLayout {
+            group: 128,
+            super_groups: None,
+            min: false,
+            packed4: false,
+            six: false,
+            fp4: false,
+            ternary: Some(t),
+        }
+    }
+
+    /// Bytes per row of `n_in` values, as the kernels' `I8` tensor holds
+    /// them: packed formats store fewer bytes than values.
+    pub fn row_bytes(self, n_in: usize) -> usize {
+        match self.ternary {
+            Some(t) => n_in / self.group * t.bytes(),
+            None if self.packed4 || self.six => n_in / 2,
+            None => n_in,
+        }
+    }
 
     fn tag(self) -> String {
         format!(
@@ -130,12 +165,20 @@ impl QLayout {
             if self.six { "q6" } else { "" }
         )
         .replace("g16p4", "nvfp4")
+            + match self.ternary {
+                Some(Trits::Slots2) => "pq2",
+                Some(Trits::Dense) => "ptq1",
+                None => "",
+            }
     }
 
     /// Weight parameters after the values, in order, with their dtypes and
     /// widths as a divisor of the row length.
     fn scale_params(self) -> Vec<(&'static str, DType, usize)> {
         let g = self.group;
+        if self.ternary.is_some() {
+            return vec![("ws", DType::F16, g)];
+        }
         if self.fp4 {
             // The FP8 scales; the tensor's own f32 scale is a separate
             // per-row parameter (see `QParams::declare`).
@@ -183,11 +226,7 @@ struct QParams {
 impl QParams {
     /// Declare `[n_out, n_in]` in `layout`, parameter names prefixed.
     fn declare(b: &mut Builder, pre: &str, n_in: usize, n_out: usize, layout: QLayout) -> QParams {
-        let qcols = if layout.packed4 || layout.six {
-            n_in / 2
-        } else {
-            n_in
-        };
+        let qcols = layout.row_bytes(n_in);
         let q = b.param(&format!("{pre}q"), DType::I8, &[n_out, qcols], false);
         let qh = layout
             .six
@@ -231,6 +270,20 @@ impl QParams {
                 ),
             )
         };
+        if let Some(t) = layout.ternary {
+            // The codes are not a whole number of bytes per value, so the
+            // chunk is addressed in bytes rather than through `load`.
+            let nb = kc / g * t.bytes();
+            let q = b.op(
+                "w",
+                Op::Load(
+                    at(self.q, [rows.clone(), IdxExpr::scaled(c, nb, 0)], [bo, nb]),
+                    reg(DType::I8, &[bo, nb]),
+                ),
+            );
+            let s = load(b, self.scales[0]);
+            return b.op("w", Op::DequantTernary(Move(q), Move(s), g, t));
+        }
         if let Some(gs) = self.gs {
             // NVFP4: E2M1 codes two per byte, an E4M3 scale per 16, and
             // this row's copy of the tensor's f32 scale.
@@ -832,6 +885,15 @@ impl Split {
 
     /// Quantised value `i`, unpacked if the layout is packed.
     pub fn value(&self, i: usize) -> f32 {
+        if let Some(t) = self.layout.ternary {
+            let (per, g) = (t.bytes(), self.layout.group);
+            let mut blk = [0u8; 32];
+            let base = i / g * per;
+            for (k, b) in blk[..per].iter_mut().enumerate() {
+                *b = self.q[base + k] as u8;
+            }
+            return t.code(&blk[..per], i % g) as f32 - 1.0;
+        }
         if self.layout.six {
             let lo = self.q[i / 2] as u8;
             let l = if i.is_multiple_of(2) {
@@ -861,10 +923,10 @@ impl Split {
     pub fn weight_tensors(&self, rows: usize) -> Vec<crate::Tensor> {
         use crate::Tensor;
         let qf = self.q_f32();
-        let n_in = if self.layout.packed4 || self.layout.six {
-            2 * qf.len() / rows
-        } else {
-            qf.len() / rows
+        let n_in = match self.layout.ternary {
+            Some(t) => qf.len() / rows / t.bytes() * self.layout.group,
+            None if self.layout.packed4 || self.layout.six => 2 * qf.len() / rows,
+            None => qf.len() / rows,
         };
         let mut out = vec![Tensor::new(DType::I8, &[rows, qf.len() / rows], &qf)];
         if self.layout.six {
@@ -916,6 +978,40 @@ pub fn split_q8_0(blocks: &[u8]) -> Split {
     }
     Split {
         layout: QLayout::Q8_0,
+        cols: 0,
+        q,
+        qh: vec![],
+        sc: vec![],
+        d,
+        mn: None,
+    }
+}
+
+/// Prism ternary blocks, 128 values each: `PQ2_0` is a scale then 32 code
+/// bytes, `PTQ1_0` is 26 code bytes then a scale. Codes stay packed -- the
+/// point of the format is that they are small -- so `q` holds the file's own
+/// bytes and the kernel unpacks them. See `docs/ternary.md`.
+pub fn split_ternary(blocks: &[u8], trits: Trits) -> Split {
+    let per = trits.bytes();
+    let stride = per + 2;
+    assert!(
+        blocks.len().is_multiple_of(stride),
+        "not whole {trits:?} blocks"
+    );
+    let n = blocks.len() / stride;
+    let mut q = Vec::with_capacity(n * per);
+    let mut d = Vec::with_capacity(n);
+    for blk in blocks.chunks_exact(stride) {
+        // The scale leads in PQ2_0 and trails in PTQ1_0.
+        let (codes, scale) = match trits {
+            Trits::Slots2 => (&blk[2..], f16_raw(blk, 0)),
+            Trits::Dense => (&blk[..per], f16_raw(blk, per)),
+        };
+        q.extend(codes.iter().map(|&b| b as i8));
+        d.push(scale);
+    }
+    Split {
+        layout: QLayout::ternary_of(trits),
         cols: 0,
         q,
         qh: vec![],
