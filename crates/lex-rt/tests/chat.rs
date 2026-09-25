@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use lex_rt::chat::{Call, parse_reply, render, tojson};
+use lex_rt::chat::{Call, parse_reply, render, render_within, tojson};
 use lex_rt::json::Json;
 
 fn dir() -> PathBuf {
@@ -203,4 +203,77 @@ fn a_streamed_reply_never_leaks_call_markup() {
     // What was streamed must be what the finished reply says it was.
     assert_eq!(content, reply.content);
     assert_eq!(reasoning, reply.reasoning);
+}
+
+fn long_conversation(turns: usize, chars: usize) -> Json {
+    let mut m = vec![
+        r#"{"role":"system","content":"SYSTEM MARKER"}"#.to_string(),
+        r#"{"role":"user","content":"FIRST USER"}"#.to_string(),
+    ];
+    for i in 0..turns {
+        m.push(format!(
+            r#"{{"role":"assistant","content":"","tool_calls":[{{"id":"c{i}","type":"function",
+               "function":{{"name":"grep","arguments":"{{\"pattern\":\"p{i}\"}}"}}}}]}}"#
+        ));
+        m.push(format!(
+            r#"{{"role":"tool","content":"{}"}}"#,
+            "out ".repeat(chars / 4)
+        ));
+    }
+    m.push(r#"{"role":"user","content":"LAST USER"}"#.to_string());
+    Json::parse(&format!(r#"{{"messages":[{}]}}"#, m.join(","))).expect("json")
+}
+
+/// Every `<tool_response>` has to sit inside a turn someone opened. Drop
+/// an assistant message but keep the tool results that answered it and the
+/// prompt is malformed in a way nothing downstream reports.
+fn tool_responses_are_inside_a_user_turn(prompt: &str) -> bool {
+    prompt
+        .split("<|im_start|>")
+        .skip(1)
+        .all(|block| !block.contains("<tool_response>") || block.starts_with("user\n"))
+}
+
+#[test]
+fn a_conversation_that_fits_is_left_alone() {
+    let req = long_conversation(2, 40);
+    let mut count = |s: &str| s.len() / 4;
+    let (prompt, dropped) = render_within(&req, 1_000_000, &mut count).expect("render");
+    assert_eq!(dropped, 0);
+    assert_eq!(prompt, render(&req).unwrap());
+}
+
+#[test]
+fn an_overlong_conversation_drops_whole_turns_from_the_front() {
+    let req = long_conversation(40, 400);
+    // A crude token count: the point is the trimming, not the tokenizer.
+    let mut count = |s: &str| s.len() / 4;
+    let budget = 4000;
+    let (prompt, dropped) = render_within(&req, budget, &mut count).expect("render");
+
+    assert!(dropped > 0, "nothing was dropped, so nothing is being tested");
+    assert!(count(&prompt) <= budget, "still over budget after trimming");
+    // The two that must survive: the tools and goal live in the system
+    // block, and the last turn is the one being answered.
+    assert!(prompt.contains("SYSTEM MARKER"), "system message was dropped");
+    assert!(prompt.contains("LAST USER"), "the turn being answered was dropped");
+    assert!(!prompt.contains("FIRST USER"), "an old turn survived; nothing was trimmed");
+    assert!(
+        tool_responses_are_inside_a_user_turn(&prompt),
+        "a tool response was orphaned by the trim:\n{}",
+        prompt
+    );
+    // It must drop no more than it has to.
+    let kept_tools = prompt.matches("<tool_response>").count();
+    assert!(kept_tools > 0, "trimmed all the way past every tool result");
+}
+
+#[test]
+fn a_single_turn_too_big_for_the_window_is_still_an_error() {
+    let req = long_conversation(1, 40);
+    let mut count = |s: &str| s.len() / 4;
+    assert!(
+        render_within(&req, 5, &mut count).is_err(),
+        "a window that cannot hold even the last turn has to say so"
+    );
 }

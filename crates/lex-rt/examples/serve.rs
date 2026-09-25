@@ -41,7 +41,13 @@ use lex_rt::json::Json;
 
     pub fn main() -> Result<(), String> {
         let mut model = "qwen3.8:27b-mlx".to_string();
-        let (mut port, mut max_seq, mut depth) = (8080u16, 4096usize, 1usize);
+        // 4096 was a decode benchmark's window; an agent's transcript passes
+        // it inside a few tool calls. 8192 is a compromise and not a happy
+        // one: prefill runs at 66-82 tok/s here and there is no prefix
+        // cache, so every turn re-reads the whole transcript and a 32k
+        // window costs about eight minutes a turn. Raise it with --max-seq
+        // when the context matters more than the latency.
+        let (mut port, mut max_seq, mut depth) = (8080u16, 8192usize, 1usize);
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -155,34 +161,29 @@ use lex_rt::json::Json;
         let stream = matches!(j.get("stream"), Some(Json::Bool(true)));
         let asked = j.get("max_tokens").and_then(Json::usize).unwrap_or(512);
 
-        let prompt = match chat::render(&j) {
-            Ok(p) => p,
-            Err(e) => {
-                return send(
-                    conn,
-                    400,
-                    "application/json",
-                    &format!(r#"{{"error":{{"message":{}}}}}"#, quote(&e)),
-                );
-            }
-        };
+        // Keep room for a reply: a prompt that fills the window exactly can
+        // generate nothing, which is a refusal by another name.
+        let room = (max_seq / 4).min(1024);
+        let (prompt, dropped) =
+            match chat::render_within(&j, max_seq - room, &mut |t| tok.encode(t).len()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return send(
+                        conn,
+                        400,
+                        "application/json",
+                        &format!(r#"{{"error":{{"message":{}}}}}"#, quote(&e)),
+                    );
+                }
+            };
+        if dropped > 0 {
+            eprintln!("dropped {dropped} of the oldest messages to fit {max_seq} tokens");
+        }
         let ids = tok.encode(&prompt);
         // `max_tokens` is a ceiling on the reply, not a reservation of
         // context. Clients routinely ask for the whole window and mean
         // "as much as fits" -- lex-llm's OpenAI adapter sends 8192 -- so
-        // refusing that is refusing every such client. Only a prompt with
-        // no room left after it is an error.
-        if ids.len() >= max_seq {
-            return send(
-                conn,
-                400,
-                "application/json",
-                &format!(
-                    r#"{{"error":{{"message":"{} prompt tokens leaves no room in {max_seq}"}}}}"#,
-                    ids.len()
-                ),
-            );
-        }
+        // refusing that is refusing every such client.
         let want = asked.min(max_seq - ids.len());
 
         // Each request is its own conversation: the cache holds one, and
@@ -358,6 +359,12 @@ use lex_rt::json::Json;
     }
 
     fn send(conn: &mut TcpStream, code: u16, ty: &str, body: &str) -> Result<(), String> {
+        // A refusal the caller only sees as "HTTP 400" is a refusal nobody
+        // can act on: the client library reports the status and drops the
+        // body, so the reason has to reach this side's log too.
+        if code != 200 {
+            eprintln!("{code}: {body}");
+        }
         let head = format!(
             "HTTP/1.1 {code} {}\r\ncontent-type: {ty}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             if code == 200 { "OK" } else { "Error" },

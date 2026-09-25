@@ -466,3 +466,80 @@ fn settled(all: &str) -> usize {
     }
     all.len()
 }
+
+/// Where each droppable turn starts, oldest first.
+///
+/// A turn is an assistant message with the tool results that answer it, or
+/// a lone user message. Grouping matters: the template opens a turn for a
+/// `tool` message only when the message before it is not one, so dropping
+/// half a tool exchange leaves a `<tool_response>` with nothing to open it.
+fn turns(msgs: &[Json]) -> Vec<usize> {
+    let mut out = vec![];
+    for (i, m) in msgs.iter().enumerate() {
+        let role = m.get("role").and_then(Json::str).unwrap_or("user");
+        // The leading system message carries the tools and the goal, so it
+        // is not a turn and never goes.
+        if i == 0 && role == "system" {
+            continue;
+        }
+        if role != "tool" {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Render `req`, dropping the oldest turns until the prompt fits `budget`
+/// tokens. Returns the prompt and how many messages were dropped.
+///
+/// Refusing an over-long conversation is what the OpenAI spec says and it
+/// is useless here: an agent loop's transcript only grows, so the run dies
+/// partway through with the work half done. Ollama drops history and keeps
+/// going, which is why it finishes tasks this did not. So this drops too --
+/// whole turns, oldest first, never the system message and never the last
+/// turn, which is the one actually being answered.
+pub fn render_within(
+    req: &Json,
+    budget: usize,
+    count: &mut dyn FnMut(&str) -> usize,
+) -> Result<(String, usize), String> {
+    let full = render(req)?;
+    if count(&full) <= budget {
+        return Ok((full, 0));
+    }
+    let msgs = req.get("messages").and_then(Json::arr).ok_or("no messages")?;
+    let starts = turns(msgs);
+    let keep_from = |d: usize| -> Result<String, String> {
+        let mut kept: Vec<Json> = vec![];
+        if msgs[0].get("role").and_then(Json::str) == Some("system") {
+            kept.push(msgs[0].clone());
+        }
+        kept.extend(msgs[starts[d]..].iter().cloned());
+        let Json::Obj(mut o) = req.clone() else {
+            return Err("request is not an object".into());
+        };
+        o.insert("messages".into(), Json::Arr(kept));
+        render(&Json::Obj(o))
+    };
+    // Binary search the fewest turns to drop: the prompt only shrinks as
+    // more go, and tokenising a long transcript is not cheap enough to
+    // walk one at a time.
+    let (mut lo, mut hi) = (0usize, starts.len().saturating_sub(1));
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if count(&keep_from(mid)?) <= budget {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let out = keep_from(lo)?;
+    if count(&out) > budget {
+        return Err(format!(
+            "the last turn alone is {} tokens, over the {budget} the window leaves",
+            count(&out)
+        ));
+    }
+    let head = usize::from(msgs[0].get("role").and_then(Json::str) == Some("system"));
+    Ok((out, starts[lo] - head))
+}
