@@ -103,7 +103,7 @@ pub fn rope_tables(pos: usize, rot: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use gpu::{Checkpoint, MAX_BATCH, Runner};
+pub use gpu::{Checkpoint, MAX_BATCH, Runner, evict_index};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gpu {
@@ -333,6 +333,27 @@ mod gpu {
     /// updated in place, and a verify that feeds four tokens updates it
     /// four times. 48 layers x 3.1 MB, copied on the GPU at roughly 0.6 ms
     /// a round, under 2% of a pass.
+    /// Which checkpoint to drop when a pool is full, by position.
+    ///
+    /// Dropping the oldest is the obvious rule and the wrong one. Turn
+    /// boundaries bunch up wherever turns are short, so a pool of the six
+    /// newest can sit entirely inside the last few thousand tokens -- and
+    /// then a prompt that diverges earlier than all of them resumes from
+    /// nothing. Measured over a four-task lex-code run: ten of forty-two
+    /// requests re-read their whole prompt with a usable prefix sitting
+    /// right there, 105326 tokens thrown away.
+    ///
+    /// So drop the most redundant one instead: the interior point whose
+    /// removal widens the smallest gap. That thins the crowded end first
+    /// and keeps the pool spread across the conversation. The newest is
+    /// never dropped -- it is the one the next turn most likely wants --
+    /// and neither is the oldest, which is the only fallback for a prompt
+    /// that diverges early.
+    pub fn evict_index(positions: &[usize]) -> Option<usize> {
+        (1..positions.len().checked_sub(1)?)
+            .min_by_key(|&i| positions[i + 1] - positions[i - 1])
+    }
+
     /// A resumable point in a conversation: the position, and the whole
     /// recurrent state there. See [`Runner::checkpoint`].
     pub struct Checkpoint {

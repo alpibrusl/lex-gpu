@@ -32,7 +32,7 @@ mod serve {
 
     use lex_rt::chat::{self, Piece, Stream};
 use lex_rt::json::Json;
-    use lex_rt::qwen_run::{Checkpoint, Runner};
+    use lex_rt::qwen_run::{Checkpoint, Runner, evict_index};
     use lex_rt::tokenizer::Tokenizer;
 
     /// What the model says to end a turn. `generation_config.json` lists
@@ -124,7 +124,11 @@ use lex_rt::json::Json;
         fn push(&mut self, c: Checkpoint) {
             self.points.push(c);
             while self.points.len() > KEEP {
-                self.points.remove(0);
+                let at: Vec<usize> = self.points.iter().map(Checkpoint::pos).collect();
+                match evict_index(&at) {
+                    Some(i) => self.points.remove(i),
+                    None => self.points.remove(0),
+                };
             }
         }
 
@@ -382,20 +386,15 @@ use lex_rt::json::Json;
             Some(t) => (start + 1..ids.len()).filter(|&i| ids[i] == t).collect(),
             None => vec![],
         };
-        // Only the last few are worth the copy; the pool would drop the
-        // rest anyway.
-        let first_kept = bounds.len().saturating_sub(KEEP);
         let mut at = start;
         let mut logits = vec![];
-        for (n, &b) in bounds.iter().enumerate() {
+        for &b in &bounds {
             if b <= at {
                 continue;
             }
             logits = rt.prefill(&ids[at..b])?;
             at = b;
-            if n >= first_kept {
-                cache.push(rt.checkpoint());
-            }
+            cache.push(rt.checkpoint());
         }
         if at < ids.len() {
             logits = rt.prefill(&ids[at..])?;
