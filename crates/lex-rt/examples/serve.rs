@@ -32,6 +32,7 @@ mod serve {
 
     use lex_rt::chat::{self, Piece, Stream};
 use lex_rt::json::Json;
+use lex_rt::sample::Sampler;
     use lex_rt::qwen_run::{Checkpoint, Runner, evict_index};
     use lex_rt::tokenizer::Tokenizer;
 
@@ -217,6 +218,23 @@ use lex_rt::json::Json;
         };
         let stream = matches!(j.get("stream"), Some(Json::Bool(true)));
         let asked = j.get("max_tokens").and_then(Json::usize).unwrap_or(512);
+        // The checkpoint's own generation_config: do_sample, 1.0, 0.95, 20.
+        // Greedy decoding is not a neutral default for a thinking model --
+        // it repeats until the client gives up.
+        let num = |k: &str| j.get(k).and_then(Json::num);
+        let temperature = num("temperature").unwrap_or(1.0) as f32;
+        let top_p = num("top_p").unwrap_or(0.95) as f32;
+        let top_k = j.get("top_k").and_then(Json::usize).unwrap_or(20);
+        let seed = j
+            .get("seed")
+            .and_then(Json::usize)
+            .map_or_else(now, |s| s as u64);
+        let mut sampler = Sampler::new(temperature, top_p, top_k, seed);
+        // Speculation verifies against the greedy token, so accepting its
+        // drafts under a sampled distribution would quietly bias what the
+        // model says. Proper speculative sampling has an accept/reject
+        // rule for this; until that exists, one or the other.
+        let depth = if temperature > 0.0 { 0 } else { depth };
 
         // Keep room for a reply: a prompt that fills the window exactly can
         // generate nothing, which is a refusal by another name.
@@ -295,7 +313,7 @@ use lex_rt::json::Json;
             };
             sse(conn, &chunk(r#"{"role":"assistant"}"#, "null".into()))?;
             let mut split = Stream::default();
-            let (text, reason, _) = generate(rt, tok, stop, depth, want, logits, &mut |all| {
+            let (text, reason, _) = generate(rt, tok, stop, depth, want, logits, &mut sampler, &mut |all| {
                 for p in split.push(all) {
                     // Reasoning goes in its own field. A client that shows
                     // `content` should not be shown the model's notes, and
@@ -334,7 +352,7 @@ use lex_rt::json::Json;
             return conn.flush().map_err(|e| e.to_string());
         }
 
-        let (text, reason, n) = generate(rt, tok, stop, depth, want, logits, &mut |_| Ok(()))?;
+        let (text, reason, n) = generate(rt, tok, stop, depth, want, logits, &mut sampler, &mut |_| Ok(()))?;
         let reply = chat::parse_reply(&text, &types);
         let calls: Vec<String> = reply
             .calls
@@ -402,7 +420,8 @@ use lex_rt::json::Json;
         Ok(logits)
     }
 
-    /// Decode greedily, handing each new piece of text to `emit`.
+    #[allow(clippy::too_many_arguments)]
+    /// Decode, handing everything said so far to `emit` as it grows.
     ///
     /// Text comes out per token, and a token can end in the middle of a
     /// character -- a three-byte character split across two tokens is
@@ -416,16 +435,12 @@ use lex_rt::json::Json;
         depth: usize,
         want: usize,
         logits: Vec<f32>,
+        sampler: &mut Sampler,
         emit: &mut dyn FnMut(&str) -> Result<(), String>,  // everything said so far
     ) -> Result<(String, &'static str, usize), String> {
-        let argmax = |v: &[f32]| {
-            (0..v.len())
-                .max_by(|&a, &b| v[a].total_cmp(&v[b]))
-                .expect("logits") as u32
-        };
         let mut out: Vec<u32> = vec![];
         let mut said = String::new();
-        let mut next = argmax(&logits);
+        let mut next = sampler.pick(&logits);
         let mut reason = "length";
 
         while out.len() < want {
@@ -440,7 +455,7 @@ use lex_rt::json::Json;
             } else {
                 let l = rt.step(next)?;
                 let c = vec![next];
-                next = argmax(&l);
+                next = sampler.pick(&l);
                 c
             };
             for t in committed {
