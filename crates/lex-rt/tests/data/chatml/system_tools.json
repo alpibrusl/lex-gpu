@@ -1,0 +1,36 @@
+{
+  "messages": [
+    {
+      "content": "Be brief.",
+      "role": "system"
+    },
+    {
+      "content": "hi",
+      "role": "user"
+    }
+  ],
+  "tools": [
+    {
+      "function": {
+        "description": "Add two numbers.",
+        "name": "add",
+        "parameters": {
+          "properties": {
+            "a": {
+              "type": "string"
+            },
+            "b": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "a",
+            "b"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

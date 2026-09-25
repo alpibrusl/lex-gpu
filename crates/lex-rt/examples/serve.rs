@@ -30,7 +30,8 @@ mod serve {
     use std::net::{TcpListener, TcpStream};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use lex_rt::json::Json;
+    use lex_rt::chat::{self, Piece, Stream};
+use lex_rt::json::Json;
     use lex_rt::qwen_run::Runner;
     use lex_rt::tokenizer::Tokenizer;
 
@@ -154,7 +155,7 @@ mod serve {
         let stream = matches!(j.get("stream"), Some(Json::Bool(true)));
         let asked = j.get("max_tokens").and_then(Json::usize).unwrap_or(512);
 
-        let prompt = match chat_ml(&j) {
+        let prompt = match chat::render(&j) {
             Ok(p) => p,
             Err(e) => {
                 return send(
@@ -191,47 +192,91 @@ mod serve {
         let logits = rt.prefill(&ids)?;
         let id = format!("chatcmpl-{}", now());
 
+        // The declared tools, so a call's arguments can come back typed:
+        // the model writes `17` and only the schema knows it meant a number.
+        let types: Vec<Json> = j.get("tools").and_then(Json::arr).unwrap_or(&[]).to_vec();
+
         if stream {
             let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
                         cache-control: no-cache\r\nconnection: close\r\n\r\n";
             conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
-            let first = format!(
-                r#"{{"id":{},"object":"chat.completion.chunk","created":{},"model":{},"choices":[{{"index":0,"delta":{{"role":"assistant"}},"finish_reason":null}}]}}"#,
-                quote(&id),
-                now(),
-                quote(model)
-            );
-            sse(conn, &first)?;
-            let (_, reason, _) = generate(rt, tok, stop, depth, want, logits, &mut |piece| {
-                let chunk = format!(
-                    r#"{{"id":{},"object":"chat.completion.chunk","created":{},"model":{},"choices":[{{"index":0,"delta":{{"content":{}}},"finish_reason":null}}]}}"#,
+            let chunk = |delta: &str, finish: String| {
+                format!(
+                    r#"{{"id":{},"object":"chat.completion.chunk","created":{},"model":{},"choices":[{{"index":0,"delta":{delta},"finish_reason":{finish}}}]}}"#,
                     quote(&id),
                     now(),
-                    quote(model),
-                    quote(piece)
-                );
-                sse(conn, &chunk)
+                    quote(model)
+                )
+            };
+            sse(conn, &chunk(r#"{"role":"assistant"}"#, "null".into()))?;
+            let mut split = Stream::default();
+            let (text, reason, _) = generate(rt, tok, stop, depth, want, logits, &mut |all| {
+                for p in split.push(all) {
+                    // Reasoning goes in its own field. A client that shows
+                    // `content` should not be shown the model's notes, and
+                    // an adapter looking for a tool call must not have to
+                    // dig it out of them.
+                    let d = match &p {
+                        Piece::Reasoning(t) => format!(r#"{{"reasoning_content":{}}}"#, quote(t)),
+                        Piece::Content(t) => format!(r#"{{"content":{}}}"#, quote(t)),
+                    };
+                    sse(conn, &chunk(&d, "null".into()))?;
+                }
+                Ok(())
             })?;
-            let last = format!(
-                r#"{{"id":{},"object":"chat.completion.chunk","created":{},"model":{},"choices":[{{"index":0,"delta":{{}},"finish_reason":{}}}]}}"#,
-                quote(&id),
-                now(),
-                quote(model),
-                quote(reason)
-            );
-            sse(conn, &last)?;
+            let (last, reply) = split.finish(&text, &types);
+            for p in last {
+                let d = match &p {
+                    Piece::Reasoning(t) => format!(r#"{{"reasoning_content":{}}}"#, quote(t)),
+                    Piece::Content(t) => format!(r#"{{"content":{}}}"#, quote(t)),
+                };
+                sse(conn, &chunk(&d, "null".into()))?;
+            }
+            // A call is only useful whole, so it goes in one chunk rather
+            // than as argument fragments.
+            for (n, c) in reply.calls.iter().enumerate() {
+                let d = format!(
+                    r#"{{"tool_calls":[{{"index":{n},"id":{},"type":"function","function":{{"name":{},"arguments":{}}}}}]}}"#,
+                    quote(&format!("call_{n}_{}", c.name)),
+                    quote(&c.name),
+                    quote(&c.arguments)
+                );
+                sse(conn, &chunk(&d, "null".into()))?;
+            }
+            let reason = finish_reason(reason, &reply);
+            sse(conn, &chunk("{}", quote(reason)))?;
             conn.write_all(b"data: [DONE]\n\n").map_err(|e| e.to_string())?;
             return conn.flush().map_err(|e| e.to_string());
         }
 
         let (text, reason, n) = generate(rt, tok, stop, depth, want, logits, &mut |_| Ok(()))?;
+        let reply = chat::parse_reply(&text, &types);
+        let calls: Vec<String> = reply
+            .calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                format!(
+                    r#"{{"id":{},"type":"function","function":{{"name":{},"arguments":{}}}}}"#,
+                    quote(&format!("call_{i}_{}", c.name)),
+                    quote(&c.name),
+                    quote(&c.arguments)
+                )
+            })
+            .collect();
+        let tool_calls = if calls.is_empty() {
+            String::new()
+        } else {
+            format!(r#","tool_calls":[{}]"#, calls.join(","))
+        };
         let payload = format!(
-            r#"{{"id":{},"object":"chat.completion","created":{},"model":{},"choices":[{{"index":0,"message":{{"role":"assistant","content":{}}},"finish_reason":{}}}],"usage":{{"prompt_tokens":{},"completion_tokens":{n},"total_tokens":{}}}}}"#,
+            r#"{{"id":{},"object":"chat.completion","created":{},"model":{},"choices":[{{"index":0,"message":{{"role":"assistant","content":{},"reasoning_content":{}{tool_calls}}},"finish_reason":{}}}],"usage":{{"prompt_tokens":{},"completion_tokens":{n},"total_tokens":{}}}}}"#,
             quote(&id),
             now(),
             quote(model),
-            quote(&text),
-            quote(reason),
+            quote(&reply.content),
+            quote(&reply.reasoning),
+            quote(finish_reason(reason, &reply)),
             ids.len(),
             ids.len() + n
         );
@@ -252,7 +297,7 @@ mod serve {
         depth: usize,
         want: usize,
         logits: Vec<f32>,
-        emit: &mut dyn FnMut(&str) -> Result<(), String>,
+        emit: &mut dyn FnMut(&str) -> Result<(), String>,  // everything said so far
     ) -> Result<(String, &'static str, usize), String> {
         let argmax = |v: &[f32]| {
             (0..v.len())
@@ -287,10 +332,8 @@ mod serve {
                 out.push(t);
             }
             let full = tok.decode(&out);
-            if let Some(piece) = full.strip_prefix(said.as_str())
-                && !piece.is_empty()
-            {
-                emit(piece)?;
+            if full != said {
+                emit(&full)?;
             }
             said = full;
             if reason == "stop" {
@@ -301,30 +344,11 @@ mod serve {
         Ok((said, reason, n))
     }
 
-    /// The messages as ChatML, which is what this checkpoint was trained
-    /// on and what its `tokenizer_config.json` template writes.
-    ///
-    /// The template in the checkpoint is Jinja, and evaluating Jinja is a
-    /// long way outside what this is for. The shape it produces for a
-    /// plain conversation is three lines of string building, so that is
-    /// what happens here -- and a checkpoint whose template is *not* this
-    /// shape would need reading rather than assuming.
-    fn chat_ml(j: &Json) -> Result<String, String> {
-        let msgs = j
-            .get("messages")
-            .and_then(Json::arr)
-            .ok_or("no `messages` array")?;
-        if msgs.is_empty() {
-            return Err("`messages` is empty".into());
-        }
-        let mut s = String::new();
-        for m in msgs {
-            let role = m.get("role").and_then(Json::str).unwrap_or("user");
-            let content = m.get("content").and_then(Json::str).unwrap_or("");
-            s.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
-        }
-        s.push_str("<|im_start|>assistant\n");
-        Ok(s)
+    /// `tool_calls` whenever the model asked for one, whatever the
+    /// decode loop stopped on: the agent loop dispatches on this field and
+    /// nothing else, so a call reported as "stop" is a call never run.
+    fn finish_reason(reason: &'static str, reply: &chat::Reply) -> &'static str {
+        if reply.calls.is_empty() { reason } else { "tool_calls" }
     }
 
     fn sse(conn: &mut TcpStream, data: &str) -> Result<(), String> {

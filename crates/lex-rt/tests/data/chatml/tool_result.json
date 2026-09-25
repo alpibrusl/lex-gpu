@@ -1,0 +1,53 @@
+{
+  "messages": [
+    {
+      "content": "What is 17 + 25?",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": {
+              "a": "17",
+              "b": "25"
+            },
+            "name": "add"
+          },
+          "id": "call_1",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "{\"result\":\"42\"}",
+      "role": "tool"
+    }
+  ],
+  "tools": [
+    {
+      "function": {
+        "description": "Add two numbers.",
+        "name": "add",
+        "parameters": {
+          "properties": {
+            "a": {
+              "type": "string"
+            },
+            "b": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "a",
+            "b"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

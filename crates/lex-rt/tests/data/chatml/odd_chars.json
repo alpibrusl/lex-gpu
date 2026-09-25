@@ -1,0 +1,29 @@
+{
+  "messages": [
+    {
+      "content": "hi",
+      "role": "user"
+    }
+  ],
+  "tools": [
+    {
+      "function": {
+        "description": "True when a < b & b > c, the 'usual' way \u2014 na\u00efvely.",
+        "name": "cmp",
+        "parameters": {
+          "properties": {
+            "a": {
+              "description": "<left>",
+              "type": "string"
+            }
+          },
+          "required": [
+            "a"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

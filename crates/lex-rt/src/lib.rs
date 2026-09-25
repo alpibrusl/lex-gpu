@@ -5,6 +5,7 @@
 //! decode loop needs a Metal device.
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod chat;
 pub mod dev;
 pub mod gguf;
 pub mod json;

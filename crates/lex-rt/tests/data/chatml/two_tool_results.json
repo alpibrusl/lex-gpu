@@ -1,0 +1,57 @@
+{
+  "messages": [
+    {
+      "content": "go",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": {
+              "a": "17",
+              "b": "25"
+            },
+            "name": "add"
+          },
+          "id": "call_1",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "a",
+      "role": "tool"
+    },
+    {
+      "content": "b",
+      "role": "tool"
+    }
+  ],
+  "tools": [
+    {
+      "function": {
+        "description": "Add two numbers.",
+        "name": "add",
+        "parameters": {
+          "properties": {
+            "a": {
+              "type": "string"
+            },
+            "b": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "a",
+            "b"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

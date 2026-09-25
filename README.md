@@ -159,16 +159,25 @@ An OpenAI-compatible endpoint: `GET /v1/models`, `POST
 /v1/chat/completions`, streaming and not. The official OpenAI Python
 client drives it unmodified, which is the point — an agent can use this
 without knowing what is behind it. So does
-[lex-llm](https://github.com/alpibrusl/lex-llm)'s agent loop, through its
-own OpenAI adapter and no new code: `providers.vllm_at("http://127.0.0.1:8080")`.
+[lex-llm](https://github.com/alpibrusl/lex-llm)'s agent loop, and so does
+[lex-code](https://github.com/alpibrusl/lex-code) — the coding agent runs a
+task here end to end, calling its own tools, against these kernels.
 
-Tool calling is the gap. The `tools` array of a request is accepted and
-dropped, so the model is never told the tools exist and answers from its
-own head — which it will say out loud if asked to use one. Closing it is
-two changes here and none in the client: render `tools` into the prompt in
-the form the chat template expects, and split `<think>` reasoning out of
-`content` into `reasoning_content`, after which a `<tool_call>` block in
-the reply is a shape the adapters already parse.
+Tool calling works: `tools` are rendered into the prompt, a `<tool_call>`
+reply comes back as OpenAI `tool_calls` with `finish_reason: "tool_calls"`,
+and the `<think>` block is split into `reasoning_content` so it neither
+pollutes the reply nor hides a call. Arguments are typed from the tool's
+own schema, because the model writes `17` and only the schema knows whether
+that was a number or a zip code.
+
+The chat template is the load-bearing part and it is not guessed:
+[`crates/lex-rt/src/chat.rs`](crates/lex-rt/src/chat.rs) is compared byte
+for byte against the template inside the checkpoint, rendered by
+[`scripts/chat_fixtures.py`](scripts/chat_fixtures.py). A wrong tool block
+does not fail loudly — it produces a model that never calls anything — so
+it is a golden test rather than an eyeball. Qwen3.8 wants
+`<function=name><parameter=k>`, not the `{"name":..,"arguments":..}` that
+earlier Qwens used.
 
 One request at a time, deliberately: there is one GPU and a 14.5 GB model
 on it, so a second caller queues rather than interleaving two sequences
