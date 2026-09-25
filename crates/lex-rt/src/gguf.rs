@@ -41,6 +41,7 @@ impl Value {
 pub enum GgmlType {
     F32,
     F16,
+    BF16,
     Q8_0,
     Q4_K,
     Q6_K,
@@ -57,6 +58,7 @@ impl GgmlType {
         match id {
             0 => GgmlType::F32,
             1 => GgmlType::F16,
+            30 => GgmlType::BF16,
             8 => GgmlType::Q8_0,
             12 => GgmlType::Q4_K,
             14 => GgmlType::Q6_K,
@@ -71,6 +73,7 @@ impl GgmlType {
         match self {
             GgmlType::F32 => Some((1, 4)),
             GgmlType::F16 => Some((1, 2)),
+            GgmlType::BF16 => Some((1, 2)),
             GgmlType::Q8_0 => Some((32, 34)),
             GgmlType::Q4_K => Some((256, 144)),
             GgmlType::Q6_K => Some((256, 210)),

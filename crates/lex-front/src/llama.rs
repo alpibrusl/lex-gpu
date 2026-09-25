@@ -54,6 +54,68 @@ pub fn rmsnorm(n: usize, eps: f32) -> Program {
     b.finish()
 }
 
+/// The activation transform that Bonsai 2's rotated weights expect of
+/// their input: an explicit per-column sign, then a normalized Sylvester
+/// Walsh-Hadamard over each `block` of the row.
+///
+/// The rotation is folded into the stored weights offline, so it costs no
+/// extra bits and no extra weight traffic -- but a runtime that skips it
+/// reads numbers from the wrong basis and gets noise. The file names the
+/// transform itself (`prism.hadamard.*`); see `docs/ternary.md`.
+///
+/// Normalized, `H` is symmetric and its own inverse, so `inverse` is the
+/// same butterflies with the sign applied after rather than before.
+///
+/// Which side the sign goes on is *not* stated by the metadata, only that
+/// it is explicit and per input element. This builds sign-then-rotate; if
+/// the model turns out to want the other order, it is this line and the
+/// matching `inverse` that change.
+pub fn hadamard_rotate(
+    rows: usize,
+    cols: usize,
+    block: usize,
+    inverse: bool,
+) -> Result<Program, String> {
+    use Arg::Move;
+    if !block.is_power_of_two() || !cols.is_multiple_of(block) {
+        return Err(format!(
+            "rotate {cols} columns in blocks of {block}: the block must be a power of two \
+             and divide the row"
+        ));
+    }
+    let dir = if inverse { "inv" } else { "fwd" };
+    let mut b = Builder::new(&format!("rotate_{rows}x{cols}_b{block}_{dir}"));
+    let px = b.param("x", DType::F32, &[rows, cols], false);
+    let ps = b.param("s", DType::F32, &[1, cols], false);
+    let py = b.param("y", DType::F32, &[rows, cols], true);
+    let all = |p, r| View {
+        param: p,
+        offset: vec![IdxExpr::lit(0), IdxExpr::lit(0)],
+        shape: vec![r, cols],
+    };
+    let mut v = b.op("x", Op::Load(all(px, rows), reg(DType::F32, &[rows, cols])));
+    let sg = b.op("s", Op::Load(all(ps, 1), reg(DType::F32, &[1, cols])));
+    if inverse {
+        let mut stride = 1;
+        while stride < block {
+            v = b.op("h", Op::Butterfly(Move(v), stride));
+            stride *= 2;
+        }
+        v = b.op("n", Op::Scale(Move(v), 1.0 / (block as f32).sqrt()));
+        v = b.op("ys", Op::Binary(BinOp::Mul, Move(v), Move(sg)));
+    } else {
+        v = b.op("xs", Op::Binary(BinOp::Mul, Move(v), Move(sg)));
+        let mut stride = 1;
+        while stride < block {
+            v = b.op("h", Op::Butterfly(Move(v), stride));
+            stride *= 2;
+        }
+        v = b.op("n", Op::Scale(Move(v), 1.0 / (block as f32).sqrt()));
+    }
+    b.effect(Op::Store(Move(v), all(py, rows)));
+    Ok(b.finish())
+}
+
 /// How a quantised matrix is laid out for the kernels: `I8` values, and per
 /// `group` values along a row either an f16 scale, or a two-level scale as
 /// the K-quants store it — a small integer `sc` per group times an f16 `d`

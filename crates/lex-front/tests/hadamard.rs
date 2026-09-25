@@ -144,3 +144,89 @@ fn a_bad_stride_is_rejected() {
         assert!(msg.contains(why), "stride {stride} on {cols}: wanted {why:?}, got {msg}");
     }
 }
+
+/// The whole activation transform Bonsai 2 asks for: sign, then a
+/// normalized blockwise Hadamard. Checked against the definition, not
+/// against another butterfly.
+#[test]
+fn the_rotation_matches_a_direct_normalized_hadamard() {
+    use lex_front::llama::hadamard_rotate;
+
+    for (rows, cols, block) in [(1usize, 1024usize, 1024usize), (3, 2048, 1024), (2, 32, 8)] {
+        let prog = hadamard_rotate(rows, cols, block, false).expect("build");
+        check(&prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+        let x = pattern(rows * cols, 3);
+        // An explicit +-1 per column, as the file stores it.
+        let sign: Vec<f32> = (0..cols)
+            .map(|c| if (c * 2_654_435_761usize).is_multiple_of(3) { -1.0 } else { 1.0 })
+            .collect();
+        let mut t = vec![
+            Tensor::new(DType::F32, &[rows, cols], &x),
+            Tensor::new(DType::F32, &[1, cols], &sign),
+            Tensor::zeros(DType::F32, &[rows, cols]),
+        ];
+        run(&prog, &mut t).expect("interpret");
+
+        let norm = 1.0 / (block as f32).sqrt();
+        let want: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                let (base, row) = (i - i % block, i % block);
+                norm * (0..block)
+                    .map(|col| {
+                        let sgn = if (row & col).count_ones() % 2 == 0 { 1.0 } else { -1.0 };
+                        sgn * sign[(base + col) % cols] * x[base + col]
+                    })
+                    .sum::<f32>()
+            })
+            .collect();
+        let worst = t[2]
+            .data
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let scale = want.iter().map(|v| v.abs()).fold(1e-6f32, f32::max);
+        assert!(
+            worst / scale < 1e-5,
+            "{rows}x{cols} block {block}: off by {worst:e} on {scale:e}"
+        );
+    }
+}
+
+/// Forward then inverse is the identity. An independent property: it holds
+/// only if the transform is orthogonal *and* the sign lands on the right
+/// side of it both ways.
+#[test]
+fn the_inverse_rotation_undoes_the_forward_one() {
+    use lex_front::llama::hadamard_rotate;
+
+    let (rows, cols, block) = (2usize, 2048usize, 1024usize);
+    let x = pattern(rows * cols, 17);
+    let sign: Vec<f32> = (0..cols)
+        .map(|c| if c % 5 < 2 { -1.0 } else { 1.0 })
+        .collect();
+    let mut fwd = vec![
+        Tensor::new(DType::F32, &[rows, cols], &x),
+        Tensor::new(DType::F32, &[1, cols], &sign),
+        Tensor::zeros(DType::F32, &[rows, cols]),
+    ];
+    run(&hadamard_rotate(rows, cols, block, false).unwrap(), &mut fwd).expect("forward");
+    let mid = fwd[2].data.clone();
+    assert!(
+        mid.iter().zip(&x).any(|(a, b)| (a - b).abs() > 1e-3),
+        "the forward rotation did nothing, so the round trip proves nothing"
+    );
+    let mut back = vec![
+        Tensor::new(DType::F32, &[rows, cols], &mid),
+        Tensor::new(DType::F32, &[1, cols], &sign),
+        Tensor::zeros(DType::F32, &[rows, cols]),
+    ];
+    run(&hadamard_rotate(rows, cols, block, true).unwrap(), &mut back).expect("inverse");
+    let worst = back[2]
+        .data
+        .iter()
+        .zip(&x)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst < 1e-4, "round trip off by {worst:e}");
+}
