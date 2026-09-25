@@ -185,6 +185,27 @@ One request at a time, deliberately: there is one GPU and a 14.5 GB model
 on it, so a second caller queues rather than interleaving two sequences
 through one KV cache. `--port`, `--max-seq` and `--depth` are the knobs.
 
+**It keeps the prefix.** An agent resends its whole history every turn —
+measured at 83–100% shared with the turn before, 92% overall — so the
+server resumes from the furthest point it has already read instead of
+re-reading it. The 16 attention layers need nothing kept, their KV cache
+is indexed by position; the 48 gated-delta layers compress their whole
+prefix into one evolving state with nothing to index into, so reuse means
+having kept a copy. Checkpoints sit at turn boundaries, because that is
+where the next prompt diverges: the harness re-renders the assistant turn
+it just received. 151 MB each, six kept, 0.4 ms to take.
+
+On one lex-code task, same binary, `LEX_NO_PREFIX_CACHE=1` for the
+ablation:
+
+| | prefill tokens | wall clock |
+| --- | --- | --- |
+| cache off | 35,972 | 16:00 |
+| cache on | 12,870 | 9:14 |
+
+Two of those three turns skipped 83% and 98% of their prefill; the first
+is a cold start and cannot. Longer runs amortise it further.
+
 The tokenizer comes from the checkpoint's own `tokenizer.json` in the
 Ollama store — byte-level BPE, written from the format because this
 repository is EUPL-1.2 and the reference tokenizers are Apache-2.0.

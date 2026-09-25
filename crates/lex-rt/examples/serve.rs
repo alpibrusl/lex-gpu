@@ -32,7 +32,7 @@ mod serve {
 
     use lex_rt::chat::{self, Piece, Stream};
 use lex_rt::json::Json;
-    use lex_rt::qwen_run::Runner;
+    use lex_rt::qwen_run::{Checkpoint, Runner};
     use lex_rt::tokenizer::Tokenizer;
 
     /// What the model says to end a turn. `generation_config.json` lists
@@ -76,9 +76,12 @@ use lex_rt::json::Json;
         );
 
         let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+        let mut cache = Cache::default();
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { continue };
-            if let Err(e) = handle(&mut conn, &mut rt, &tok, &stop, depth, &model, max_seq) {
+            if let Err(e) = handle(
+                &mut conn, &mut rt, &tok, &stop, depth, &model, max_seq, &mut cache,
+            ) {
                 // A client that hangs up mid-stream is ordinary, not an
                 // error worth stopping the server over.
                 eprintln!("request: {e}");
@@ -87,6 +90,51 @@ use lex_rt::json::Json;
         Ok(())
     }
 
+    /// What the runner already holds: the tokens it was last driven with,
+    /// and resumable points inside them.
+    ///
+    /// An agent resends its whole history every turn, so most of each
+    /// prompt has already been read once -- measured at 83-100% shared
+    /// with the turn before, 92% overall. Re-reading it is the difference
+    /// between a task taking minutes and taking an hour.
+    ///
+    /// Checkpoints sit at turn boundaries rather than at the end of the
+    /// last prompt, because the end is exactly what changes: the harness
+    /// re-renders the assistant turn it just received, so the shared
+    /// prefix stops short of it. A single end-of-prompt checkpoint would
+    /// miss every time.
+    #[derive(Default)]
+    struct Cache {
+        tokens: Vec<u32>,
+        points: Vec<Checkpoint>,
+    }
+
+    /// Roughly a gigabyte of them, at 151 MB each for this model.
+    const KEEP: usize = 6;
+
+    impl Cache {
+        /// How many leading tokens of `ids` the runner has already read.
+        fn shared(&self, ids: &[u32]) -> usize {
+            ids.iter()
+                .zip(&self.tokens)
+                .take_while(|(a, b)| a == b)
+                .count()
+        }
+
+        fn push(&mut self, c: Checkpoint) {
+            self.points.push(c);
+            while self.points.len() > KEEP {
+                self.points.remove(0);
+            }
+        }
+
+        fn clear(&mut self) {
+            self.points.clear();
+            self.tokens.clear();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn handle(
         conn: &mut TcpStream,
         rt: &mut Runner,
@@ -95,6 +143,7 @@ use lex_rt::json::Json;
         depth: usize,
         model: &str,
         max_seq: usize,
+        cache: &mut Cache,
     ) -> Result<(), String> {
         let mut r = BufReader::new(conn.try_clone().map_err(|e| e.to_string())?);
         let mut line = String::new();
@@ -127,7 +176,7 @@ use lex_rt::json::Json;
                 ),
             ),
             ("POST", "/v1/chat/completions") => {
-                chat(conn, rt, tok, stop, depth, model, max_seq, &body)
+                chat(conn, rt, tok, stop, depth, model, max_seq, &body, cache)
             }
             ("GET", "/health") => send(conn, 200, "text/plain", "ok\n"),
             _ => send(
@@ -149,6 +198,7 @@ use lex_rt::json::Json;
         model: &str,
         max_seq: usize,
         body: &str,
+        cache: &mut Cache,
     ) -> Result<(), String> {
         let j = match Json::parse(body) {
             Ok(j) => j,
@@ -189,11 +239,38 @@ use lex_rt::json::Json;
         // refusing that is refusing every such client.
         let want = asked.min(max_seq - ids.len());
 
-        // Each request is its own conversation: the cache holds one, and
-        // a caller that resends its history expects to be answered on it
-        // rather than on what the last caller left behind.
-        rt.reset();
-        let logits = rt.prefill(&ids)?;
+        // Resume as far into this prompt as the runner has already read.
+        // A caller that resends its history is answered on the history it
+        // sent -- the tokens are compared, so a different conversation
+        // shares nothing and starts over.
+        // The ablation: same binary, cache off, so the difference it makes
+        // is measured rather than argued.
+        if std::env::var_os("LEX_NO_PREFIX_CACHE").is_some() {
+            cache.clear();
+        }
+        let shared = cache.shared(&ids);
+        let at = cache.points.iter().rposition(|c| c.pos() <= shared);
+        let start = match at {
+            // Never resume at the very end: the prompt's last token has to
+            // go through the model for its logits.
+            Some(i) if cache.points[i].pos() > 0 && cache.points[i].pos() < ids.len() => {
+                rt.resume(&cache.points[i]);
+                cache.points.truncate(i + 1);
+                cache.points[i].pos()
+            }
+            _ => {
+                rt.reset();
+                cache.clear();
+                0
+            }
+        };
+        eprintln!(
+            "prefill {} tokens, {shared} already read, resuming at {start} ({:.0}% skipped)",
+            ids.len(),
+            100.0 * start as f64 / ids.len() as f64
+        );
+        let logits = prefill_cached(rt, tok, &ids, start, cache)?;
+        cache.tokens.clone_from(&ids);
         let id = format!("chatcmpl-{}", now());
 
         // The declared tools, so a call's arguments can come back typed:
@@ -285,6 +362,45 @@ use lex_rt::json::Json;
             ids.len() + n
         );
         send(conn, 200, "application/json", &payload)
+    }
+
+    /// Prefill `ids[start..]`, stopping at turn boundaries to keep a
+    /// resumable point at each of the last few.
+    ///
+    /// Boundaries, not fixed strides, because that is where the next
+    /// prompt will diverge: the harness re-renders the assistant turn it
+    /// just received, so the shared prefix ends where that turn began.
+    fn prefill_cached(
+        rt: &mut Runner,
+        tok: &Tokenizer,
+        ids: &[u32],
+        start: usize,
+        cache: &mut Cache,
+    ) -> Result<Vec<f32>, String> {
+        let turn = tok.id_of("<|im_start|>");
+        let bounds: Vec<usize> = match turn {
+            Some(t) => (start + 1..ids.len()).filter(|&i| ids[i] == t).collect(),
+            None => vec![],
+        };
+        // Only the last few are worth the copy; the pool would drop the
+        // rest anyway.
+        let first_kept = bounds.len().saturating_sub(KEEP);
+        let mut at = start;
+        let mut logits = vec![];
+        for (n, &b) in bounds.iter().enumerate() {
+            if b <= at {
+                continue;
+            }
+            logits = rt.prefill(&ids[at..b])?;
+            at = b;
+            if n >= first_kept {
+                cache.push(rt.checkpoint());
+            }
+        }
+        if at < ids.len() {
+            logits = rt.prefill(&ids[at..])?;
+        }
+        Ok(logits)
     }
 
     /// Decode greedily, handing each new piece of text to `emit`.

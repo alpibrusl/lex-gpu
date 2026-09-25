@@ -557,3 +557,62 @@ fn speculation_survives_rejected_drafts() {
     );
     eprintln!("{rejected} of {} rounds rejected, output identical", spec.len());
 }
+
+/// Resuming from a checkpoint lands where a clean prefill lands.
+///
+/// This is the whole safety of the prefix cache. 48 of the 64 layers are
+/// gated-delta: they keep no per-position cache to index into, only one
+/// evolving state, so resuming means having put that state back exactly.
+/// Put it back wrong and nothing errors -- the model simply answers from a
+/// history it never saw.
+///
+/// The state is deliberately dirtied between taking the checkpoint and
+/// resuming from it. Without that the test passes with `resume` deleted,
+/// because the runner would already be sitting where the checkpoint says.
+#[test]
+fn resuming_from_a_checkpoint_lands_where_a_clean_prefill_lands() {
+    let _lock = one_at_a_time();
+    let (model, _) = parse(include_str!("data/qwen35_27b_golden.txt"));
+    let prompt: Vec<u32> = (0..40).map(|i| 1000 + (i as u32 * 7919) % 200000).collect();
+    // A different continuation of the same prefix, to leave the recurrent
+    // state somewhere else entirely before resuming.
+    let other: Vec<u32> = (0..23).map(|i| 500 + (i as u32 * 104_729) % 150_000).collect();
+    let cut = 17;
+    let mut rt = match Runner::load(&model, prompt.len() + other.len() + 16) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+
+    rt.reset();
+    let clean = rt.prefill(&prompt).expect("clean prefill");
+
+    rt.reset();
+    rt.prefill(&prompt[..cut]).expect("prefix");
+    let point = rt.checkpoint();
+    assert_eq!(point.pos(), cut, "a checkpoint records where it was taken");
+
+    // Drive the model somewhere else, so resuming has real work to undo.
+    let strayed = rt.prefill(&other).expect("divergent continuation");
+    rt.resume(&point);
+    let resumed = rt.prefill(&prompt[cut..]).expect("resumed prefill");
+
+    let rel = |a: &[f32], b: &[f32]| {
+        let scale = a.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max) / scale
+    };
+    // The detour has to have moved the model, or nothing was restored.
+    assert!(
+        rel(&clean, &strayed) > 1e-2,
+        "the divergent continuation landed in the same place; the test would \
+         pass with `resume` deleted"
+    );
+    let worst = rel(&clean, &resumed);
+    assert!(
+        worst < 2e-3,
+        "resuming differs from a clean prefill by {worst:e} of scale"
+    );
+    eprintln!("resume vs clean prefill: worst {worst:e} of scale");
+}

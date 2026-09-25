@@ -103,7 +103,7 @@ pub fn rope_tables(pos: usize, rot: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use gpu::{MAX_BATCH, Runner};
+pub use gpu::{Checkpoint, MAX_BATCH, Runner};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gpu {
@@ -333,6 +333,28 @@ mod gpu {
     /// updated in place, and a verify that feeds four tokens updates it
     /// four times. 48 layers x 3.1 MB, copied on the GPU at roughly 0.6 ms
     /// a round, under 2% of a pass.
+    /// A resumable point in a conversation: the position, and the whole
+    /// recurrent state there. See [`Runner::checkpoint`].
+    pub struct Checkpoint {
+        pos: usize,
+        mtp_pos: usize,
+        state: Vec<Vec<f32>>,
+        conv: Vec<Vec<f32>>,
+    }
+
+    impl Checkpoint {
+        pub fn pos(&self) -> usize {
+            self.pos
+        }
+
+        /// Host bytes held, so a pool of these can bound itself.
+        pub fn bytes(&self) -> usize {
+            let f = size_of::<f32>();
+            f * (self.state.iter().map(Vec::len).sum::<usize>()
+                + self.conv.iter().map(Vec::len).sum::<usize>())
+        }
+    }
+
     struct Snapshot {
         state: Vec<Buffer>,
         conv: Vec<Buffer>,
@@ -1486,6 +1508,63 @@ mod gpu {
                 if let Mixer::Linear(lin) = &l.mixer {
                     self.gpu.write(&lin.state, 0, &zeros);
                     self.gpu.write(&lin.conv_state, 0, &win);
+                }
+            }
+        }
+
+        /// The recurrent state of every linear layer, so a later prompt
+        /// sharing this prefix can resume from here instead of re-reading
+        /// it.
+        ///
+        /// The 16 attention layers need nothing kept: their KV cache is
+        /// indexed by position, so a shared prefix is still sitting there.
+        /// A gated-delta layer is the opposite -- it compresses its whole
+        /// prefix into one evolving state, with nothing to index into, so
+        /// reuse means having kept a copy. 48 of this model's 64 layers
+        /// are that kind, which is why a prefix cache here is not the
+        /// usual one.
+        ///
+        /// 151 MB and about 0.4 ms for this model, against the minutes a
+        /// re-prefill costs.
+        pub fn checkpoint(&self) -> Checkpoint {
+            let n = self.cfg.v_heads * self.cfg.v_dim * self.cfg.k_dim;
+            let w = (self.cfg.conv_kernel - 1) * self.cfg.conv_channels();
+            let (mut state, mut conv) = (vec![], vec![]);
+            for l in &self.layers {
+                if let Mixer::Linear(lin) = &l.mixer {
+                    let mut x = vec![0.0f32; n];
+                    self.gpu.download(&lin.state, &mut x);
+                    state.push(x);
+                    let mut c = vec![0.0f32; w];
+                    self.gpu.download(&lin.conv_state, &mut c);
+                    conv.push(c);
+                }
+            }
+            Checkpoint {
+                pos: self.pos,
+                mtp_pos: self.mtp_pos,
+                state,
+                conv,
+            }
+        }
+
+        /// Resume from a checkpoint. The caller must have established that
+        /// the tokens up to `c.pos` are the same ones that produced it --
+        /// the attention layers read their KV cache straight through, so a
+        /// mismatched prefix is not an error, it is wrong numbers.
+        ///
+        /// Named apart from `restore`, which puts back a speculation
+        /// snapshot and is a different thing at a different scale.
+        pub fn resume(&mut self, c: &Checkpoint) {
+            self.pos = c.pos;
+            self.mtp_pos = c.mtp_pos;
+            self.spec_h = None;
+            let mut i = 0;
+            for l in &self.layers {
+                if let Mixer::Linear(lin) = &l.mixer {
+                    self.gpu.write(&lin.state, 0, &c.state[i]);
+                    self.gpu.write(&lin.conv_state, 0, &c.conv[i]);
+                    i += 1;
                 }
             }
         }
