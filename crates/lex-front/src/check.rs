@@ -713,6 +713,29 @@ impl Checker<'_> {
                 }
                 Some(reg(t.dtype, &t.shape))
             }
+            Op::Butterfly(a, stride) => {
+                let ty = self.args(&[*a])?.remove(0);
+                let t = self.tile(ty, "butterfly operand")?;
+                let n = t.shape.last().copied().unwrap_or(0);
+                // A stage pairs `i` with `i + stride`, so the width must
+                // be a whole number of `2 * stride` blocks or the last
+                // block has partners that do not exist.
+                if *stride == 0 || !stride.is_power_of_two() {
+                    self.err(
+                        Kind::Shape,
+                        format!("butterfly stride {stride} is not a power of two"),
+                    );
+                    return None;
+                }
+                if !n.is_multiple_of(2 * stride) {
+                    self.err(
+                        Kind::Shape,
+                        format!("butterfly at stride {stride} needs a multiple of {} , not {n}", 2 * stride),
+                    );
+                    return None;
+                }
+                Some(reg(t.dtype, &t.shape))
+            }
             Op::Dequant(q, s, m, group) | Op::Dequant4(q, s, m, group, _) => {
                 let pairs = matches!(op, Op::Dequant4(.., crate::ir::Nibbles::Pairs));
                 let mut ops = vec![*q, *s];

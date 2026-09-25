@@ -293,6 +293,26 @@ pub enum Op {
     /// Swap adjacent elements: `out[2i] = a[2i+1]`, `out[2i+1] = a[2i]`.
     /// With a sign-folded sine table this is RoPE's rotation of pairs.
     SwapPairs(Arg),
+    /// One stage of a Walsh-Hadamard butterfly at `stride`, over the last
+    /// dimension:
+    ///
+    /// ```text
+    /// out[i]          = a[i] + a[i + stride]
+    /// out[i + stride] = a[i] - a[i + stride]
+    /// ```
+    ///
+    /// for every `i` whose `stride` bit is clear. A width-`2^k` Hadamard
+    /// is `k` of these at strides 1, 2, 4 ... -- so the transform is a
+    /// sequence in the builder rather than an op of its own, and nothing
+    /// here has to know how wide the caller wanted it.
+    ///
+    /// It exists because low-bit weight formats increasingly store a
+    /// rotated basis: Bonsai 2's ternary weights are folded through a
+    /// blockwise Hadamard offline, and a runtime either applies the
+    /// matching rotation to activations or reads the wrong numbers.
+    /// [`Op::SwapPairs`] is the same shape of operation with the stride
+    /// fixed at one.
+    Butterfly(Arg, usize),
     /// `q[r,c] * s[r, c / group] - m[r, c / group]` in f32: quantised
     /// values meet their scales (and, for affine formats such as Q4_K, their
     /// mins). The only way to compute with an `I8` tile.

@@ -1141,6 +1141,40 @@ impl Gen<'_> {
                     &[format!("{name}[k] = {}({src});", self.d.scalar(ty.dtype))],
                 );
             }
+            Op::Butterfly(a, stride) => {
+                let x = dst.ok_or("op without a result")?;
+                let ty = self.arg_ty(*a)?;
+                let n = ty.elems();
+                let ops = self.operands(&[*a], &[false], n)?;
+                // `e ^ stride` is the partner. That stays inside the row
+                // and inside the transform's block because the checker
+                // requires the last dimension to be a multiple of
+                // `2 * stride` and the stride to be a power of two: the
+                // row base then has no bits below the stride to disturb.
+                let mine = Self::read(&ops[0].0, "e");
+                let theirs = Self::read(&ops[0].0, &format!("e ^ {stride}u"));
+                let sc = self.d.scalar(ty.dtype);
+                let name = self.declare_reg(x, &reg(ty.dtype, &ty.shape));
+                // Low partner adds, high partner subtracts, which is what
+                // makes the pair of outputs the sum and the difference.
+                // Through temporaries, not one nested expression. A
+                // direct read is `float(p0_x[...])`, and wrapping that in
+                // another `float(...)` is the most vexing parse: the
+                // compiler reads the inner one as declaring `p0_x` an
+                // array and says the size is not constant. Only the first
+                // stage hits it, because later ones read from scratch and
+                // `float((scratch + 0)[...])` cannot be a declarator.
+                self.owned(
+                    n,
+                    &[
+                        format!("const {sc} bfly_a = {mine};"),
+                        format!("const {sc} bfly_b = {theirs};"),
+                        format!(
+                            "{name}[k] = (e & {stride}u) ? bfly_b - bfly_a : bfly_a + bfly_b;"
+                        ),
+                    ],
+                );
+            }
             Op::Dequant(q, s, m, group) => {
                 let x = dst.ok_or("op without a result")?;
                 let tq = self.arg_ty(*q)?;

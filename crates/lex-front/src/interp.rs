@@ -542,6 +542,24 @@ impl Interp<'_> {
                 let out = (0..t.data.len()).map(|i| t.data[i ^ 1]).collect();
                 Some(Val::Tile(self.fresh(t.ty.dtype, &t.ty.shape, out)))
             }
+            Op::Butterfly(a, stride) => {
+                let t = self.arg(*a)?;
+                let n = *t.ty.shape.last().expect("checked");
+                let mut out = t.data.clone();
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let j = i % n;
+                    let base = i - j;
+                    // The low partner adds, the high one subtracts. Read
+                    // from `t.data` rather than from `out`, or the second
+                    // half of a pair sees the first half's new value.
+                    *slot = if j & stride == 0 {
+                        t.data[base + j] + t.data[base + j + stride]
+                    } else {
+                        t.data[base + j - stride] - t.data[base + j]
+                    };
+                }
+                Some(Val::Tile(self.fresh(t.ty.dtype, &t.ty.shape, out)))
+            }
             Op::Dequant(q, s, m, group) => {
                 let (tq, ts) = (self.arg(*q)?, self.arg(*s)?);
                 let tm = m.map(|m| self.arg(m)).transpose()?;

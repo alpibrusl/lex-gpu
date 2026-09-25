@@ -226,6 +226,53 @@ fn matvec_every_layout_matches_the_interpreter() {
     }
 }
 
+/// A blockwise Hadamard, on the GPU, against the interpreter.
+///
+/// The butterfly reads its partner at `e ^ stride`, which on a GPU means
+/// an element another thread owns. The interpreter has no threads and
+/// cannot tell whether that read is wired up, so this is the test that
+/// says the emitted code does what the op means.
+///
+/// The shape is the one Bonsai 2 needs: 1024-wide blocks inside a wider
+/// row, which is also the case where `e ^ stride` has to stay inside its
+/// own block rather than wandering into the neighbour's.
+#[test]
+fn a_blockwise_hadamard_matches_the_interpreter() {
+    use lex_front::ir::{Arg, Builder, IdxExpr, Op, TileTy, View};
+    use lex_ir::Space;
+
+    let gpu = Gpu::open().expect("metal device");
+    for (cols, width) in [(1024usize, 1024usize), (2048, 1024), (256, 256)] {
+        let mut b = Builder::new(&format!("hadamard_{cols}_w{width}"));
+        let px = b.param("x", DType::F32, &[1, cols], false);
+        let py = b.param("y", DType::F32, &[1, cols], true);
+        let v = |p| View {
+            param: p,
+            offset: vec![IdxExpr::lit(0), IdxExpr::lit(0)],
+            shape: vec![1, cols],
+        };
+        let ty = TileTy::new(DType::F32, &[1, cols], Space::Reg);
+        let mut x = b.op("x", Op::Load(v(px), ty));
+        let mut stride = 1;
+        while stride < width {
+            x = b.op("h", Op::Butterfly(Arg::Move(x), stride));
+            stride *= 2;
+        }
+        b.effect(Op::Store(Arg::Move(x), v(py)));
+        same(
+            &gpu,
+            &b.finish(),
+            vec![
+                Tensor::new(DType::F32, &[1, cols], &pattern(cols, 5)),
+                Tensor::zeros(DType::F32, &[1, cols]),
+            ],
+            &[],
+            1,
+            256,
+        );
+    }
+}
+
 #[test]
 fn rmsnorm_rope_silu_and_kv_append_match_the_interpreter() {
     let gpu = Gpu::open().expect("metal device");
