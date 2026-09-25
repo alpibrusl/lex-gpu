@@ -314,7 +314,22 @@ fn last_t(ss :: List[Sample], fallback :: Float) -> Float {
 # not clocked down, and idle read 17 W cold against 30-34 W warm. Measuring
 # a warm run against a cold baseline is what makes `marginal` swing by a
 # third while `total` holds to 3%.
-fn main(backend :: Str, engine :: Str, model :: Str, tokens :: Int, idle_s :: Int) -> [proc, net, io, time] Str {
+# `baseline_mw` is the background to subtract, in milliwatts; 0 measures
+# it here instead.
+#
+# Measuring it per run is what the first comparison did, and it is wrong
+# for comparing two engines: each one subtracted its own background, which
+# differed by eighty times on a Mac (5.54 W against 0.07 W), so the
+# marginal ratio said 1.69x where the totals said 1.92x. With one common
+# background the ratio comes back to 1.92x whichever value is used --
+# subtracting b*t from both changes the joules and never the ratio. Pass a
+# common one when comparing; measure one when you want this machine's own
+# absolute cost.
+#
+# `engine` "idle" measures the background and stops: run it with nothing
+# serving for the machine's floor, and again with a server up but untouched
+# for what merely holding a model costs.
+fn main(backend :: Str, engine :: Str, model :: Str, tokens :: Int, idle_s :: Int, baseline_mw :: Int) -> [proc, net, io, time] Str {
   let host := if engine == "ollama" { "http://127.0.0.1:11434" } else { "http://127.0.0.1:8080" }
   let apple := backend == "apple"
   let opts := { cwd: None, env: map.new(), stdin: None }
@@ -328,8 +343,9 @@ fn main(backend :: Str, engine :: Str, model :: Str, tokens :: Int, idle_s :: In
   # second leaves the warm-up's own samples sitting in the pipe, and the
   # idle window reads them: with a three-second warm-up the baseline came
   # back at 193 W against a 40 W idle rail, and `marginal` went negative.
-  let _w := io.print("warming up ...")
-  let _r := drive(engine, host, model, 16)
+  let measuring := engine != "idle"
+  let _w := if measuring { io.print("warming up ...") } else { io.print("background only") }
+  let _r := if measuring { drive(engine, host, model, 16) } else { Ok(0) }
   match process.spawn(bin, args, opts) {
     Err(e) => str.join(["cannot start ", bin, ": ", e], ""),
     Ok(h) => {
@@ -339,7 +355,16 @@ fn main(backend :: Str, engine :: Str, model :: Str, tokens :: Int, idle_s :: In
       let _n := io.print(str.join(["idle baseline for ", int.to_str(idle_s), "s ..."], ""))
       let idle := sample_to(h, apple, t_start + int.to_float(idle_s), 4000, t_start)
       let idle_end := last_t(idle, t_start)
-      let idle_w := if idle_end > t_start { joules(idle, t_start, idle_end) / (idle_end - t_start) } else { 0.0 }
+      let measured_w := if idle_end > t_start { joules(idle, t_start, idle_end) / (idle_end - t_start) } else { 0.0 }
+      # A baseline given on the command line wins, so two engines can be
+      # compared against the same background.
+      let idle_w := if baseline_mw > 0 { int.to_float(baseline_mw) / 1000.0 } else { measured_w }
+      if not measuring {
+        let _k2 := process.kill(h, "TERM")
+        str.join(["\nbackground    ", float.to_str(measured_w), " W over ", int.to_str(idle_s), "s",
+                  "\n\nRun this with nothing serving for the machine's floor, and again",
+                  "\nwith a server up but untouched for what holding a model costs."], "")
+      } else {
 
       let _g := io.print(str.join(["generating ", int.to_str(tokens), " tokens on ", engine, " ..."], ""))
       let t0 := idle_end
@@ -375,6 +400,7 @@ fn main(backend :: Str, engine :: Str, model :: Str, tokens :: Int, idle_s :: In
             "\nmachines: nvidia-smi reports board power and powermetrics SoC rails.",
           ], "")
         },
+      }
       }
     },
   }
