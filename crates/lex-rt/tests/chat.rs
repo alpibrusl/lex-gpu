@@ -268,12 +268,44 @@ fn an_overlong_conversation_drops_whole_turns_from_the_front() {
     assert!(kept_tools > 0, "trimmed all the way past every tool result");
 }
 
+/// A coding agent reads files, so one tool result can be bigger than the
+/// whole window. Dropping turns cannot help -- the turn that is too big is
+/// the one being answered -- and refusing ends the run. This is the case
+/// that actually killed a lex-code eval: "the last turn alone is 10497
+/// tokens, over the 7168 the window leaves".
 #[test]
-fn a_single_turn_too_big_for_the_window_is_still_an_error() {
+fn one_oversized_tool_result_is_elided_not_refused() {
+    let huge = "x".repeat(60_000);
+    let req = Json::parse(&format!(
+        r#"{{"messages":[{{"role":"system","content":"SYSTEM MARKER"}},
+           {{"role":"user","content":"read the file"}},
+           {{"role":"assistant","content":"","tool_calls":[{{"id":"c","type":"function",
+             "function":{{"name":"read","arguments":"{{}}"}}}}]}},
+           {{"role":"tool","content":"HEAD-OF-OUTPUT{huge}TAIL-OF-OUTPUT"}}]}}"#
+    ))
+    .expect("json");
+    let mut count = |s: &str| s.len() / 4;
+    let budget = 2000;
+    let (prompt, _) = render_within(&req, budget, &mut count).expect("must not refuse");
+    assert!(count(&prompt) <= budget, "still over budget");
+    assert!(prompt.contains("SYSTEM MARKER"), "system message lost");
+    // Both ends survive: the head says what the tool was, the tail is
+    // usually where the answer is.
+    assert!(prompt.contains("HEAD-OF-OUTPUT"), "head of the output was lost");
+    assert!(prompt.contains("TAIL-OF-OUTPUT"), "tail of the output was lost");
+    assert!(prompt.contains("characters elided"), "elision was not declared");
+    assert!(
+        tool_responses_are_inside_a_user_turn(&prompt),
+        "eliding broke the turn structure"
+    );
+}
+
+#[test]
+fn a_window_too_small_for_anything_still_says_so() {
     let req = long_conversation(1, 40);
     let mut count = |s: &str| s.len() / 4;
     assert!(
         render_within(&req, 5, &mut count).is_err(),
-        "a window that cannot hold even the last turn has to say so"
+        "a window that cannot hold even an elided turn has to say so"
     );
 }

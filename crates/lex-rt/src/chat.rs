@@ -515,11 +515,7 @@ pub fn render_within(
             kept.push(msgs[0].clone());
         }
         kept.extend(msgs[starts[d]..].iter().cloned());
-        let Json::Obj(mut o) = req.clone() else {
-            return Err("request is not an object".into());
-        };
-        o.insert("messages".into(), Json::Arr(kept));
-        render(&Json::Obj(o))
+        render_msgs(req, &kept)
     };
     // Binary search the fewest turns to drop: the prompt only shrinks as
     // more go, and tokenising a long transcript is not cheap enough to
@@ -533,13 +529,80 @@ pub fn render_within(
             lo = mid + 1;
         }
     }
-    let out = keep_from(lo)?;
-    if count(&out) > budget {
-        return Err(format!(
-            "the last turn alone is {} tokens, over the {budget} the window leaves",
-            count(&out)
-        ));
-    }
     let head = usize::from(msgs[0].get("role").and_then(Json::str) == Some("system"));
-    Ok((out, starts[lo] - head))
+    let dropped = starts[lo] - head;
+    let out = keep_from(lo)?;
+    if count(&out) <= budget {
+        return Ok((out, dropped));
+    }
+
+    // Dropping turns is not always enough: one tool result can be larger
+    // than the whole window -- a coding agent reads files -- and the turn
+    // that is too big is the one being answered, which is never dropped.
+    // So cut the middle out of the largest message instead, keeping the
+    // head (what the tool was asked) and the tail (usually the answer).
+    let mut kept: Vec<Json> = vec![];
+    if head == 1 {
+        kept.push(msgs[0].clone());
+    }
+    kept.extend(msgs[starts[lo]..].iter().cloned());
+    loop {
+        let rendered = render_msgs(req, &kept)?;
+        if count(&rendered) <= budget {
+            return Ok((rendered, dropped));
+        }
+        let biggest = kept
+            .iter()
+            .enumerate()
+            .skip(head)
+            .max_by_key(|(_, m)| m.get("content").and_then(Json::str).unwrap_or("").len())
+            .map(|(i, _)| i);
+        match biggest.filter(|&i| {
+            kept[i].get("content").and_then(Json::str).unwrap_or("").len() > 256
+        }) {
+            Some(i) => kept[i] = elide(&kept[i]),
+            None => {
+                return Err(format!(
+                    "the last turn is {} tokens with nothing left to elide, over the {budget} \
+                     the window leaves",
+                    count(&rendered)
+                ));
+            }
+        }
+    }
+}
+
+/// `req` with its messages replaced.
+fn render_msgs(req: &Json, msgs: &[Json]) -> Result<String, String> {
+    let Json::Obj(mut o) = req.clone() else {
+        return Err("request is not an object".into());
+    };
+    o.insert("messages".into(), Json::Arr(msgs.to_vec()));
+    render(&Json::Obj(o))
+}
+
+/// Halve a message's content, cutting from the middle and saying so. Two
+/// thirds of the budget goes to the head, because a tool result's first
+/// lines say what it is.
+fn elide(m: &Json) -> Json {
+    let text = m.get("content").and_then(Json::str).unwrap_or("");
+    let target = text.len() / 2;
+    let (mut h, mut t) = (target * 2 / 3, target / 3);
+    while h > 0 && !text.is_char_boundary(h) {
+        h -= 1;
+    }
+    while t < text.len() && !text.is_char_boundary(text.len() - t) {
+        t += 1;
+    }
+    let cut = text.len() - h - t;
+    let shorter = format!(
+        "{}\n... {cut} characters elided ...\n{}",
+        &text[..h],
+        &text[text.len() - t..]
+    );
+    let Json::Obj(mut o) = m.clone() else {
+        return m.clone();
+    };
+    o.insert("content".into(), Json::Str(shorter));
+    Json::Obj(o)
 }

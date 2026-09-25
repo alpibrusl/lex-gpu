@@ -42,12 +42,15 @@ use lex_rt::json::Json;
     pub fn main() -> Result<(), String> {
         let mut model = "qwen3.8:27b-mlx".to_string();
         // 4096 was a decode benchmark's window; an agent's transcript passes
-        // it inside a few tool calls. 8192 is a compromise and not a happy
-        // one: prefill runs at 66-82 tok/s here and there is no prefix
-        // cache, so every turn re-reads the whole transcript and a 32k
-        // window costs about eight minutes a turn. Raise it with --max-seq
-        // when the context matters more than the latency.
-        let (mut port, mut max_seq, mut depth) = (8080u16, 8192usize, 1usize);
+        // it inside a few tool calls, and one of lex-code's tool results
+        // measured 10497 tokens on its own -- at 8192 that is elided on
+        // every turn. 16384 holds a big tool result and some history.
+        //
+        // Not larger, because prefill runs at 66-82 tok/s here and there is
+        // no prefix cache: every turn re-reads the whole transcript, so a
+        // 32k window costs about eight minutes a turn. Raise it with
+        // --max-seq when context matters more than latency.
+        let (mut port, mut max_seq, mut depth) = (8080u16, 16384usize, 1usize);
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             let mut val = || args.next().ok_or(format!("{a} needs a value"));
