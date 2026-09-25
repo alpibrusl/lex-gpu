@@ -5,8 +5,11 @@
 # bytes per token can be slower and still cheaper -- so it is worth
 # measuring rather than inferring.
 #
-#   lex run --allow-effects proc,net,io,time --allow-proc nvidia-smi \
-#     scripts/energy.lex main '"lex"' '"lex"' '256' '8'
+#   lex run --allow-effects io,net,proc,time --allow-proc nvidia-smi \
+#     scripts/energy.lex main '"nvidia"' '"ollama"' '"llama3.2:1b"' '256' '8'
+#
+# Measured on an NVIDIA L4: Ollama serving llama3.2:1b at 160 tok/s draws
+# 323-363 mJ/token, 133-151 of that above idle.
 #
 # `--allow-proc nvidia-smi` is the point of writing this in Lex rather than
 # Python: the binary it may spawn is named at the command line, the effect
@@ -276,6 +279,15 @@ fn last_t(ss :: List[Sample], fallback :: Float) -> Float {
   match list.head(list.reverse(ss)) { Some(s) => s.t, None => fallback }
 }
 
+# Warm first, then baseline, then measure.
+#
+# The order is the measurement. A cold first request carries the model load:
+# on an L4, llama3.2:1b read 6984 mJ/token cold against 327 warm, a factor
+# of twenty-one, and nothing in the output says which you got. Taking the
+# baseline *after* the warm-up matters too -- a GPU straight off a run has
+# not clocked down, and idle read 17 W cold against 30-34 W warm. Measuring
+# a warm run against a cold baseline is what makes `marginal` swing by a
+# third while `total` holds to 3%.
 fn main(backend :: Str, engine :: Str, model :: Str, tokens :: Int, idle_s :: Int) -> [proc, net, io, time] Str {
   let host := if engine == "ollama" { "http://127.0.0.1:11434" } else { "http://127.0.0.1:8080" }
   let apple := backend == "apple"
@@ -284,12 +296,14 @@ fn main(backend :: Str, engine :: Str, model :: Str, tokens :: Int, idle_s :: In
   let args := if apple {
     ["--samplers", "gpu_power", "-i", "200"]
   } else {
-    ["--query-gpu=timestamp,power.draw", "--format=csv,noheader,nounits", "-lms200"]
+    ["--query-gpu=timestamp,power.draw", "--format=csv,noheader,nounits", "--loop-ms=200"]
   }
   match process.spawn(bin, args, opts) {
     Err(e) => str.join(["cannot start ", bin, ": ", e], ""),
     Ok(h) => {
       # Anchor the timeline on the sampler's own clock, not ours.
+      let _w := io.print("warming up ...")
+      let _r := generate(engine, host, model, 16)
       let first := sample_to(h, apple, 0.0, 200, 0.0)
       let t_start := match list.head(first) { Some(s) => s.t, None => 0.0 }
       let _n := io.print(str.join(["idle baseline for ", int.to_str(idle_s), "s ..."], ""))
