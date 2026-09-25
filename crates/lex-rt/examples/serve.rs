@@ -152,11 +152,7 @@ mod serve {
             }
         };
         let stream = matches!(j.get("stream"), Some(Json::Bool(true)));
-        let want = j
-            .get("max_tokens")
-            .and_then(Json::usize)
-            .unwrap_or(512)
-            .min(max_seq);
+        let asked = j.get("max_tokens").and_then(Json::usize).unwrap_or(512);
 
         let prompt = match chat_ml(&j) {
             Ok(p) => p,
@@ -170,17 +166,23 @@ mod serve {
             }
         };
         let ids = tok.encode(&prompt);
-        if ids.len() + want > max_seq {
+        // `max_tokens` is a ceiling on the reply, not a reservation of
+        // context. Clients routinely ask for the whole window and mean
+        // "as much as fits" -- lex-llm's OpenAI adapter sends 8192 -- so
+        // refusing that is refusing every such client. Only a prompt with
+        // no room left after it is an error.
+        if ids.len() >= max_seq {
             return send(
                 conn,
                 400,
                 "application/json",
                 &format!(
-                    r#"{{"error":{{"message":"{} prompt tokens plus {want} asked exceeds {max_seq}"}}}}"#,
+                    r#"{{"error":{{"message":"{} prompt tokens leaves no room in {max_seq}"}}}}"#,
                     ids.len()
                 ),
             );
         }
+        let want = asked.min(max_seq - ids.len());
 
         // Each request is its own conversation: the cache holds one, and
         // a caller that resends its history expects to be answered on it

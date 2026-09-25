@@ -158,7 +158,17 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
 An OpenAI-compatible endpoint: `GET /v1/models`, `POST
 /v1/chat/completions`, streaming and not. The official OpenAI Python
 client drives it unmodified, which is the point — an agent can use this
-without knowing what is behind it.
+without knowing what is behind it. So does
+[lex-llm](https://github.com/alpibrusl/lex-llm)'s agent loop, through its
+own OpenAI adapter and no new code: `providers.vllm_at("http://127.0.0.1:8080")`.
+
+Tool calling is the gap. The `tools` array of a request is accepted and
+dropped, so the model is never told the tools exist and answers from its
+own head — which it will say out loud if asked to use one. Closing it is
+two changes here and none in the client: render `tools` into the prompt in
+the form the chat template expects, and split `<think>` reasoning out of
+`content` into `reasoning_content`, after which a `<tool_call>` block in
+the reply is a shape the adapters already parse.
 
 One request at a time, deliberately: there is one GPU and a 14.5 GB model
 on it, so a second caller queues rather than interleaving two sequences
