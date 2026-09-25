@@ -216,7 +216,7 @@ fn long_conversation(turns: usize, chars: usize) -> Json {
                "function":{{"name":"grep","arguments":"{{\"pattern\":\"p{i}\"}}"}}}}]}}"#
         ));
         m.push(format!(
-            r#"{{"role":"tool","content":"{}"}}"#,
+            r#"{{"role":"tool","content":"TURNMARK{i} {}"}}"#,
             "out ".repeat(chars / 4)
         ));
     }
@@ -257,7 +257,10 @@ fn an_overlong_conversation_drops_whole_turns_from_the_front() {
     // block, and the last turn is the one being answered.
     assert!(prompt.contains("SYSTEM MARKER"), "system message was dropped");
     assert!(prompt.contains("LAST USER"), "the turn being answered was dropped");
-    assert!(!prompt.contains("FIRST USER"), "an old turn survived; nothing was trimmed");
+    // The task itself is pinned. Dropping it is what made a lex-code run
+    // end with the agent asking the user what they would like built.
+    assert!(prompt.contains("FIRST USER"), "the task was dropped");
+    assert!(!prompt.contains("TURNMARK0 "), "the oldest middle turn survived");
     assert!(
         tool_responses_are_inside_a_user_turn(&prompt),
         "a tool response was orphaned by the trim:\n{}",

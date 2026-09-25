@@ -467,6 +467,26 @@ fn settled(all: &str) -> usize {
     all.len()
 }
 
+/// The messages that are never dropped: a leading system message, and the
+/// first user message after it.
+///
+/// The system message carries the tools and the agent's goal. The first
+/// user message carries the *task*, and pinning it is not a nicety --
+/// without it a long lex-code run ends with the agent asking the user what
+/// they would like built, having read the codebase and forgotten why.
+fn pinned(msgs: &[Json]) -> Vec<usize> {
+    let mut out = vec![];
+    let mut i = 0;
+    if msgs.first().and_then(|m| m.get("role")).and_then(Json::str) == Some("system") {
+        out.push(0);
+        i = 1;
+    }
+    if msgs.get(i).and_then(|m| m.get("role")).and_then(Json::str) == Some("user") {
+        out.push(i);
+    }
+    out
+}
+
 /// Where each droppable turn starts, oldest first.
 ///
 /// A turn is an assistant message with the tool results that answer it, or
@@ -474,19 +494,10 @@ fn settled(all: &str) -> usize {
 /// `tool` message only when the message before it is not one, so dropping
 /// half a tool exchange leaves a `<tool_response>` with nothing to open it.
 fn turns(msgs: &[Json]) -> Vec<usize> {
-    let mut out = vec![];
-    for (i, m) in msgs.iter().enumerate() {
-        let role = m.get("role").and_then(Json::str).unwrap_or("user");
-        // The leading system message carries the tools and the goal, so it
-        // is not a turn and never goes.
-        if i == 0 && role == "system" {
-            continue;
-        }
-        if role != "tool" {
-            out.push(i);
-        }
-    }
-    out
+    let after = pinned(msgs).last().map_or(0, |&i| i + 1);
+    (after..msgs.len())
+        .filter(|&i| msgs[i].get("role").and_then(Json::str) != Some("tool"))
+        .collect()
 }
 
 /// Render `req`, dropping the oldest turns until the prompt fits `budget`
@@ -509,11 +520,9 @@ pub fn render_within(
     }
     let msgs = req.get("messages").and_then(Json::arr).ok_or("no messages")?;
     let starts = turns(msgs);
+    let head: Vec<Json> = pinned(msgs).iter().map(|&i| msgs[i].clone()).collect();
     let keep_from = |d: usize| -> Result<String, String> {
-        let mut kept: Vec<Json> = vec![];
-        if msgs[0].get("role").and_then(Json::str) == Some("system") {
-            kept.push(msgs[0].clone());
-        }
+        let mut kept = head.clone();
         kept.extend(msgs[starts[d]..].iter().cloned());
         render_msgs(req, &kept)
     };
@@ -529,8 +538,7 @@ pub fn render_within(
             lo = mid + 1;
         }
     }
-    let head = usize::from(msgs[0].get("role").and_then(Json::str) == Some("system"));
-    let dropped = starts[lo] - head;
+    let dropped = starts[lo] - head.len();
     let out = keep_from(lo)?;
     if count(&out) <= budget {
         return Ok((out, dropped));
@@ -541,10 +549,7 @@ pub fn render_within(
     // that is too big is the one being answered, which is never dropped.
     // So cut the middle out of the largest message instead, keeping the
     // head (what the tool was asked) and the tail (usually the answer).
-    let mut kept: Vec<Json> = vec![];
-    if head == 1 {
-        kept.push(msgs[0].clone());
-    }
+    let mut kept = head.clone();
     kept.extend(msgs[starts[lo]..].iter().cloned());
     loop {
         let rendered = render_msgs(req, &kept)?;
@@ -554,7 +559,7 @@ pub fn render_within(
         let biggest = kept
             .iter()
             .enumerate()
-            .skip(head)
+            .skip(head.len())
             .max_by_key(|(_, m)| m.get("content").and_then(Json::str).unwrap_or("").len())
             .map(|(i, _)| i);
         match biggest.filter(|&i| {
