@@ -71,7 +71,7 @@ and is re-measured rather than remembered.
 | `llama3.1:8b` | M4 Max | 79.2 | 86.0 | 92% |
 | `llama3.2:1b` | M4 Max | 233.7 | 261.9 | 89% |
 | `llama3.2:1b` | NVIDIA L4 | 124.4 | 162.9 | 76% |
-| `qwen3.8:27b-mlx` | NVIDIA L4 | 6.4 | — | see below |
+| `qwen3.8:27b-mlx` | NVIDIA L4 | 9.1 | — | see below |
 
 **A caution about the Ollama column.** `scripts/ollama_bench.py` prompts
 with random words, which is right for timing prefill — it defeats the
@@ -92,8 +92,10 @@ with the crossover at 16 tokens.
 
 **Qwen on the L4 is correct and slow.** The full golden suite passes there
 against the f32 reference — 24 steps over 3 prompts, worst |dlogprob|
-0.00064 against a tolerance of 0.02 — at 6.4 tok/s. That is 93 GB/s of a
-~300 GB/s card, 31% of its roof, where Metal reaches 75% of its own.
+0.00064 against a tolerance of 0.02 — at 9.1 tok/s, up from 6.4 once the
+decode matvec read two rows per simdgroup rather than one
+([`docs/roadmap-weeks.md`](docs/roadmap-weeks.md)). That is 132 GB/s of a
+~300 GB/s card, 44% of its roof, where Metal reaches 75% of its own.
 Bandwidth scaling alone would predict 15.6. The CUDA backend is days old
 and issues every dispatch on the default stream in order, while Metal runs
 a concurrent encoder with hazard barriers.
