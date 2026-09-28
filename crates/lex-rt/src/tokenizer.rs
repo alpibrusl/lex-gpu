@@ -109,13 +109,7 @@ impl Tokenizer {
                     },
                     _ => {
                         let s = m.str().ok_or_else(|| format!("merge {rank} is not a string"))?;
-                        // The left side is the longest prefix that is a
-                        // token and leaves a token behind.
-                        let split = (1..s.len())
-                            .filter(|i| s.is_char_boundary(*i) && s.as_bytes()[*i - 1] == b' ')
-                            .find(|i| vocab.contains_key(&s[..i - 1]) && vocab.contains_key(&s[*i..]))
-                            .ok_or_else(|| format!("merge {rank} `{s}` splits into no two tokens"))?;
-                        (s[..split - 1].to_string(), s[split..].to_string())
+                        split_joined(s, &vocab).map_err(|e| format!("merge {rank} {e}"))?
                     }
                 };
                 ranks.entry(pair).or_insert(rank);
@@ -149,6 +143,90 @@ impl Tokenizer {
             ignore_merges: matches!(model.get("ignore_merges"), Some(Json::Bool(true))),
             vocab,
             text,
+            ranks,
+            added,
+        })
+    }
+
+    /// The same tokenizer from a GGUF's metadata.
+    ///
+    /// A GGUF carries a byte-level BPE as parallel arrays rather than a
+    /// `tokenizer.json`: the token texts by id, the merges in rank order,
+    /// and a type per token. Checked against the real thing rather than
+    /// assumed: MiMo-v2.6's arrays are Qwen3.8's `tokenizer.json` exactly --
+    /// every token text, all 247587 merges in order, and its 33 control
+    /// tokens are the JSON's 33 added tokens, id for id.
+    ///
+    /// What the arrays do not say is how to split text before merging.
+    /// The name they give for it, `tokenizer.ggml.pre`, is a label rather
+    /// than a pattern, and a pre-tokenizer that disagreed would tokenise
+    /// wrongly without an error -- so this refuses any label it has not
+    /// been checked against, instead of splitting every model the Qwen way.
+    pub fn from_gguf(g: &crate::gguf::Gguf) -> Result<Tokenizer, String> {
+        use crate::gguf::Value;
+        let text_of = |k: &str| match g.meta.get(k) {
+            Some(Value::Str(s)) => Some(s.as_str()),
+            _ => None,
+        };
+        match text_of("tokenizer.ggml.model") {
+            Some("gpt2") => {}
+            other => return Err(format!("GGUF tokenizer {other:?} is not byte-level BPE")),
+        }
+        match text_of("tokenizer.ggml.pre") {
+            Some("qwen35") => {}
+            other => {
+                return Err(format!(
+                    "GGUF pre-tokenizer {other:?}: only qwen35 has been checked against this splitter"
+                ));
+            }
+        }
+        let strings = |k: &str| -> Result<Vec<String>, String> {
+            match g.meta.get(k) {
+                Some(Value::Array(v)) => v
+                    .iter()
+                    .map(|x| match x {
+                        Value::Str(s) => Ok(s.clone()),
+                        _ => Err(format!("{k} holds a non-string")),
+                    })
+                    .collect(),
+                _ => Err(format!("GGUF has no {k}")),
+            }
+        };
+        let tokens = strings("tokenizer.ggml.tokens")?;
+        let kinds: Vec<i64> = match g.meta.get("tokenizer.ggml.token_type") {
+            Some(Value::Array(v)) => v.iter().map(|x| x.as_int().unwrap_or(1)).collect(),
+            _ => vec![1; tokens.len()],
+        };
+        // llama.cpp's token types: 3 is control and 4 user-defined -- the
+        // `<|...|>` markers, matched whole before anything else -- and 5 is
+        // unused, the padding that rounds the embedding up to 248320. The
+        // padding has text but no place in the vocabulary.
+        const CONTROL: i64 = 3;
+        const USER: i64 = 4;
+        const UNUSED: i64 = 5;
+        let mut vocab = HashMap::new();
+        let mut added = vec![];
+        for (id, (t, &k)) in tokens.iter().zip(&kinds).enumerate() {
+            match k {
+                UNUSED => {}
+                CONTROL | USER => added.push((t.clone(), id as u32)),
+                _ => {
+                    vocab.insert(t.clone(), id as u32);
+                }
+            }
+        }
+        let mut ranks = HashMap::new();
+        for (rank, m) in strings("tokenizer.ggml.merges")?.iter().enumerate() {
+            let pair = split_joined(m, &vocab).map_err(|e| format!("merge {rank} {e}"))?;
+            ranks.entry(pair).or_insert(rank);
+        }
+        added.sort_by_key(|(t, _)| std::cmp::Reverse(t.len()));
+        Ok(Tokenizer {
+            // Not in the GGUF. Qwen's tokenizer.json sets it false, and
+            // qwen35 is the only pre-tokenizer accepted above.
+            ignore_merges: false,
+            vocab,
+            text: tokens,
             ranks,
             added,
         })
@@ -323,6 +401,21 @@ fn compose(a: char, b: char) -> Option<char> {
 /// here. That is a model reading different text from the one it was
 /// given, and no logit comparison would show it -- the logits would be
 /// right for the tokens actually sent.
+/// A merge stored as its two halves joined by a space.
+///
+/// A space is itself a legal token character, so splitting on the first
+/// one is wrong for the pair `" " + " "`. The left side is the shortest
+/// prefix ending in a space whose two sides are both tokens. Shared by
+/// both readers, so that a JSON and a GGUF of the same tokenizer cannot
+/// rank a merge differently.
+fn split_joined(s: &str, vocab: &HashMap<String, u32>) -> Result<(String, String), String> {
+    let split = (1..s.len())
+        .filter(|i| s.is_char_boundary(*i) && s.as_bytes()[*i - 1] == b' ')
+        .find(|i| vocab.contains_key(&s[..i - 1]) && vocab.contains_key(&s[*i..]))
+        .ok_or_else(|| format!("`{s}` splits into no two tokens"))?;
+    Ok((s[..split - 1].to_string(), s[split..].to_string()))
+}
+
 pub fn nfc(text: &str) -> String {
     let mut out: Vec<char> = Vec::with_capacity(text.len());
     for c in text.chars() {
@@ -537,6 +630,12 @@ impl Tokenizer {
     /// that drifted from the weights it is paired with would be worse
     /// than not having one, and harder to notice.
     pub fn for_model(model: &str) -> Result<Tokenizer, String> {
+        // A GGUF carries its tokenizer in the header, so only the header
+        // is read: the tensors are the runtime's business, and reading
+        // them here too would load the model twice.
+        if let Some(path) = crate::gguf::gguf_path(model)? {
+            return Tokenizer::from_gguf(&crate::gguf::Gguf::open_header(&path)?);
+        }
         let store = crate::qwen::Store::open(model)?;
         let raw = store.file("tokenizer.json")?;
         let text = String::from_utf8(raw).map_err(|e| format!("tokenizer.json: {e}"))?;

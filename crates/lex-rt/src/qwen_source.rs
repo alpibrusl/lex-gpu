@@ -15,7 +15,7 @@
 use lex_front::ir::Trits;
 use lex_front::llama::{QLayout, Split, split_q4_k, split_q6_k, split_q8_0, split_ternary};
 
-use crate::gguf::{GgmlType, Gguf, ollama_model};
+use crate::gguf::{GgmlType, Gguf, gguf_path};
 use crate::qwen::Store;
 
 /// A quantised matrix, host side, laid out as the matvec's parameters:
@@ -40,10 +40,9 @@ pub enum Source {
 impl Source {
     /// An Ollama tag, in whichever format its manifest says it is.
     pub fn open(model: &str) -> Result<Source, String> {
-        match ollama_model(model) {
-            Ok(path) => Ok(Source::Gguf(Box::new(Gguf::open(&path)?))),
-            // An MLX manifest is found and simply has no GGUF layer.
-            Err(e) if e.contains("has no GGUF model layer") => Ok(Source::Mlx(Store::open(model)?)),
+        match gguf_path(model) {
+            Ok(Some(path)) => Ok(Source::Gguf(Box::new(Gguf::open(&path)?))),
+            Ok(None) => Ok(Source::Mlx(Store::open(model)?)),
             Err(e) => Store::open(model)
                 .map(Source::Mlx)
                 .map_err(|m| format!("{e}; and as MLX: {m}")),

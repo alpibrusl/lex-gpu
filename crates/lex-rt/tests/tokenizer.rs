@@ -16,6 +16,11 @@ use lex_rt::tokenizer::Tokenizer;
 
 const FIXTURE: &str = include_str!("data/qwen_tokenizer.txt");
 const MODEL: &str = "qwen3.8:27b-mlx";
+/// The same tokenizer, carried as GGUF metadata instead of a
+/// `tokenizer.json`: MiMo-v2.6's arrays are Qwen3.8's JSON exactly, token
+/// for token and merge for merge. So the reference's ids for Qwen3.8 are
+/// the reference's ids for MiMo, and the GGUF reader is held to them.
+const GGUF_MODEL: &str = "maternion/mimo-v2.6:9b";
 
 /// `"..."` as the fixture writes it, back to a string.
 fn unquote(s: &str) -> String {
@@ -62,12 +67,11 @@ fn cases() -> Vec<(String, Vec<u32>)> {
         .collect()
 }
 
-#[test]
-fn encodes_what_the_reference_encodes() {
-    let tok = match Tokenizer::for_model(MODEL) {
+fn encodes_like_the_reference(model: &str) {
+    let tok = match Tokenizer::for_model(model) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("SKIPPED: {MODEL} ({e})");
+            eprintln!("SKIPPED: {model} ({e})");
             return;
         }
     };
@@ -82,20 +86,30 @@ fn encodes_what_the_reference_encodes() {
     }
     assert!(
         bad.is_empty(),
-        "{} of {} cases differ from the reference:\n{}",
+        "{model}: {} of {} cases differ from the reference:\n{}",
         bad.len(),
         cases.len(),
         bad.join("\n")
     );
-    eprintln!("{} cases match the reference exactly", cases.len());
+    eprintln!("{model}: {} cases match the reference exactly", cases.len());
 }
 
 #[test]
-fn decoding_undoes_encoding() {
-    let tok = match Tokenizer::for_model(MODEL) {
+fn encodes_what_the_reference_encodes() {
+    encodes_like_the_reference(MODEL);
+}
+
+/// Read from the GGUF header, never touching the 5.6 GB of tensors.
+#[test]
+fn a_gguf_tokenizer_encodes_what_the_reference_encodes() {
+    encodes_like_the_reference(GGUF_MODEL);
+}
+
+fn decodes_the_references_ids(model: &str) {
+    let tok = match Tokenizer::for_model(model) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("SKIPPED: {MODEL} ({e})");
+            eprintln!("SKIPPED: {model} ({e})");
             return;
         }
     };
@@ -108,6 +122,34 @@ fn decoding_undoes_encoding() {
     // two code points back. The reference does not round-trip that case
     // either, and a test demanding it would be demanding a bug.
     for (text, ids) in cases() {
-        assert_eq!(tok.decode(&ids), lex_rt::tokenizer::nfc(&text), "decoding {ids:?}");
+        assert_eq!(tok.decode(&ids), lex_rt::tokenizer::nfc(&text), "{model}: decoding {ids:?}");
+    }
+}
+
+#[test]
+fn decoding_undoes_encoding() {
+    decodes_the_references_ids(MODEL);
+}
+
+#[test]
+fn a_gguf_tokenizer_decodes_the_references_ids() {
+    decodes_the_references_ids(GGUF_MODEL);
+}
+
+/// The control markers the chat template is built from, by the ids the
+/// model was trained on. They are matched whole before any splitting, and
+/// a marker that fell through to BPE would come apart into punctuation.
+#[test]
+fn a_gguf_tokenizer_keeps_the_chat_markers_whole() {
+    let tok = match Tokenizer::for_model(GGUF_MODEL) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("SKIPPED: {GGUF_MODEL} ({e})");
+            return;
+        }
+    };
+    for (marker, id) in [("<|endoftext|>", 248044), ("<|im_start|>", 248045), ("<|im_end|>", 248046)] {
+        assert_eq!(tok.encode(marker), vec![id], "{marker}");
+        assert_eq!(tok.decode(&[id]), marker, "{marker}");
     }
 }

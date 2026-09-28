@@ -106,6 +106,10 @@ pub struct Gguf {
     data: usize,
 }
 
+/// What running off the end of the bytes reads as; `open_header` grows
+/// its prefix on exactly this and on nothing else.
+const TRUNCATED: &str = "truncated GGUF file";
+
 struct Cursor<'a> {
     b: &'a [u8],
     pos: usize,
@@ -116,7 +120,7 @@ impl Cursor<'_> {
         let s = self
             .b
             .get(self.pos..self.pos + n)
-            .ok_or("truncated GGUF file")?;
+            .ok_or(TRUNCATED)?;
         self.pos += n;
         Ok(s)
     }
@@ -170,6 +174,35 @@ impl Cursor<'_> {
 impl Gguf {
     pub fn open(path: &Path) -> Result<Gguf, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Gguf::parse(path, bytes)
+    }
+
+    /// The metadata and the tensor directory, without the tensors.
+    ///
+    /// A tokenizer needs only the header -- tens of megabytes of vocabulary
+    /// and merges -- and `open` reads the whole file, 5.6 GB for MiMo, on
+    /// top of the runtime reading it again. This reads a prefix and grows
+    /// it until the header fits. `raw` then fails for every tensor, which
+    /// is the honest answer for a file that was not read.
+    pub fn open_header(path: &Path) -> Result<Gguf, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let io = |e: std::io::Error| format!("{}: {e}", path.display());
+        let mut f = std::fs::File::open(path).map_err(io)?;
+        let len = f.metadata().map_err(io)?.len() as usize;
+        let mut want = 32usize << 20;
+        loop {
+            let n = want.min(len);
+            let mut bytes = vec![0u8; n];
+            f.seek(SeekFrom::Start(0)).map_err(io)?;
+            f.read_exact(&mut bytes).map_err(io)?;
+            match Gguf::parse(path, bytes) {
+                Err(e) if e == TRUNCATED && n < len => want *= 2,
+                other => return other,
+            }
+        }
+    }
+
+    fn parse(path: &Path, bytes: Vec<u8>) -> Result<Gguf, String> {
         let mut c = Cursor { b: &bytes, pos: 0 };
         if c.take(4)? != b"GGUF" {
             return Err(format!("{} is not a GGUF file", path.display()));
@@ -257,6 +290,20 @@ impl Gguf {
     }
 }
 
+/// What `ollama_model` says about a tag it found that is not a GGUF.
+const NO_GGUF_LAYER: &str = "has no GGUF model layer";
+
+/// `ollama_model`, telling "not a GGUF" apart from "not found": `Ok(None)`
+/// is a manifest with no GGUF layer -- an MLX checkpoint, say -- which the
+/// caller should read some other way, not an error to report.
+pub fn gguf_path(tag: &str) -> Result<Option<PathBuf>, String> {
+    match ollama_model(tag) {
+        Ok(p) => Ok(Some(p)),
+        Err(e) if e.ends_with(NO_GGUF_LAYER) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The GGUF blob behind an Ollama model tag such as `llama3.2:1b`, found
 /// through Ollama's manifest (`$OLLAMA_MODELS`, else `~/.ollama/models`).
 pub fn ollama_model(tag: &str) -> Result<PathBuf, String> {
@@ -319,7 +366,7 @@ pub fn ollama_model(tag: &str) -> Result<PathBuf, String> {
     let key = "application/vnd.ollama.image.model";
     let at = text
         .find(key)
-        .ok_or_else(|| format!("{tag} has no GGUF model layer"))?;
+        .ok_or_else(|| format!("{tag} {NO_GGUF_LAYER}"))?;
     let rest = &text[at..];
     let d = rest.find("sha256:").ok_or("manifest layer has no digest")?;
     let digest: String = rest[d..]
