@@ -81,7 +81,8 @@ ZONE=""
 # and this script learning the zone would otherwise leave a GPU running
 # that nothing knows to delete -- the expensive mistake here.
 where() {
-  gc compute instances list --filter="name=$NAME" --format="value(zone.basename())" 2>/dev/null | head -1
+  gc compute instances list --filter="name=$NAME" --format="value(zone.basename())" 2>/dev/null \
+    | head -1 || true
 }
 cleanup() {
   local z
@@ -110,7 +111,11 @@ for r in $REGIONS; do
   # Only this region's zones from $ZONES: an explicit ZONES list is a
   # restriction, and the region's other zones are not in it.
   echo "trying $MACHINE in $r"
-  allow=$(for z in $ZONES; do [ "${z%-*}" = "$r" ] && printf '%s=allow,' "$z"; done)
+  # An `if`, not `[ ] && printf`: under `set -e` the loop's status is its
+  # last test's, a zone of another region fails it, and the assignment
+  # then ends the script -- which is how the first run of this died
+  # silently after "trying ... in europe-west4".
+  allow=$(for z in $ZONES; do if [ "${z%-*}" = "$r" ]; then printf '%s=allow,' "$z"; fi; done)
   if gc compute instances bulk create --region "$r" --count 1 \
       --predefined-names "$NAME" \
       --location-policy "${allow%,}" \
@@ -128,7 +133,7 @@ for r in $REGIONS; do
   fi
   # One line per region: the error code, not the last two lines of a YAML
   # dump that cut the reason in half.
-  why=$(grep -oE "code: [A-Z_]+|currently unavailable|[Qq]uota [^.]*" "$OUT/create-$r.log" | head -1)
+  why=$(grep -oE "code: [A-Z_]+|currently unavailable|[Qq]uota [^.]*" "$OUT/create-$r.log" | head -1 || true)
   echo "  $r: ${why:-failed, see $OUT/create-$r.log}" >&2
 done
 [ -n "$ZONE" ] || { echo "no region had capacity (or quota) for $MACHINE; see $OUT/create-*.log" >&2; exit 1; }
