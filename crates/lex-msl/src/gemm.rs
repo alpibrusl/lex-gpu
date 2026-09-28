@@ -228,9 +228,17 @@ fn metal(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
             .unwrap_or(default)
     };
     let (bm, bn, threads) = (pick("LEX_GEMM_BM", 32), pick("LEX_GEMM_BN", 64), 128usize);
+    // The K step: 32. Twice the depth a step halves the barriers and was
+    // measured slower at 32x64 -- prefill 112-119 tok/s against 123, gate/up
+    // unchanged at 2.64 ms -- as it was at 32x32 in `gemm_probe`.
+    // `LEX_GEMM_BK=64` keeps it for measuring, where the reduction allows.
+    let bk = match std::env::var("LEX_GEMM_BK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(64) if g.k.is_multiple_of(64) => 64,
+        _ => BK,
+    };
     // Four simdgroups as 2x2, each (bm/2) rows by (bn/2) columns of 8x8.
     let (fm, nf) = ((bm / 2) / 8, (bn / 2) / 8);
-    let (bkp, bnp) = (BK + 4, bn + 4);
+    let (bkp, bnp) = (bk + 4, bn + 4);
     // One buffer, in floats: the two half tiles while the loop runs, then
     // the float output tile.
     let staged = (bm * bkp + bn * bkp).div_ceil(2);
@@ -324,7 +332,6 @@ kernel void {entry}(
         fp4 = Msl.fp4_preamble(),
         gx = n.div_ceil(bn),
         gy = m.div_ceil(bm),
-        bk = BK,
         nf8 = nf * 8,
         fm8 = fm * 8,
     );
