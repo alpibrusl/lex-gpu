@@ -77,14 +77,20 @@ impl Sampler {
         v as f32 / (1u64 << 53) as f32
     }
 
-    pub fn pick(&mut self, logits: &[f32]) -> u32 {
-        let best = |v: &[f32]| {
-            (0..v.len())
-                .max_by(|&a, &b| v[a].total_cmp(&v[b]))
-                .expect("logits") as u32
-        };
+    /// The tokens this sampler can draw, most likely first, with their
+    /// probabilities -- temperature, then top-k, then top-p, renormalised.
+    /// Greedy is the one-token nucleus.
+    ///
+    /// Everything below is defined on this, which is what keeps `pick`,
+    /// `prob` and `verify_draft` describing the same distribution. A
+    /// speculative rule that drew from one distribution and checked
+    /// against another would be wrong in a way no output would show.
+    pub fn nucleus(&self, logits: &[f32]) -> (Vec<u32>, Vec<f32>) {
         if self.temperature <= 0.0 || self.top_k == 1 {
-            return best(logits);
+            let best = (0..logits.len())
+                .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+                .expect("logits") as u32;
+            return (vec![best], vec![1.0]);
         }
         // Top-k first: the vocabulary is 248320 wide and all but a handful
         // of it is noise, so everything below is done on k entries.
@@ -116,15 +122,77 @@ impl Sampler {
                 break;
             }
         }
-        let total: f32 = p[..cut].iter().sum();
-        let r = self.next_unit() * total;
+        idx.truncate(cut);
+        p.truncate(cut);
+        let kept: f32 = p.iter().sum();
+        for x in &mut p {
+            *x /= kept;
+        }
+        (idx, p)
+    }
+
+    /// One draw from a nucleus.
+    fn draw(&mut self, idx: &[u32], p: &[f32]) -> u32 {
+        let r = self.next_unit();
         let mut acc = 0.0;
-        for j in 0..cut {
-            acc += p[j];
-            if acc >= r {
+        for (j, &x) in p.iter().enumerate() {
+            acc += x;
+            if acc > r {
                 return idx[j];
             }
         }
-        idx[cut - 1]
+        // Rounding can leave the sum a hair under 1.
+        idx[idx.len() - 1]
+    }
+
+    pub fn pick(&mut self, logits: &[f32]) -> u32 {
+        let (idx, p) = self.nucleus(logits);
+        self.draw(&idx, &p)
+    }
+
+    /// The probability `pick` would give `token`: zero outside the nucleus.
+    pub fn prob(&self, logits: &[f32], token: u32) -> f32 {
+        let (idx, p) = self.nucleus(logits);
+        idx.iter().position(|&t| t == token).map_or(0.0, |i| p[i])
+    }
+
+    /// Speculative sampling's accept/reject for one drafted token.
+    ///
+    /// The draft head drafts greedily, so its proposal is a point mass on
+    /// `draft` and the general rule -- accept with min(1, p/q), else draw
+    /// from (p - q)+ -- collapses to: accept with probability p(draft),
+    /// else draw from p with `draft` removed. What comes out is then
+    /// distributed exactly as `pick` would have been:
+    ///
+    ///   P(y) = p(x)[y = x] + (1 - p(x)) p(y) / (1 - p(x)) [y != x] = p(y)
+    ///
+    /// so speculation changes how fast the tokens arrive and nothing about
+    /// which ones. At temperature 0, p(draft) is exactly 1 or 0 and this is
+    /// the greedy check it replaces.
+    ///
+    /// `Ok(())` accepts the draft; `Err(t)` rejects it, `t` being the token
+    /// to say instead.
+    pub fn verify_draft(&mut self, logits: &[f32], draft: u32) -> Result<(), u32> {
+        let (idx, p) = self.nucleus(logits);
+        let px = idx.iter().position(|&t| t == draft).map_or(0.0, |i| p[i]);
+        if self.next_unit() < px {
+            return Ok(());
+        }
+        let (ri, mut rp): (Vec<u32>, Vec<f32>) = idx
+            .iter()
+            .zip(&p)
+            .filter(|(t, _)| **t != draft)
+            .map(|(t, x)| (*t, *x))
+            .unzip();
+        let left: f32 = rp.iter().sum();
+        if ri.is_empty() || left <= 0.0 {
+            // Only reachable if the nucleus was the draft alone, which
+            // p(draft) = 1 has already accepted; kept for rounding.
+            return Err(idx[0]);
+        }
+        for x in &mut rp {
+            *x /= left;
+        }
+        Err(self.draw(&ri, &rp))
     }
 }

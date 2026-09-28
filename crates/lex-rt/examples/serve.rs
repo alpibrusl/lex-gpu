@@ -51,7 +51,12 @@ use lex_rt::sample::Sampler;
         // no prefix cache: every turn re-reads the whole transcript, so a
         // 32k window costs about eight minutes a turn. Raise it with
         // --max-seq when context matters more than latency.
-        let (mut port, mut max_seq, mut depth) = (8080u16, 16384usize, 1usize);
+        // Depth 2, measured under sampling at temperature 1.0 on an M4:
+        // 25.8 tok/s without speculation, 31.9 at depth 1, 34.9 at 2, 33.8
+        // at 3. A sampled target accepts deep drafts less often than a
+        // greedy one, so past 2 the drafting costs more than it saves. One
+        // run each; the step from 1 to 2 is the robust part.
+        let (mut port, mut max_seq, mut depth) = (8080u16, 16384usize, 2usize);
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -230,11 +235,6 @@ use lex_rt::sample::Sampler;
             .and_then(Json::usize)
             .map_or_else(now, |s| s as u64);
         let mut sampler = Sampler::new(temperature, top_p, top_k, seed);
-        // Speculation verifies against the greedy token, so accepting its
-        // drafts under a sampled distribution would quietly bias what the
-        // model says. Proper speculative sampling has an accept/reject
-        // rule for this; until that exists, one or the other.
-        let depth = if temperature > 0.0 { 0 } else { depth };
 
         // Keep room for a reply: a prompt that fills the window exactly can
         // generate nothing, which is a refusal by another name.
@@ -449,7 +449,7 @@ use lex_rt::sample::Sampler;
                 break;
             }
             let committed = if depth > 0 {
-                let (c, after) = rt.speculate(next, depth)?;
+                let (c, after) = rt.speculate_with(next, depth, sampler)?;
                 next = after;
                 c
             } else {

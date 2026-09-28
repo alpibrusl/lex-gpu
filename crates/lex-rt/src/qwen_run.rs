@@ -107,6 +107,7 @@ pub use gpu::{Checkpoint, MAX_BATCH, Runner, evict_index};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gpu {
+    use crate::sample::Sampler;
     use std::collections::HashMap;
 
     use half::f16;
@@ -264,12 +265,6 @@ mod gpu {
         for ((o, &v), &g) in out.iter_mut().zip(x).zip(w) {
             *o = v * inv * g;
         }
-    }
-
-    fn argmax(v: &[f32]) -> u32 {
-        (0..v.len())
-            .max_by(|&a, &b| v[a].total_cmp(&v[b]))
-            .unwrap_or(0) as u32
     }
 
     fn floats(gpu: &Gpu, store: &Store, name: &str) -> Result<Buffer, String> {
@@ -1045,9 +1040,30 @@ mod gpu {
         /// accepted prefix replayed, which costs a second pass; at the
         /// acceptance this head reaches that is rare enough to be worth it.
         pub fn speculate(&mut self, last: u32, depth: usize) -> Result<(Vec<u32>, u32), String> {
+            self.speculate_with(last, depth, &mut Sampler::new(0.0, 1.0, 1, 0))
+        }
+
+        /// [`Self::speculate`] for a sampled distribution.
+        ///
+        /// The drafts are checked with [`Sampler::verify_draft`] rather
+        /// than against the argmax, so what comes out is distributed
+        /// exactly as sampling one token at a time would have been:
+        /// speculation changes how fast the tokens arrive, never which
+        /// ones. Before this, sampling and speculation could not both be
+        /// on, and turning sampling on cost 1.64x of decode on an M4 --
+        /// which, since the two engines draw the same power, was 1.64x of
+        /// the joules as well.
+        ///
+        /// At temperature 0 this is the greedy check, token for token.
+        pub fn speculate_with(
+            &mut self,
+            last: u32,
+            depth: usize,
+            sampler: &mut Sampler,
+        ) -> Result<(Vec<u32>, u32), String> {
             if self.mtp.is_none() || depth == 0 {
                 let logits = self.step(last)?;
-                return Ok((vec![last], argmax(&logits)));
+                return Ok((vec![last], sampler.pick(&logits)));
             }
             let trace = std::env::var_os("LEX_SPEC_TRACE").is_some();
             let mark = std::time::Instant::now();
@@ -1055,7 +1071,7 @@ mod gpu {
             let t_draft = mark.elapsed().as_secs_f64() * 1e3;
             if drafts.is_empty() {
                 let logits = self.step(last)?;
-                return Ok((vec![last], argmax(&logits)));
+                return Ok((vec![last], sampler.pick(&logits)));
             }
 
             // `save` exists for the replay path: restore the pre-batch
@@ -1079,12 +1095,22 @@ mod gpu {
             let logits = self.forward_with(&fed, true, true)?;
             let t_verify = mark.elapsed().as_secs_f64() * 1e3;
 
-            // How many drafts the model agrees with, longest prefix only.
+            // How many drafts survive, longest prefix only. The first
+            // rejection also decides what is said in its place, drawn
+            // from the target with the rejected draft taken out; if every
+            // draft survives, the row after the last one is a free token.
             let mut kept = 0;
-            while kept < drafts.len() && drafts[kept] == argmax(&logits[kept]) {
-                kept += 1;
+            let mut instead = None;
+            while kept < drafts.len() {
+                match sampler.verify_draft(&logits[kept], drafts[kept]) {
+                    Ok(()) => kept += 1,
+                    Err(t) => {
+                        instead = Some(t);
+                        break;
+                    }
+                }
             }
-            let next = argmax(&logits[kept]);
+            let next = instead.unwrap_or_else(|| sampler.pick(&logits[kept]));
             let committed = fed[..=kept].to_vec();
             // Row `kept` of the verify is the state after exactly the tokens
             // being committed, so it is the right input for the next draft

@@ -616,3 +616,53 @@ fn resuming_from_a_checkpoint_lands_where_a_clean_prefill_lands() {
     );
     eprintln!("resume vs clean prefill: worst {worst:e} of scale");
 }
+
+/// Speculation under sampling, on the real model.
+///
+/// `speculative_sampling_reproduces_the_distribution_whatever_is_drafted`
+/// proves the accept/reject rule against a known distribution; this proves
+/// the runner actually drives it. Both halves have to happen: drafts
+/// accepted, or speculation is sampling one token at a time with extra
+/// work, and drafts rejected, or the correction and the rollback behind it
+/// never ran at all. Either one missing is a pass that means nothing.
+#[test]
+fn sampled_speculation_accepts_drafts_and_rejects_some() {
+    use lex_rt::sample::Sampler;
+    let _lock = one_at_a_time();
+    let (model, cases) = parse(include_str!("data/qwen35_27b_golden.txt"));
+    const ROUNDS: usize = 24;
+    const DEPTH: usize = 3;
+    let prompt = cases[0].prompt.clone();
+    let mut rt = match Runner::load(&model, prompt.len() + ROUNDS * (DEPTH + 1) + 16) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+    if !rt.has_mtp() {
+        panic!("{model} has no draft head, so there is nothing to speculate with");
+    }
+    rt.reset();
+    let logits = rt.prefill(&prompt).expect("prefill");
+    let mut s = Sampler::seeded(7);
+    let mut next = s.pick(&logits);
+    let (mut accepted, mut short, mut said) = (0, 0, 0);
+    for _ in 0..ROUNDS {
+        let (committed, n) = rt.speculate_with(next, DEPTH, &mut s).expect("speculate");
+        let kept = committed.len() - 1;
+        accepted += kept;
+        if kept < DEPTH {
+            short += 1;
+        }
+        said += committed.len();
+        next = n;
+    }
+    eprintln!(
+        "sampled speculation: {accepted} drafts accepted over {ROUNDS} rounds, \
+         {short} rounds cut short, {:.2} tokens a round",
+        said as f64 / ROUNDS as f64
+    );
+    assert!(accepted > 0, "no draft was ever accepted under sampling");
+    assert!(short > 0, "no draft was ever rejected; the correction path never ran");
+}
