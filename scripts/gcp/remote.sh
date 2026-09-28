@@ -189,13 +189,20 @@ if [ -n "${QWEN:-}" ]; then
   # launches queued as normal -- and what a verify costs in steps, which
   # is why speculation loses here (2.7 steps for two tokens, against 1.15
   # on Metal). At two contexts, because attention's share grows with it.
-  for ctx in 0 1024; do
-    cargo run --release -p lex-rt --example qwen_profile -- \
-      --tokens 32 --context $ctx --verify 3 2>&1 | tee "$R/qwen-profile-ctx$ctx.log" \
-      | grep -E "ms/token|verify of|timed sum|batch path"
-    [ "${PIPESTATUS[0]}" = 0 ] || fail=1
-    grep -q "verify of" "$R/qwen-profile-ctx$ctx.log" \
-      || { echo "qwen_profile at context $ctx printed no verify line"; fail=1; }
+  # And again with LEX_NARROW=1, the loads as they were before the
+  # emitter widened them: the same binary both ways, so the difference is
+  # the loads and nothing else about the build or the machine.
+  for narrow in "" 1; do
+    for ctx in 0 1024; do
+      log="$R/qwen-profile-ctx$ctx${narrow:+-narrow}.log"
+      echo "--- context $ctx${narrow:+, LEX_NARROW=1}"
+      LEX_NARROW=$narrow cargo run --release -p lex-rt --example qwen_profile -- \
+        --tokens 32 --context $ctx --verify 3 2>&1 | tee "$log" \
+        | grep -E "ms/token|verify of|timed sum|batch path|prefill of"
+      [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+      grep -q "prefill of" "$log" \
+        || { echo "qwen_profile at context $ctx printed no prefill line"; fail=1; }
+    done
   done
 
   # Every schedule constant in this repository was chosen on an M4 Max.

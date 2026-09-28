@@ -16,6 +16,9 @@
 //!    step, both normal, as a ratio. Speculation pays only while that
 //!    ratio stays well under the tokens it commits per cycle. Then the
 //!    batch timed per call site, so the part that grew is named.
+//! 5. **Prefill**: `--prefill` tokens (512 by default) in chunks of the
+//!    largest batch, warmed first, as tokens per second. This is the batch
+//!    kernel at its widest, where register pressure bites first.
 //! 4. **Decode through the batch path**: the same positions as pass 1, one
 //!    token at a time through `forward` instead of `step`. On an L4 a
 //!    verify of three cost 0.97 of a step, so the batched kernels may beat
@@ -27,8 +30,8 @@ fn main() -> Result<(), String> {
 
     use lex_rt::qwen_run::Runner;
 
-    let (mut model, mut tokens, mut context, mut verify) =
-        ("qwen3.8:27b-mlx".to_string(), 32usize, 0usize, 3usize);
+    let (mut model, mut tokens, mut context, mut verify, mut pre) =
+        ("qwen3.8:27b-mlx".to_string(), 32usize, 0usize, 3usize, 512usize);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -37,12 +40,16 @@ fn main() -> Result<(), String> {
             "--tokens" => tokens = val()?.parse().map_err(|_| "bad --tokens")?,
             "--context" => context = val()?.parse().map_err(|_| "bad --context")?,
             "--verify" => verify = val()?.parse().map_err(|_| "bad --verify")?,
+            "--prefill" => pre = val()?.parse().map_err(|_| "bad --prefill")?,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
     let t = Instant::now();
     // Room for the context, three passes of steps, and the verify rounds.
-    let mut rt = Runner::load(&model, context + 3 * tokens + 16 * verify + 64)?;
+    let mut rt = Runner::load(
+        &model,
+        (context + 3 * tokens + 16 * verify + 64).max(pre + 16),
+    )?;
     println!(
         "{model}: loaded in {:.1} s on {}",
         t.elapsed().as_secs_f64(),
@@ -141,6 +148,22 @@ fn main() -> Result<(), String> {
         rt.forward(&[(1000 + i) as u32], false)?;
     }
     table(&rt.profile(), tokens, one_s);
+
+    // 5. Prefill, warmed: the first chunk of each size compiles.
+    rt.sync = false;
+    rt.reset();
+    rt.compile_batches()?;
+    let ids: Vec<u32> = (0..pre).map(|i| (700 + (i * 37) % 20000) as u32).collect();
+    rt.prefill(&ids[..16.min(pre)])?;
+    rt.reset();
+    let t = Instant::now();
+    rt.prefill(&ids)?;
+    let s = t.elapsed().as_secs_f64();
+    println!(
+        "\nprefill of {pre}: {:.0} ms = {:.1} tok/s",
+        1e3 * s,
+        pre as f64 / s
+    );
     Ok(())
 }
 

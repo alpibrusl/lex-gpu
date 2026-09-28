@@ -126,6 +126,22 @@ pub trait Dialect {
         usize::MAX
     }
 
+    /// Whether a lane's run of consecutive loads is spelled as explicit
+    /// wide loads (`uint2`, `float4`) rather than left for the compiler to
+    /// merge.
+    ///
+    /// Metal's compiler merges them: a run of byte loads from one row
+    /// becomes one wide load, which is why the loop is written as runs.
+    /// NVRTC does not -- it cannot prove the alignment of a `char*` behind
+    /// a long index expression -- so on an L4 a run of 16 NVFP4 values was
+    /// eight one-byte loads and sixteen four-byte ones, three load
+    /// instructions per weight byte, and the matvec read at half the
+    /// card's bandwidth. The emitter proves the alignment instead and says
+    /// so in the type.
+    fn wide_loads(&self) -> bool {
+        false
+    }
+
     /// The NVFP4 decode helpers, when a kernel dequantises four-bit
     /// weights.
     ///
@@ -273,6 +289,10 @@ pub struct Cuda;
 impl Dialect for Cuda {
     fn barrier(&self) -> String {
         "__syncthreads();".to_string()
+    }
+
+    fn wide_loads(&self) -> bool {
+        true
     }
 
     fn shuffle(&self, value: &str, src: &str) -> String {

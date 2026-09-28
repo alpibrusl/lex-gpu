@@ -18,7 +18,7 @@
 
 use half::f16;
 use lex_cuda::device::Gpu;
-use lex_front::llama::{QLayout, matvec_q, rmsnorm_rows, silu_mul};
+use lex_front::llama::{QLayout, matmul_q, matvec_q, rmsnorm_rows, silu_mul};
 use lex_front::{Program, Tensor, check, run};
 use lex_ir::{DType, Target};
 use lex_msl::dialect::Cuda;
@@ -149,4 +149,56 @@ fn nvfp4_matvec_matches_the_interpreter() {
         Tensor::zeros(DType::F32, &[1, n_out]),
     ];
     same(&g, &prog, tensors, 4, 1e-4);
+}
+
+/// The same at the shape and schedule the L4 runs: a 5120-wide row, 16
+/// lanes to a row (`bo` 16, two rows a warp). That is the wide-load path --
+/// one `uint2` of weights and four `float4` of input per run -- and a load
+/// that lands off its alignment faults here rather than in a model.
+#[test]
+fn nvfp4_matvec_loaded_wide_matches_the_interpreter() {
+    let Some(g) = gpu() else { return };
+    let (n_in, n_out) = (5120, 32);
+    let prog = matvec_q(n_in, n_out, 16, n_in, QLayout::NVFP4, false).expect("program");
+    let codes: Vec<f32> = (0..n_out * n_in / 2)
+        .map(|i| ((i.wrapping_mul(131).wrapping_add(17) & 0xFF) as i32 - 128) as f32)
+        .collect();
+    let scales: Vec<f32> = (0..n_out * n_in / 16)
+        .map(|i| (0x30i32 + (i % 11) as i32 - 128) as f32)
+        .collect();
+    let rows: Vec<f32> = (0..n_out).map(|i| 0.5 + (i % 3) as f32 * 0.25).collect();
+    let tensors = vec![
+        Tensor::new(DType::F32, &[1, n_in], &fill(n_in, 9)),
+        Tensor::new(DType::I8, &[n_out, n_in / 2], &codes),
+        Tensor::new(DType::I8, &[n_out, n_in / 16], &scales),
+        Tensor::new(DType::F32, &[n_out], &rows),
+        Tensor::zeros(DType::F32, &[1, n_out]),
+    ];
+    same(&g, &prog, tensors, 4, 1e-4);
+}
+
+/// The batched form -- a verify's three tokens, a prefill chunk's eight --
+/// loaded wide: each row's run as one `uint2`, each token's quarter-run as
+/// one `float4`. Eight is where the kernel holds the most registers.
+#[test]
+fn nvfp4_matmul_loaded_wide_matches_the_interpreter() {
+    let Some(g) = gpu() else { return };
+    for m in [3, 8] {
+        let (n_in, n_out) = (5120, 64);
+        let prog = matmul_q(m, n_in, n_out, 32, n_in, QLayout::NVFP4, false).expect("program");
+        let codes: Vec<f32> = (0..n_out * n_in / 2)
+            .map(|i| ((i.wrapping_mul(97).wrapping_add(3) & 0xFF) as i32 - 128) as f32)
+            .collect();
+        let scales: Vec<f32> = (0..n_out * n_in / 16)
+            .map(|i| (0x34i32 + (i % 7) as i32 - 128) as f32)
+            .collect();
+        let tensors = vec![
+            Tensor::new(DType::F32, &[m, n_in], &fill(m * n_in, 13)),
+            Tensor::new(DType::I8, &[n_out, n_in / 2], &codes),
+            Tensor::new(DType::I8, &[n_out, n_in / 16], &scales),
+            Tensor::new(DType::F32, &[n_out], &vec![0.75; n_out]),
+            Tensor::zeros(DType::F32, &[m, n_out]),
+        ];
+        same(&g, &prog, tensors, 4, 1e-4);
+    }
 }

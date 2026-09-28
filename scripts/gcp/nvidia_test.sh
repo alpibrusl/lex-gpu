@@ -17,7 +17,9 @@
 #   ZONES        space-separated zones to try in order. EU first, then US:
 #                GPUs are often out of stock in one zone and free in the
 #                next, and L4 capacity in europe-west was unavailable for
-#                an entire afternoon. Set it explicitly to stay in one
+#                an entire afternoon.  On 2026-09-28 Spot L4s were out in every
+#                EU and US region at once and Tokyo had them, so Asia
+#                follows. Set it explicitly to stay in one
 #                region -- these runs carry no user data, only public
 #                model weights and this repository, which is why leaving
 #                the EU is allowed here and would not be for everything.
@@ -54,7 +56,7 @@ MODELS="${MODELS:-llama3.2:1b llama3.1:8b}"
 [ -n "${SPEED:-}" ] && QWEN=1
 
 case "$GPU" in
-  l4)   MACHINE=g2-standard-8; DEFAULT_ZONES="europe-west4-a europe-west4-b europe-west4-c europe-west1-b europe-west1-c europe-west3-a europe-west3-b europe-west2-a europe-west2-b us-central1-a us-central1-b us-central1-c us-east1-c us-east1-d us-east4-a us-east4-c us-west1-a us-west1-b us-west4-a" ;;
+  l4)   MACHINE=g2-standard-8; DEFAULT_ZONES="europe-west4-a europe-west4-b europe-west4-c europe-west1-b europe-west1-c europe-west3-a europe-west3-b europe-west2-a europe-west2-b us-central1-a us-central1-b us-central1-c us-east1-c us-east1-d us-east4-a us-east4-c us-west1-a us-west1-b us-west4-a asia-northeast1-a asia-northeast1-c asia-east1-a asia-east1-b asia-east1-c asia-northeast3-a asia-northeast3-b asia-southeast1-a asia-southeast1-b asia-southeast1-c asia-south1-a asia-south1-b asia-south1-c" ;;
   a100) MACHINE=a2-highgpu-1g; DEFAULT_ZONES="europe-west4-a europe-west4-b us-central1-a us-central1-b us-central1-c us-east1-b" ;;
   h100) MACHINE=a3-highgpu-1g; DEFAULT_ZONES="europe-west4-b europe-west4-c europe-west1-b us-central1-a us-east4-a us-east5-a" ;;
   *) echo "GPU must be l4, a100 or h100" >&2; exit 2 ;;

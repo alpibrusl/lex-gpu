@@ -86,6 +86,44 @@ fn at_index(template: &str, idx: &str) -> String {
     template.replace(AT, &format!("({idx})"))
 }
 
+/// A lazy read's element as an lvalue template, `pN_name[..@I@..]`, when
+/// the read is one parameter element under nothing but conversions
+/// (`float(p0_x[..])`, `char(p1_wq[..])`). Only an element can start a wide
+/// load; anything computed is `None`.
+fn lvalue(template: &str) -> Option<&str> {
+    let mut t = template.trim();
+    // Peel `name( ... )` while it wraps the whole expression.
+    while let Some(open) = t.find('(') {
+        let head = &t[..open];
+        let ident = !head.is_empty() && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !ident || !closes_at_end(t, open, '(', ')') {
+            break;
+        }
+        t = &t[open + 1..t.len() - 1];
+    }
+    let open = t.find('[')?;
+    let (index, _) = t[..open].strip_prefix('p')?.split_once('_')?;
+    let digits = !index.is_empty() && index.chars().all(|c| c.is_ascii_digit());
+    (digits && closes_at_end(t, open, '[', ']')).then_some(t)
+}
+
+/// Whether the bracket opened at byte `open` is closed by the last
+/// character of `t`, and by nothing earlier.
+fn closes_at_end(t: &str, open: usize, o: char, c: char) -> bool {
+    let mut depth = 0i32;
+    for (i, ch) in t[open..].char_indices() {
+        if ch == o {
+            depth += 1;
+        } else if ch == c {
+            depth -= 1;
+            if depth == 0 {
+                return open + i == t.len() - 1;
+            }
+        }
+    }
+    false
+}
+
 /// How an op reads one operand at a flat element index.
 enum Access {
     /// This thread's own element: `expr[k]`.
@@ -373,6 +411,47 @@ fn lit(x: f32) -> String {
 }
 
 impl Gen<'_> {
+    /// Whether an NVFP4 run can be loaded wide, and from what: the weight
+    /// bytes' and the input's lvalue templates.
+    ///
+    /// Only when the dialect asks (`Dialect::wide_loads`), and only when
+    /// the alignment is a consequence of the shape rather than luck. A run
+    /// is 16 values, so 8 weight bytes starting at `p0 / 2` with `p0` a
+    /// multiple of 16; every other term of either index is a multiple of a
+    /// row -- `qc` bytes or `kd` inputs -- or of a chunk of the same size.
+    /// So `qc % 8 == 0` and `kd % 16 == 0` make every run's bytes 8-aligned
+    /// and its inputs 64-aligned, given buffers the driver aligns to 256.
+    /// The input has to be an f32 *parameter*: a half one converted where
+    /// it is read looks like f32 at the tile, and reinterpreting its
+    /// pointer as `float4` would read garbage.
+    fn wide_fp4(
+        &self,
+        qe: &str,
+        qc: usize,
+        kd: usize,
+        vec: usize,
+        x: &Access,
+    ) -> Option<(String, String)> {
+        // `LEX_NARROW=1` keeps the narrow loads: the same binary both ways,
+        // so what the wide ones are worth is measured and not assumed.
+        if !self.d.wide_loads()
+            || std::env::var_os("LEX_NARROW").is_some()
+            || vec != 16
+            || !qc.is_multiple_of(8)
+            || !kd.is_multiple_of(16)
+        {
+            return None;
+        }
+        let Access::Lazy(xt) = x else { return None };
+        let (wq, xa) = (lvalue(qe)?, lvalue(xt)?);
+        let dtype = |lv: &str| -> Option<DType> {
+            let i: usize = lv[1..].split_once('_')?.0.parse().ok()?;
+            self.prog.params.get(i).map(|p| p.dtype)
+        };
+        (dtype(wq)? == DType::I8 && dtype(xa)? == DType::F32)
+            .then(|| (wq.to_string(), xa.to_string()))
+    }
+
     fn line(&mut self, text: &str) {
         for _ in 0..self.depth {
             self.body.push_str("    ");
@@ -1497,6 +1576,41 @@ impl Gen<'_> {
                                      + {a3} * (float(int((l1 >> 4u) | (((hh >> 6u) & 3u) << 4u)) - 32) * sg); }}"
                                 ));
                             }
+                            Pack::Fp4(qe, qc) if self.wide_fp4(qe, *qc, kd, vec, &ops[0].0).is_some() => {
+                                // The same run as below, loaded wide: its
+                                // eight bytes as one `uint2` and its sixteen
+                                // inputs as four `float4`. Aligned by
+                                // construction -- `wide_fp4` says why.
+                                let (wq, xa) =
+                                    self.wide_fp4(qe, *qc, kd, vec, &ops[0].0).expect("checked");
+                                let w = at_index(&wq, &format!("j * {qc}u + p0 / 2u"));
+                                self.line(&format!(
+                                    "    const uint2 wq = *reinterpret_cast<const uint2*>(&{w});"
+                                ));
+                                for q in 0..4 {
+                                    let xq = at_index(&xa, &format!("i * {kd}u + p0 + {}u", 4 * q));
+                                    self.line(&format!(
+                                        "    const float4 x{q} = *reinterpret_cast<const float4*>(&{xq});"
+                                    ));
+                                }
+                                self.line("    float run = 0.0f;");
+                                // Byte b holds values 2b (low nibble) and
+                                // 2b + 1; little-endian, so `wq.x` is bytes
+                                // 0-3 from the bottom.
+                                for b in 0..8 {
+                                    let word = if b < 4 { "wq.x" } else { "wq.y" };
+                                    let (q, c) = ((2 * b) / 4, (2 * b) % 4);
+                                    let lanes = ["x", "y", "z", "w"];
+                                    self.line(&format!(
+                                        "    {{ const float2 w = fp4_pair(({word} >> {}u) & 0xFFu); \
+                                         run += x{q}.{} * w.x + x{q}.{} * w.y; }}",
+                                        8 * (b % 4),
+                                        lanes[c],
+                                        lanes[c + 1]
+                                    ));
+                                }
+                                self.line("    s += run * (sg * 16384.0f);");
+                            }
                             Pack::Fp4(qe, qc) => {
                                 // One byte, two E2M1 codes: p and p + 1.
                                 // A run shares one scale, so it accumulates
@@ -1876,81 +1990,134 @@ impl Gen<'_> {
                 ));
             }
         }
-        self.line(&format!("for (uint u = 0; u < {v}u; u += {step}u) {{"));
-        self.depth += 1;
-        self.line("const uint p = p0 + u;");
-        let names: Vec<String> = (0..weights.len()).map(|k| format!("w{k}")).collect();
-        let decl: Vec<String> = weights
-            .iter()
-            .zip(&names)
-            .map(|(w, nm)| format!("const float {nm} = {w};"))
-            .collect();
-        // Each token's activations for this step, loaded once and reused by
-        // every weight row below: that reuse is the whole point of a batch.
-        self.line(&format!("float xa[{m}][{step}];"));
-        for k in 0..step {
-            if unroll {
-                for i in 0..m {
-                    self.line(&format!(
-                        "xa[{i}][{k}] = {};",
-                        Self::read(&ops[0].0, &format!("p + {}u", i * kd + k))
-                    ));
-                }
-            } else {
+        // Loaded wide where the dialect wants it and the shape proves the
+        // alignment (see `wide_fp4`): each row's run of 8 bytes as one
+        // `uint2`, then the run a quarter at a time -- one `float4` per
+        // token, applied to every row -- so `m` of them are live at once
+        // rather than all sixteen inputs of every token.
+        let wide = match dq.as_ref().map(|d| &d.pack) {
+            Some(Pack::Fp4(qe, qc)) if unroll => self
+                .wide_fp4(qe, *qc, kd, vec, &ops[0].0)
+                .map(|(w, xa)| (w, xa, *qc)),
+            _ => None,
+        };
+        if let Some((wq, xa, qc)) = wide {
+            self.line(&format!("uint2 wq[{r}];"));
+            for rr in 0..r {
                 self.line(&format!(
-                    "for (uint i = 0; i < {m}u; ++i) xa[i][{k}] = {};",
-                    Self::read(&ops[0].0, &format!("i * {kd}u + p + {k}u"))
+                    "{{ const uint j = min(sgid * {r}u + {rr}u, {}u); \
+                     wq[{rr}] = *reinterpret_cast<const uint2*>(&{}); }}",
+                    n - 1,
+                    at_index(&wq, &format!("j * {qc}u + p0 / 2u"))
                 ));
             }
-        }
-        let terms = |i: &str| -> String {
-            names
-                .iter()
-                .enumerate()
-                .map(|(k, nm)| format!("xa[{i}][{k}] * {nm}"))
-                .collect::<Vec<_>>()
-                .join(" + ")
-        };
-        if unroll {
-            for rr in 0..r {
-                // Braces per row: `pre` declares names of its own.
+            for q in 0..4 {
                 self.line("{");
                 self.depth += 1;
-                self.line(&format!(
-                    "const uint j = min(sgid * {r}u + {rr}u, {}u);",
-                    n - 1
-                ));
-                // `sgr`/`mgr` are register tiles too, so their row index has
-                // to be a literal for the same reason.
-                let lit = |s: &str| s.replace("[rr]", &format!("[{rr}]"));
-                self.line(&format!(
-                    "{}{}",
-                    lit(&pre),
-                    decl.iter().map(|d| lit(d)).collect::<Vec<_>>().join(" ")
-                ));
                 for i in 0..m {
-                    self.line(&format!("s[{rr}][{i}] += {};", terms(&i.to_string())));
+                    self.line(&format!(
+                        "const float4 x{i} = *reinterpret_cast<const float4*>(&{});",
+                        at_index(&xa, &format!("{}u + p0 + {}u", i * kd, 4 * q))
+                    ));
+                }
+                for rr in 0..r {
+                    for half in 0..2 {
+                        // Byte `2q + half` of the run: values 4q + 2 half
+                        // and the one after, low nibble first.
+                        let byte = 2 * q + half;
+                        let word = if byte < 4 { "x" } else { "y" };
+                        let (c0, c1) = if half == 0 { ("x", "y") } else { ("z", "w") };
+                        let sums: Vec<String> = (0..m)
+                            .map(|i| format!("s[{rr}][{i}] += x{i}.{c0} * w0 + x{i}.{c1} * w1;"))
+                            .collect();
+                        self.line(&format!(
+                            "{{ const float2 w = fp4_pair((wq[{rr}].{word} >> {}u) & 0xFFu); \
+                             const float w0 = w.x * sgr[{rr}], w1 = w.y * sgr[{rr}]; {} }}",
+                            8 * (byte % 4),
+                            sums.join(" ")
+                        ));
+                    }
                 }
                 self.depth -= 1;
                 self.line("}");
             }
         } else {
-            self.line(&format!("for (uint rr = 0; rr < {r}u; ++rr) {{"));
+            self.line(&format!("for (uint u = 0; u < {v}u; u += {step}u) {{"));
             self.depth += 1;
-            self.line(&format!(
-                "const uint j = min(sgid * {r}u + rr, {}u);",
-                n - 1
-            ));
-            self.line(&format!("{pre}{}", decl.join(" ")));
-            self.line(&format!(
-                "for (uint i = 0; i < {m}u; ++i) s[rr][i] += {};",
-                terms("i")
-            ));
+            self.line("const uint p = p0 + u;");
+            let names: Vec<String> = (0..weights.len()).map(|k| format!("w{k}")).collect();
+            let decl: Vec<String> = weights
+                .iter()
+                .zip(&names)
+                .map(|(w, nm)| format!("const float {nm} = {w};"))
+                .collect();
+            // Each token's activations for this step, loaded once and reused by
+            // every weight row below: that reuse is the whole point of a batch.
+            self.line(&format!("float xa[{m}][{step}];"));
+            for k in 0..step {
+                if unroll {
+                    for i in 0..m {
+                        self.line(&format!(
+                            "xa[{i}][{k}] = {};",
+                            Self::read(&ops[0].0, &format!("p + {}u", i * kd + k))
+                        ));
+                    }
+                } else {
+                    self.line(&format!(
+                        "for (uint i = 0; i < {m}u; ++i) xa[i][{k}] = {};",
+                        Self::read(&ops[0].0, &format!("i * {kd}u + p + {k}u"))
+                    ));
+                }
+            }
+            let terms = |i: &str| -> String {
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(k, nm)| format!("xa[{i}][{k}] * {nm}"))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            };
+            if unroll {
+                for rr in 0..r {
+                    // Braces per row: `pre` declares names of its own.
+                    self.line("{");
+                    self.depth += 1;
+                    self.line(&format!(
+                        "const uint j = min(sgid * {r}u + {rr}u, {}u);",
+                        n - 1
+                    ));
+                    // `sgr`/`mgr` are register tiles too, so their row index has
+                    // to be a literal for the same reason.
+                    let lit = |s: &str| s.replace("[rr]", &format!("[{rr}]"));
+                    self.line(&format!(
+                        "{}{}",
+                        lit(&pre),
+                        decl.iter().map(|d| lit(d)).collect::<Vec<_>>().join(" ")
+                    ));
+                    for i in 0..m {
+                        self.line(&format!("s[{rr}][{i}] += {};", terms(&i.to_string())));
+                    }
+                    self.depth -= 1;
+                    self.line("}");
+                }
+            } else {
+                self.line(&format!("for (uint rr = 0; rr < {r}u; ++rr) {{"));
+                self.depth += 1;
+                self.line(&format!(
+                    "const uint j = min(sgid * {r}u + rr, {}u);",
+                    n - 1
+                ));
+                self.line(&format!("{pre}{}", decl.join(" ")));
+                self.line(&format!(
+                    "for (uint i = 0; i < {m}u; ++i) s[rr][i] += {};",
+                    terms("i")
+                ));
+                self.depth -= 1;
+                self.line("}");
+            }
             self.depth -= 1;
             self.line("}");
         }
-        self.depth -= 1;
-        self.line("}");
         self.depth -= 1;
         self.line("}");
         // The reduction and the store index `s` too, and one loop-variable
@@ -2028,5 +2195,30 @@ impl Gen<'_> {
             },
             Arg::BorrowPart(..) => return Err("pipe shares have no Metal lowering".into()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lvalue;
+
+    /// A wide load starts at an element, so only a read of one parameter
+    /// element -- under conversions and nothing else -- may give one up.
+    #[test]
+    fn only_a_plain_parameter_element_is_an_lvalue() {
+        let x = "float(p0_x[(uint)(0) * 5120u + ((@I@))])";
+        assert_eq!(lvalue(x), Some("p0_x[(uint)(0) * 5120u + ((@I@))]"));
+        assert_eq!(lvalue("char(p1_wq[a[(@I@)]])"), Some("p1_wq[a[(@I@)]]"));
+        assert_eq!(lvalue("float(float(p3_s[@I@]))"), Some("p3_s[@I@]"));
+        assert_eq!(lvalue("p2_y[@I@]"), Some("p2_y[@I@]"));
+        // Computed, not loaded.
+        assert_eq!(lvalue("float(p0_x[@I@]) * 2.0f"), None);
+        assert_eq!(lvalue("fp8_e4m3(p2_ws[@I@]) * float(p3_g[0])"), None);
+        assert_eq!(lvalue("(p0_x[@I@])+(p1_y[@I@])"), None);
+        // Not a parameter.
+        assert_eq!(lvalue("scratch[@I@]"), None);
+        assert_eq!(lvalue("v3[@I@]"), None);
+        // An index that closes early is two things, not one.
+        assert_eq!(lvalue("p0_x[1] + p1_y[@I@]"), None);
     }
 }
