@@ -29,7 +29,6 @@ fn main() -> Result<(), String> {
 
     const K: usize = 5120;
     const N: usize = 17408;
-    const MATS: usize = 4;
     const REPS: usize = 12;
     // What one call moves: codes, scales, row scales, the input.
     let bytes = (N * K / 2 + N * K / 16 + 4 * N + 4 * K) as f64;
@@ -192,6 +191,16 @@ extern "C" __global__ void read{sig} {{
     // `--emit DIR`: write the sources for scripts/cuda_check.sh and stop,
     // so they are compiled on the laptop before a GPU is rented for them.
     let args: Vec<String> = std::env::args().collect();
+    // `--mats N`: how many different matrices to cycle. Four (200 MB) keep
+    // the 48 MB L2 honest; many more (64 is 3.2 GB) ask whether a working
+    // set the size of a model's -- 14.5 GB -- is what slows the kernel
+    // there, since in the model it takes half as long again as here.
+    let mats_n: usize = args
+        .iter()
+        .position(|a| a == "--mats")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     if let Some(i) = args.iter().position(|a| a == "--emit") {
         let dir = args.get(i + 1).ok_or("--emit needs a directory")?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -201,7 +210,7 @@ extern "C" __global__ void read{sig} {{
         return Ok(());
     }
     let gpu = Gpu::open()?;
-    println!("{}", gpu.name());
+    println!("{}, {mats_n} matrices", gpu.name());
 
     // Deterministic, valid bytes: every E2M1 code is a number, and E4M3
     // scales kept clear of NaN (0x7F / 0xFF).
@@ -215,7 +224,7 @@ extern "C" __global__ void read{sig} {{
     let x: Vec<f32> = (0..K).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
     let xb = gpu.upload(&x);
     let mut mats = vec![];
-    for _ in 0..MATS {
+    for _ in 0..mats_n {
         let q: Vec<u8> = (0..N * K / 2).map(|_| next() as u8).collect();
         let s: Vec<u8> = (0..N * K / 16)
             .map(|_| (0x28 + (next() % 24) as u8) | (((next() & 1) as u8) << 7))
@@ -248,12 +257,12 @@ extern "C" __global__ void read{sig} {{
         };
         let bufs: Vec<[&lex_cuda::device::Buffer; 5]> =
             mats.iter().map(|(q, s, g)| [&xb, q, s, g, &y]).collect();
-        let steps: Vec<Step<'_>> = (0..REPS * MATS)
-            .map(|i| (&pipe, &bufs[i % MATS][..], None))
+        let steps: Vec<Step<'_>> = (0..REPS * mats_n)
+            .map(|i| (&pipe, &bufs[i % mats_n][..], None))
             .collect();
         let times = gpu.run_each_timed(&steps);
         // The first round warms the pipeline and the TLB; not counted.
-        let t: f64 = times[MATS..].iter().sum::<f64>() / (times.len() - MATS) as f64;
+        let t: f64 = times[mats_n..].iter().sum::<f64>() / (times.len() - mats_n) as f64;
         println!("{name:<14} {:>9.1} {:>8.1}  {check}", 1e6 * t, moved / t / 1e9);
     }
     Ok(())

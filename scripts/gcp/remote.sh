@@ -163,10 +163,12 @@ if [ -n "${QWEN:-}" ]; then
 
   # The matvec structures, timed against the emitted one on this card
   # (no model needed; synthetic weights, four matrices to defeat the L2).
-  cargo run --release -p lex-cuda --example mv_variants 2>&1 | tee "$R/mv-variants.log" \
-    | grep -E "variant|GB/s|read|emitted|unroll|warp"
-  [ "${PIPESTATUS[0]}" = 0 ] || fail=1
-  grep -q "warp_4rows" "$R/mv-variants.log" || { echo "mv_variants printed no table"; fail=1; }
+  for mats in 4 64; do
+    cargo run --release -p lex-cuda --example mv_variants -- --mats $mats 2>&1 \
+      | tee "$R/mv-variants-$mats.log" | grep -E "matrices|variant|GB/s|read|emitted|unroll|warp"
+    [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+    grep -q "warp_4rows" "$R/mv-variants-$mats.log" || { echo "mv_variants printed no table"; fail=1; }
+  done
 
   if [ -n "${SPEED:-}" ]; then
     # Speed runs still check what they time: the kernels against the
@@ -209,6 +211,13 @@ if [ -n "${QWEN:-}" ]; then
   # launches queued as normal -- and what a verify costs in steps, which
   # is why speculation loses here (2.7 steps for two tokens, against 1.15
   # on Metal). At two contexts, because attention's share grows with it.
+  # Clocks, power and temperature through the profiles: the L4 is capped
+  # at 72 W, and the decode matvec runs half as long again inside the model
+  # as it does alone in mv_variants.
+  nvidia-smi --query-gpu=timestamp,clocks.sm,clocks.mem,power.draw,temperature.gpu,clocks_throttle_reasons.active \
+    --format=csv -lms 500 > "$R/clocks.csv" 2>&1 &
+  SMI=$!
+
   # And again with LEX_NARROW=1, the loads as they were before the
   # emitter widened them: the same binary both ways, so the difference is
   # the loads and nothing else about the build or the machine.
@@ -224,6 +233,8 @@ if [ -n "${QWEN:-}" ]; then
         || { echo "qwen_profile at context $ctx printed no prefill line"; fail=1; }
     done
   done
+
+  kill $SMI 2>/dev/null || true
 
   # Prefill by chunk size: 8 is the batched matvec alone, 64 and 128 go
   # through the tensor-core GEMM. The per-kernel table is in each log.
