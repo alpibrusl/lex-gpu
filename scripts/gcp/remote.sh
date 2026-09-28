@@ -205,6 +205,17 @@ if [ -n "${QWEN:-}" ]; then
     done
   done
 
+  # Prefill by chunk size: 8 is the batched matvec alone, 64 and 128 go
+  # through the tensor-core GEMM. The per-kernel table is in each log.
+  for chunk in 8 64 128; do
+    log="$R/qwen-prefill-chunk$chunk.log"
+    LEX_PREFILL_CHUNK=$chunk cargo run --release -p lex-rt --example qwen_profile -- \
+      --tokens 4 --verify 3 --prefill 512 2>&1 | tee "$log" | grep -E "prefill of"
+    [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+    grep -q "prefill of" "$log" \
+      || { echo "no prefill line at chunk $chunk"; fail=1; }
+  done
+
   # Every schedule constant in this repository was chosen on an M4 Max.
   # `bo` and `threads` set rows per simdgroup and therefore register
   # pressure, and the right value is a property of the register file, not
