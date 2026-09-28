@@ -154,6 +154,15 @@ fn main() -> Result<(), String> {
     }
 
     // What it is all for: the same tokens, in less time.
+    //
+    // One untimed speculation first. A batch size's kernels compile the
+    // first time it is used, and on CUDA that is an NVRTC compile of every
+    // kernel -- seconds, inside a timed loop of a few seconds -- which is
+    // how speculation came to measure 0.69x there while the verify's own
+    // kernels cost less than one step.
+    rt.reset();
+    let logits = fill(&mut rt, &ids)?;
+    rt.speculate(argmax(&logits), depth)?;
     rt.reset();
     let logits = fill(&mut rt, &ids)?;
     let mut got = 0usize;

@@ -37,6 +37,11 @@ fi
 . "$HOME/.cargo/env"
 rustc --version | tee -a "$R/machine.txt"
 
+# SPEED=1 is for a question about speed: it skips everything that checks
+# correctness or measures Ollama, which is most of an hour, and keeps the
+# Qwen fetch and the timing. It is not a test run and says nothing about
+# whether the numbers it times are right -- run without it for that.
+if [ -z "${SPEED:-}" ]; then
 step "workspace tests (frontend, interpreter, emitters)"
 cargo test --release --workspace 2>&1 | tee "$R/cargo-test.log" | grep -E "test result|FAILED|panicked"
 [ "${PIPESTATUS[0]}" = 0 ] || fail=1
@@ -126,6 +131,8 @@ cargo run --release -p lex-rt --example generate -- \
   2>&1 | tee "$R/cuda-generate.txt" | tail -20
 [ "${PIPESTATUS[0]}" = 0 ] || fail=1
 
+fi
+
 # The hard model on the other backend: 48 of 64 layers carry a recurrent
 # state instead of a KV cache, the weights are NVFP4, and there is a
 # multi-token-prediction head. Ollama cannot run it on this machine --
@@ -154,23 +161,26 @@ if [ -n "${QWEN:-}" ]; then
   sudo systemctl stop ollama 2>/dev/null || true
   nvidia-smi --query-gpu=memory.total,memory.used --format=csv | tee -a "$R/machine.txt"
 
-  QOUT=$(cargo test --release -p lex-rt --test qwen_golden -- --nocapture 2>&1)
-  echo "$QOUT" >> "$R/qwen-cuda.log"
-  echo "$QOUT" | grep -E "test result|worst|SKIPPED|panicked|differs" || true
-  # A suite that runs nothing is not a pass. The first version of this
-  # step reported success off `test result: ok. 0 passed`, because the
-  # test file was still gated to macOS and compiled to nothing.
-  if ! echo "$QOUT" | grep -qE "test result: ok\. [1-9]"; then
-    echo "no qwen test actually ran -- gated out, or the model is missing"
-    fail=1
+  if [ -z "${SPEED:-}" ]; then
+    QOUT=$(cargo test --release -p lex-rt --test qwen_golden -- --nocapture 2>&1)
+    echo "$QOUT" >> "$R/qwen-cuda.log"
+    echo "$QOUT" | grep -E "test result|worst|SKIPPED|panicked|differs" || true
+    # A suite that runs nothing is not a pass. The first version of this
+    # step reported success off `test result: ok. 0 passed`, because the
+    # test file was still gated to macOS and compiled to nothing.
+    if ! echo "$QOUT" | grep -qE "test result: ok\. [1-9]"; then
+      echo "no qwen test actually ran -- gated out, or the model is missing"
+      fail=1
+    fi
+    # And a test that skips is not a test that ran. These print SKIPPED and
+    # return Ok when the model is absent, which is right for a laptop with
+    # no checkpoint and wrong here, where fetching it is the point.
+    if echo "$QOUT" | grep -q SKIPPED; then
+      echo "a qwen test skipped -- the model was asked for and is not there"
+      fail=1
+    fi
   fi
-  # And a test that skips is not a test that ran. These print SKIPPED and
-  # return Ok when the model is absent, which is right for a laptop with
-  # no checkpoint and wrong here, where fetching it is the point.
-  if echo "$QOUT" | grep -q SKIPPED; then
-    echo "a qwen test skipped -- the model was asked for and is not there"
-    fail=1
-  fi
+
   cargo run --release -p lex-rt --example mtp -- --steps 32 --depth 1 2>&1 \
     | tee -a "$R/qwen-cuda.log" | grep -E "tok/s|offset 1"
   [ "${PIPESTATUS[0]}" = 0 ] || fail=1
@@ -200,6 +210,7 @@ fi
 # only THREADS all measured the Metal-tuned default of 8 and reported
 # the same ~100 GB/s. The batched table varies `bo` itself and reaches
 # twice that, which is what says the decode kernel is the problem.
+if [ -z "${SPEED:-}" ]; then
 step "the schedule, swept on this card"
 for th in 128 256; do
   for bo in 4 8 16 32 64; do
@@ -218,6 +229,8 @@ rows=$(grep -c "qwen gate/up (nvfp4)" "$R/matvec-cuda.log" 2>/dev/null || true)
 if [ "${rows:-0}" -lt 10 ]; then
   echo "the sweep produced ${rows:-0} rows, expected 10 -- it did not run"
   fail=1
+fi
+
 fi
 
 step "done (failures: $fail)"

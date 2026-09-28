@@ -25,6 +25,9 @@
 #                cheaper and can be preempted mid-run; use SPOT=0 only for
 #                a run long enough that losing it matters.
 #   MODELS       Ollama models for the baseline (default: llama3.2:1b llama3.1:8b).
+#   SPEED=1      only Qwen's timing (qwen_profile, mtp): no test suites, no
+#                Ollama baseline, no sweep. Implies QWEN=1. Minutes instead
+#                of most of an hour, for a question about speed.
 #   QWEN=1       also run qwen3.8:27b-mlx on the GPU -- the hybrid
 #                gated-delta / NVFP4 / draft-head model. 14.5 GB to pull,
 #                and Ollama cannot run it here to compare against (MLX is
@@ -48,6 +51,7 @@ SPOT="${SPOT:-1}"
 MAX_RUN="${MAX_RUN:-2h}"
 KEEP="${KEEP:-0}"
 MODELS="${MODELS:-llama3.2:1b llama3.1:8b}"
+[ -n "${SPEED:-}" ] && QWEN=1
 
 case "$GPU" in
   l4)   MACHINE=g2-standard-8; DEFAULT_ZONES="europe-west4-a europe-west4-b europe-west4-c europe-west1-b europe-west1-c europe-west3-a europe-west3-b europe-west2-a europe-west2-b us-central1-a us-central1-b us-central1-c us-east1-c us-east1-d us-east4-a us-east4-c us-west1-a us-west1-b us-west4-a" ;;
@@ -71,46 +75,63 @@ FAMILY="$(gcloud compute images list --project deeplearning-platform-release \
 echo "image family: deeplearning-platform-release/$FAMILY"
 
 ZONE=""
-# Every zone we have asked for a VM in, recorded *before* the request, because
-# an interrupt during create leaves a machine that $ZONE does not know about
-# yet. A GPU left running is the expensive mistake here, so the sweep is over
-# everything we might have started, not just the one we settled on.
-ATTEMPTED=()
+# Where the VM named $NAME is, if it exists anywhere in the project. Asked
+# by name rather than remembered, because a request is made per *region*
+# and Google picks the zone: an interrupt between the request succeeding
+# and this script learning the zone would otherwise leave a GPU running
+# that nothing knows to delete -- the expensive mistake here.
+where() {
+  gc compute instances list --filter="name=$NAME" --format="value(zone.basename())" 2>/dev/null | head -1
+}
 cleanup() {
-  if [ "$KEEP" = 1 ] && [ -n "$ZONE" ]; then
-    echo "KEEP=1: $NAME is still running in $ZONE. Delete it with:"
-    echo "  gcloud --project $GCP_PROJECT compute instances delete $NAME --zone $ZONE"
+  local z
+  z="$(where)"
+  [ -n "$z" ] || return 0
+  if [ "$KEEP" = 1 ]; then
+    echo "KEEP=1: $NAME is still running in $z. Delete it with:"
+    echo "  gcloud --project $GCP_PROJECT compute instances delete $NAME --zone $z"
     return
   fi
-  local z
-  for z in ${ZONE:+$ZONE} ${ATTEMPTED[@]+"${ATTEMPTED[@]}"}; do
-    if gc compute instances delete "$NAME" --zone "$z" >/dev/null 2>&1; then
-      echo "deleted $NAME in $z"
-    fi
-  done
+  gc compute instances delete "$NAME" --zone "$z" >/dev/null 2>&1 && echo "deleted $NAME in $z"
 }
 # EXIT alone does not fire when the shell is killed by a signal.
 trap cleanup EXIT INT TERM HUP
 
 spot_flags=()
 [ "$SPOT" = 1 ] && spot_flags=(--provisioning-model=SPOT)
-for z in $ZONES; do
-  echo "trying $MACHINE in $z"
-  ATTEMPTED+=("$z")
-  if gc compute instances create "$NAME" --zone "$z" \
+# One request per region, not per zone: Google places the VM in whichever
+# zone of the region has capacity, so a region is one question instead of
+# three or four asked in turn -- and never more than one VM, which asking
+# every zone at once would risk. Nothing publishes free GPU capacity; asking
+# for a machine is the only way to find out. Regions in the order their
+# zones appear in $ZONES, so EU still comes first.
+REGIONS=$(for z in $ZONES; do echo "${z%-*}"; done | awk '!seen[$0]++')
+for r in $REGIONS; do
+  # Only this region's zones from $ZONES: an explicit ZONES list is a
+  # restriction, and the region's other zones are not in it.
+  echo "trying $MACHINE in $r"
+  allow=$(for z in $ZONES; do [ "${z%-*}" = "$r" ] && printf '%s=allow,' "$z"; done)
+  if gc compute instances bulk create --region "$r" --count 1 \
+      --predefined-names "$NAME" \
+      --location-policy "${allow%,}" \
       --machine-type "$MACHINE" \
       --maintenance-policy TERMINATE ${spot_flags[@]+"${spot_flags[@]}"} \
       --max-run-duration "$MAX_RUN" --instance-termination-action DELETE \
       --image-project deeplearning-platform-release --image-family "$FAMILY" \
       --boot-disk-size 150GB --boot-disk-type pd-ssd \
       --metadata install-nvidia-driver=True \
-      --labels purpose=lex-gpu-test 2>"$OUT/create-$z.log"; then
-    ZONE="$z"
-    break
+      --labels purpose=lex-gpu-test 2>"$OUT/create-$r.log" >/dev/null; then
+    ZONE="$(where)"
+    [ -n "$ZONE" ] && break
+    echo "  $r: created, but $NAME is not listed anywhere" >&2
+    continue
   fi
-  tail -2 "$OUT/create-$z.log" >&2
+  # One line per region: the error code, not the last two lines of a YAML
+  # dump that cut the reason in half.
+  why=$(grep -oE "code: [A-Z_]+|currently unavailable|[Qq]uota [^.]*" "$OUT/create-$r.log" | head -1)
+  echo "  $r: ${why:-failed, see $OUT/create-$r.log}" >&2
 done
-[ -n "$ZONE" ] || { echo "no zone had capacity (or quota) for $MACHINE; see $OUT/create-*.log" >&2; exit 1; }
+[ -n "$ZONE" ] || { echo "no region had capacity (or quota) for $MACHINE; see $OUT/create-*.log" >&2; exit 1; }
 echo "$NAME up in $ZONE"
 
 # SSH comes up before the driver finishes installing; remote.sh waits for it.
@@ -124,7 +145,7 @@ gc compute scp --zone "$ZONE" "$OUT/src.tar.gz" "$NAME:~/src.tar.gz"
 # A failing run must still bring its logs home: no errexit from here on.
 set +e
 gc compute ssh "$NAME" --zone "$ZONE" --command \
-  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' QWEN='${QWEN:-}' bash lex-gpu/scripts/gcp/remote.sh" \
+  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' QWEN='${QWEN:-}' SPEED='${SPEED:-}' bash lex-gpu/scripts/gcp/remote.sh" \
   2>&1 | tee "$OUT/remote.log"
 status=${PIPESTATUS[0]}
 gc compute scp --zone "$ZONE" --recurse "$NAME:~/results/*" "$OUT/" || true

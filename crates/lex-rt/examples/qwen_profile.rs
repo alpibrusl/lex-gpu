@@ -86,6 +86,11 @@ fn main() -> Result<(), String> {
     start(&mut rt)?;
     let rounds = 8;
     let batch: Vec<u32> = (0..verify).map(|i| (2000 + i) as u32).collect();
+    // A batch size's kernels compile the first time it is used -- on CUDA
+    // an NVRTC compile of every kernel, seconds of it -- so the first
+    // forward is not a forward. Timing it made a verify of three look like
+    // 5.27 steps on an L4 whose kernels summed to less than one.
+    rt.forward(&batch, true)?;
     let (mut one, mut many) = (0.0, 0.0);
     for _ in 0..rounds {
         let t = Instant::now();
