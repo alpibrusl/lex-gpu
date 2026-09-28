@@ -12,7 +12,7 @@ because the rest of this file is measurements and they deserve the same
 honesty:**
 
 - **The surface syntax is one slice deep.** `.lx` files parse, and
-  [`rmsnorm.lx`](crates/lex-front/tests/lx/rmsnorm.lx) is held to emitting
+  [`rmsnorm.lx`](crates/lex-front/lx/rmsnorm.lx) is held to emitting
   MSL byte-identical to the Rust that built it. What exists is `algo`
   declarations, parameters, `let` bindings over the elementwise and
   reduction ops, and `store`. What does not: `schedule` blocks, loops, the
@@ -58,20 +58,38 @@ there is in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Status
 
-Two backends, four model/hardware combinations, and one number that is
-bad. Everything here was measured on the dates in `docs/roadmap-weeks.md`
-and is re-measured rather than remembered.
+Two backends, five model/hardware combinations, one model where lex is
+ahead and one where it has fallen behind. Everything here was measured on
+the dates in `docs/roadmap-weeks.md` and is re-measured rather than
+remembered.
 
 **Decode, against Ollama on the same machine:**
 
 | Model | Hardware | lex | Ollama | |
 | --- | --- | --- | --- | --- |
-| `qwen3.8:27b-mlx` | M4 Max | 42.9 (speculating) | 42.7 | parity |
+| `maternion/mimo-v2.6:9b` | M4 Max, greedy | 74.6 | 66.9 | **113%** |
+| `maternion/mimo-v2.6:9b` | M4 Max, sampled | 73.4 | 62.0 | **118%** |
+| `qwen3.8:27b-mlx` | M4 Max, greedy (speculating) | 37.9 | 58.5 | 65% |
+| `qwen3.8:27b-mlx` | M4 Max, sampled (speculating) | 38.3 | 57.1 | 67% |
 | `qwen3.8:27b-mlx` | M4 Max, 1440 ctx | 34.4 | 39.7 | 87% |
 | `llama3.1:8b` | M4 Max | 79.2 | 86.0 | 92% |
 | `llama3.2:1b` | M4 Max | 233.7 | 261.9 | 89% |
 | `llama3.2:1b` | NVIDIA L4 | 124.4 | 162.9 | 76% |
 | `qwen3.8:27b-mlx` | NVIDIA L4 | 9.1 | — | see below |
+
+The MiMo and Qwen ctx-0 rows are from 2026-09-28, through both servers,
+by the method [`scripts/serve_bench.py`](scripts/serve_bench.py) now
+records: the same prose prompt, 256 decode tokens, two or three runs each,
+and where runs differed the lower lex figure is the one shown. Runs on a
+shared machine are not comparable -- one taken while another workload
+held the GPU had Ollama falling from 59.7 to 8.0 tok/s across three
+identical requests -- so check `ollama ps` and the process list first.
+
+**Qwen used to read "42.9 against 42.7, parity", and that no longer
+holds**: Ollama now decodes this model at 57–58 on prose, and keeps that
+under sampling — its draft acceptance does not collapse at temperature 1. MiMo has no draft head, so
+its row is plain decode against plain decode, and lex's kernels read its
+5.6 GB at about 420 GB/s of a 463 GB/s copy ceiling.
 
 **A caution about the Ollama column.** `scripts/ollama_bench.py` prompts
 with random words, which is right for timing prefill — it defeats the
@@ -97,12 +115,12 @@ energy per token is time per token and nothing else: 1.47x slower is 1.43x
 the energy, 1.92x slower is 1.92x the energy. There is no separate
 efficiency story to chase, which is worth knowing before chasing one.
 
-The Mac row is lex *without speculation*: the checkpoint's own sampling
-defaults are on, and speculation verifies against the greedy token, so the
-two cannot both be true yet. Speculating, the same machine decodes at
-42.9 — which would be about 1090 mJ/token, most of the gap. Speculative
-sampling has an accept/reject rule that makes both work at once, and we
-do not have it.
+The Mac row is lex *without speculation*: at the time, speculation
+verified against the greedy token, so it could not run under the
+checkpoint's sampling defaults. Speculative sampling -- accept a draft
+with the target's probability for it, else resample without it -- now
+lets both be true at once, at 38 tok/s sampled; the energy row has not
+been re-measured since.
 
 **Prefill is the weak point: 90 tok/s against Ollama's ~250.** Not a
 mystery. 512 tokens is 28.5 TFLOP, and at the measured 13.7 TFLOP/s that

@@ -27,7 +27,10 @@ model" — which is the failure that would make this project pointless.
 
 | | lex | Ollama | |
 | --- | --- | --- | --- |
-| Qwen decode, ctx 0 (speculating) | 42.9 | 42.7 | parity |
+| Qwen decode, ctx 0 (speculating) | 42.9 | 42.7 | parity (superseded below) |
+| Qwen decode, prose, 2026-09-28, greedy | 37.9 | 58.5 | 65% |
+| Qwen decode, prose, 2026-09-28, sampled | 38.3 | 57.1 | 67% |
+| MiMo-v2.6 9B decode, 2026-09-28, greedy | 74.6 | 66.9 | 113% |
 | Qwen decode, 512, real prose | 34.8 | 45.0 | 77% |
 | Qwen decode, 1440, real prose | 34.4 | 39.7 | 87% |
 | Qwen prefill, 512 | 90 | ~250 | 36% |
