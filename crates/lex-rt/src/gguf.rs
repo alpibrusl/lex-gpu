@@ -278,11 +278,16 @@ pub fn ollama_model(tag: &str) -> Result<PathBuf, String> {
     }
 
     let (repo, t) = tag.split_once(':').unwrap_or((tag, "latest"));
-    let path_in = |r: &PathBuf| {
-        r.join("manifests/registry.ollama.ai/library")
-            .join(repo)
-            .join(t)
+    // `llama3.2` is shorthand for `library/llama3.2`; a tag that names its
+    // own namespace, like `maternion/mimo-v2.6`, lives beside `library`
+    // rather than inside it. Joining `library/` onto every tag sent those
+    // looking for `library/maternion/mimo-v2.6`, which does not exist.
+    let rel = if repo.contains('/') {
+        format!("manifests/registry.ollama.ai/{repo}")
+    } else {
+        format!("manifests/registry.ollama.ai/library/{repo}")
     };
+    let path_in = |r: &PathBuf| r.join(&rel).join(t);
     // "Not there" and "there but unreadable" are different problems with
     // the same symptom, and telling them apart matters more than it
     // sounds: on a Linux box the store belongs to the `ollama` service
@@ -297,22 +302,18 @@ pub fn ollama_model(tag: &str) -> Result<PathBuf, String> {
         let m = path_in(r);
         match std::fs::read_to_string(&m) {
             Ok(s) => {
-                found = Some((m, s));
+                found = Some((r.clone(), s));
                 break;
             }
             Err(e) => tried.push(format!("{} ({})", m.display(), e.kind())),
         }
     }
-    let (manifest, text) =
+    // The store is the root the manifest was found under. It used to be
+    // worked out by counting five components up from the manifest, which
+    // holds only for `library/` tags and would have silently counted wrong
+    // for any other depth.
+    let (root, text) =
         found.ok_or_else(|| format!("no readable Ollama manifest for {tag}; tried {}", tried.join(", ")))?;
-    // manifests/registry.ollama.ai/library/<repo>/<tag> is five components
-    // below the store, and `ancestors` counts the path itself as the
-    // first, so the store is the sixth.
-    let root = manifest
-        .ancestors()
-        .nth(5)
-        .ok_or("manifest is not inside a model store")?
-        .to_path_buf();
     // The manifest is small JSON; find the model layer's digest without a
     // JSON dependency.
     let key = "application/vnd.ollama.image.model";

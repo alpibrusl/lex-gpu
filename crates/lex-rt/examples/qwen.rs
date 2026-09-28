@@ -38,6 +38,17 @@ fn main() -> Result<(), String> {
     for &id in &ids {
         logits = rt.step(id)?;
     }
+    // The first position's top five, against a reference's own: one wrong
+    // token says something is off, where the right one ranks says how far.
+    if std::env::var_os("LEX_TOP5").is_some() {
+        let m = logits.iter().cloned().fold(f32::MIN, f32::max);
+        let z: f32 = logits.iter().map(|x| (x - m).exp()).sum();
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+        for &i in idx.iter().take(5) {
+            println!("   top  token {i:6}  logprob {:+.4}", logits[i] - m - z.ln());
+        }
+    }
     let t = Instant::now();
     for i in 0..steps {
         let (best, lp) = top(&logits);

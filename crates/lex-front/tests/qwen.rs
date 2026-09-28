@@ -1,6 +1,6 @@
 //! Qwen3.8's gated-delta state update, against the rule it implements.
 
-use lex_front::qwen::{DeltaNet, build_conv_silu, build_conv_silu_rows, build_delta_qk, build_delta_qk_rows,
+use lex_front::qwen::{DeltaNet, build_conv_silu, build_conv_silu_rows, build_delta_qk, build_delta_qk_rows, build_delta_qk_rows_in,
     build_gated_norm, build_gated_norm_rows, build_gates, build_gates_rows, build_matvec_dense,
     build_qk_rope, build_qk_rope_rows, reference, build_conv_silu_rows_snap, copy_block};
 use lex_front::{Tensor, check, run};
@@ -755,4 +755,41 @@ fn copy_block_takes_the_block_it_names() {
             "block {which} came back as something else"
         );
     }
+}
+
+/// Which key head each value head reads, in both orders a checkpoint can
+/// store them in.
+///
+/// With more value heads than key heads, each key head serves several, and
+/// there are two ways to say which: grouped, as Hugging Face's
+/// `repeat_interleave` does, and tiled, as ggml's broadcast does. MiMo's
+/// GGUF is tiled; read grouped it still produced fluent English and had
+/// lost what it knew -- "The capital of France is" put ' Paris' outside its
+/// top five. So the two are pinned here, per value head, rather than
+/// trusted to a flag's name.
+#[test]
+fn the_value_head_orders_pair_each_head_with_a_different_key() {
+    let (hk, per, dk) = (2usize, 2usize, 16usize);
+    let width = 2 * hk * dk;
+    let x = pattern(width, 211);
+    let run_as = |tiled: bool| {
+        let p = build_delta_qk_rows_in(1, hk, per, dk, width, 0, 1.0, 1e-6, tiled).unwrap();
+        check(&p, &Target::apple_m_series()).unwrap();
+        let mut t = vec![
+            Tensor::new(DType::F32, &[1, width], &x),
+            Tensor::zeros(DType::F32, &[hk * per, dk]),
+        ];
+        run(&p, &mut t).expect("expand");
+        t[1].data.clone()
+    };
+    let (grouped, tiled) = (run_as(false), run_as(true));
+    let row = |v: &[f32], i: usize| v[i * dk..(i + 1) * dk].to_vec();
+    // The normalised key head `k`, as grouped writes it first.
+    let key = |k: usize| row(&grouped, k * per);
+    for v in 0..hk * per {
+        assert_eq!(row(&grouped, v), key(v / per), "grouped: value head {v} should read key {}", v / per);
+        assert_eq!(row(&tiled, v), key(v % hk), "tiled: value head {v} should read key {}", v % hk);
+    }
+    // If the orders agreed, nothing above would distinguish them.
+    assert_ne!(grouped, tiled, "the two orders paired every head the same way");
 }

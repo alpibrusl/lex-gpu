@@ -636,6 +636,34 @@ pub fn build_delta_qk_rows(
     scale: f32,
     eps: f32,
 ) -> Result<Program, String> {
+    build_delta_qk_rows_in(tokens, k_heads, per, k_dim, width, first, scale, eps, false)
+}
+
+/// [`build_delta_qk_rows`], choosing which value heads each key head
+/// serves when there are more value heads than key heads.
+///
+/// Grouped, as Hugging Face does it with `repeat_interleave`: key head `h`
+/// serves value heads `h*per .. h*per + per`. Tiled, as ggml's broadcast
+/// does it with `repeat`: key head `h` serves `h, h + k_heads, ...`. A
+/// GGUF converter that wants ggml's broadcast reorders the value heads to
+/// match, so the same file read with the other convention pairs every
+/// value head with the wrong key -- and still produces fluent text, which
+/// is what makes it worth a flag rather than a guess.
+///
+/// Only this expansion has to know. Everything else in the layer is
+/// indexed by value head in the file's own order already.
+#[allow(clippy::too_many_arguments)]
+pub fn build_delta_qk_rows_in(
+    tokens: usize,
+    k_heads: usize,
+    per: usize,
+    k_dim: usize,
+    width: usize,
+    first: usize,
+    scale: f32,
+    eps: f32,
+    tiled: bool,
+) -> Result<Program, String> {
     use Arg::{Borrow, Move};
     if per == 0 || first + k_heads * k_dim > width {
         return Err(format!(
@@ -643,7 +671,8 @@ pub fn build_delta_qk_rows(
         ));
     }
     let mut b = Builder::new(&format!(
-        "delta_qk{tokens}_k{k_heads}x{per}_d{k_dim}_at{first}"
+        "delta_qk{tokens}_k{k_heads}x{per}_d{k_dim}_at{first}{}",
+        if tiled { "_tiled" } else { "" }
     ));
     let px = b.param("x", DType::F32, &[tokens, width], false);
     let py = b.param("y", DType::F32, &[tokens * k_heads * per, k_dim], true);
@@ -684,9 +713,15 @@ pub fn build_delta_qk_rows(
             View {
                 param: py,
                 offset: vec![
-                    IdxExpr::scaled(tok, k_heads * per, 0)
-                        .plus(head, per)
-                        .plus(copy, 1),
+                    if tiled {
+                        IdxExpr::scaled(tok, k_heads * per, 0)
+                            .plus(copy, k_heads)
+                            .plus(head, 1)
+                    } else {
+                        IdxExpr::scaled(tok, k_heads * per, 0)
+                            .plus(head, per)
+                            .plus(copy, 1)
+                    },
                     IdxExpr::lit(0),
                 ],
                 shape: vec![1, k_dim],

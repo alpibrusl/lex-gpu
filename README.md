@@ -138,6 +138,18 @@ next to Ollama itself (`scripts/lex_vs_ollama.py`):
 | --- | --- | --- | --- | --- |
 | `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.009 | ≤ 0.007 |
 | `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.08 | ≤ 0.007 |
+| `maternion/mimo-v2.6:9b` | Q4_K_M (GGUF) | 16 / 16 | ≤ 0.012 | — |
+
+MiMo-v2.6 is the Qwen3.5 architecture — the hybrid of gated-delta and
+attention layers that Qwen3.8 is — shipped as GGUF rather than MLX. It runs
+on the same runtime through `qwen_source`, which reads either format and
+keeps every convention the two disagree on in one place. Three of them
+differ, and none errors when got wrong: llama.cpp has already added the 1
+to the norm weights, stores `ssm_a` as `-exp(A_log)`, and orders the value
+heads tiled rather than grouped. That last one left the model fluent and
+wrong — "The capital of France is" continued "the 1960, 1961" with ' Paris'
+outside its top five — which is why the test checks log-probabilities and
+not just tokens. MiMo has no draft head, so it decodes without speculation.
 
 How to read that:
 - **Correctness:** lex agrees with an f32 PyTorch reference to within 0.007 on

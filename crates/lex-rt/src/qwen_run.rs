@@ -6,8 +6,9 @@
 //! window. The weights are NVFP4 and reach the GPU as they lie on disk;
 //! [`crate::qwen::Store`] does the few folds the kernels expect.
 
+use crate::gguf::{Gguf, Value};
 use crate::json::Json;
-use crate::qwen::Store;
+use crate::qwen_source::Source;
 
 /// The text model's shape, from `config.json`.
 #[derive(Clone, Debug)]
@@ -31,10 +32,17 @@ pub struct Config {
     pub conv_kernel: usize,
     pub vocab: usize,
     pub max_seq: usize,
+    /// Value heads in ggml's tiled order rather than Hugging Face's
+    /// grouped one; see `build_delta_qk_rows_in`.
+    pub v_tiled: bool,
 }
 
 impl Config {
-    pub fn read(store: &Store, max_seq: usize) -> Result<Config, String> {
+    pub fn read(src: &Source, max_seq: usize) -> Result<Config, String> {
+        if let Some(g) = src.gguf() {
+            return Config::from_gguf(g, max_seq);
+        }
+        let store = src.mlx().ok_or("no config.json: not an MLX checkpoint")?;
         let c = store.config()?;
         let usize_of = |k: &str| -> Result<usize, String> {
             c.get(k)
@@ -66,7 +74,76 @@ impl Config {
             conv_kernel: usize_of("linear_conv_kernel_dim")?,
             vocab: usize_of("vocab_size")?,
             max_seq,
+            v_tiled: false,
         })
+    }
+
+    /// The same, from a GGUF's metadata, which carries every field under
+    /// the architecture's own prefix. The SSM names are llama.cpp's:
+    /// `time_step_rank` is the number of value heads, `group_count` the
+    /// number of key heads, `state_size` a key head's width, and
+    /// `inner_size` all the value heads together.
+    fn from_gguf(g: &Gguf, max_seq: usize) -> Result<Config, String> {
+        let arch = match g.meta.get("general.architecture") {
+            Some(Value::Str(s)) => s.clone(),
+            _ => return Err("GGUF has no general.architecture".into()),
+        };
+        if arch != "qwen35" {
+            return Err(format!("{arch} is not the Qwen3.5 architecture this runs"));
+        }
+        let u = |k: &str| g.int(&format!("{arch}.{k}")).map(|v| v as usize);
+        let f = |k: &str| g.float(&format!("{arch}.{k}")).map(|v| v as f32);
+        let v_heads = u("ssm.time_step_rank")?;
+        let cfg = Config {
+            hidden: u("embedding_length")?,
+            layers: u("block_count")?,
+            interval: u("full_attention_interval")?,
+            ffn: u("feed_forward_length")?,
+            heads: u("attention.head_count")?,
+            kv_heads: u("attention.head_count_kv")?,
+            head_dim: u("attention.key_length")?,
+            rot: u("rope.dimension_count")?,
+            theta: f("rope.freq_base")?,
+            eps: f("attention.layer_norm_rms_epsilon")?,
+            v_heads,
+            k_heads: u("ssm.group_count")?,
+            k_dim: u("ssm.state_size")?,
+            v_dim: u("ssm.inner_size")? / v_heads,
+            conv_kernel: u("ssm.conv_kernel")?,
+            vocab: g.info("output.weight")?.dims[1],
+            max_seq,
+            // Value-head order. Hugging Face groups value heads by key
+            // head; ggml's broadcast tiles them, and llama.cpp's converter
+            // reorders the heads to suit it. MiMo-v2.6 is tiled: read that
+            // way it matches Ollama token for token, read grouped it puts
+            // ' Paris' outside its top five for "The capital of France is".
+            // Prism's converter keeps the grouped order and says so --
+            // Bonsai 2 carries `prism.hadamard.gdn_v_grouped = true` -- so a
+            // file that says grouped is read grouped, and one that says
+            // nothing is read as llama.cpp writes it.
+            v_tiled: !matches!(
+                g.meta.get("prism.hadamard.gdn_v_grouped"),
+                Some(Value::Bool(true))
+            ),
+        };
+        // Which layers are attention is worked out from the interval. The
+        // file also lists it outright, and two sources for one fact had
+        // better agree: a layer run as the wrong kind reads the wrong
+        // weights and says nothing about it.
+        if let Some(Value::Array(flags)) = g.meta.get(&format!("{arch}.attention.recurrent_layers")) {
+            for (i, flag) in flags.iter().enumerate() {
+                if let Value::Bool(recurrent) = flag
+                    && *recurrent != cfg.is_linear(i)
+                {
+                    return Err(format!(
+                        "layer {i}: the file says recurrent={recurrent}, the interval {} says {}",
+                        cfg.interval,
+                        cfg.is_linear(i)
+                    ));
+                }
+            }
+        }
+        Ok(cfg)
     }
 
     /// Attention layers are the last of each group of `interval`.
@@ -116,7 +193,7 @@ mod gpu {
         QLayout, kv_append, kv_append_rows, matmul_q_x, matvec_q, rmsnorm_rows,
     };
     use lex_front::qwen::{
-        DeltaNet, build_conv_silu_rows, build_conv_silu_rows_snap, build_delta_qk_rows,
+        DeltaNet, build_conv_silu_rows, build_conv_silu_rows_snap, build_delta_qk_rows_in,
         build_gated_norm_rows,
         build_gates_rows, build_matvec_dense_rows, build_mul, build_qk_rope_rows,
     };
@@ -126,7 +203,7 @@ mod gpu {
     use lex_msl::program::lower_with;
 
     use super::{Config, rope_tables};
-    use crate::qwen::Store;
+    use crate::qwen_source::Source;
 
     const THREADS: usize = 256;
     /// Output rows a decode matvec gives one threadgroup.
@@ -224,24 +301,39 @@ mod gpu {
     }
 
     /// An NVFP4 matrix on the GPU, as the matvec binds it.
+    /// A pipeline key: shape, whether the matvec accumulates into the
+    /// residual, and the layout its weights are stored in.
+    type MvKey = (usize, usize, bool, QLayout);
+
+    /// A quantised matrix on the device, in any layout `matvec_q` reads:
+    /// the values, the six-bit layouts' high plane, then the scale
+    /// parameters in `QLayout::scale_params` order with NVFP4's per-row
+    /// scale last. NVFP4 binds exactly as it did when this held three
+    /// named buffers -- values, scales, row scale.
     struct QBuf {
         rows: usize,
         cols: usize,
-        codes: Buffer,
-        scales: Buffer,
-        row_scale: Buffer,
+        layout: QLayout,
+        q: Buffer,
+        qh: Option<Buffer>,
+        scales: Vec<Buffer>,
     }
 
     impl QBuf {
-        fn load(gpu: &Gpu, store: &Store, name: &str) -> Result<QBuf, String> {
-            let w = store.nvfp4(name)?;
+        fn load(gpu: &Gpu, src: &Source, name: &str) -> Result<QBuf, String> {
+            let m = src.matrix(name)?;
             Ok(QBuf {
-                rows: w.rows,
-                cols: w.cols,
-                codes: gpu.upload(&w.codes),
-                scales: gpu.upload(&w.scales),
-                row_scale: gpu.upload(&w.row_scale),
+                rows: m.rows,
+                cols: m.cols,
+                layout: m.layout,
+                q: gpu.upload(&m.q),
+                qh: (!m.qh.is_empty()).then(|| gpu.upload(&m.qh)),
+                scales: m.scales.iter().map(|b| gpu.upload(b)).collect(),
             })
+        }
+
+        fn key(&self, res: bool) -> MvKey {
+            (self.cols, self.rows, res, self.layout)
         }
 
         fn bind<'a>(
@@ -250,11 +342,49 @@ mod gpu {
             r: Option<&'a Buffer>,
             y: &'a Buffer,
         ) -> Vec<&'a Buffer> {
-            let mut v = vec![x, &self.codes, &self.scales, &self.row_scale];
+            let mut v = vec![x, &self.q];
+            v.extend(self.qh.as_ref());
+            v.extend(self.scales.iter());
             v.extend(r);
             v.push(y);
             v
         }
+    }
+
+    /// Every matvec the model runs, keyed by what it needs compiled.
+    ///
+    /// Taken from the loaded weights, not from the config's shapes: a GGUF
+    /// mixes quantisations within one kind of tensor -- MiMo's `ffn_down`
+    /// is Q6_K in some layers and Q4_K in others -- and a pipeline compiled
+    /// for the wrong one reads the right bytes as the wrong numbers.
+    fn mv_keys(layers: &[Layer], lm_head: &QBuf, mtp: Option<&Mtp>) -> Vec<MvKey> {
+        fn layer(l: &Layer, v: &mut Vec<MvKey>) {
+            v.push(l.ffn.gate.key(false));
+            v.push(l.ffn.up.key(false));
+            v.push(l.ffn.down.key(true));
+            match &l.mixer {
+                Mixer::Linear(x) => {
+                    v.push(x.qkv.key(false));
+                    v.push(x.z.key(false));
+                    v.push(x.out.key(true));
+                }
+                Mixer::Attn(a) => {
+                    v.push(a.q.key(false));
+                    v.push(a.k.key(false));
+                    v.push(a.v.key(false));
+                    v.push(a.o.key(true));
+                }
+            }
+        }
+        let mut v = vec![lm_head.key(false)];
+        for l in layers {
+            layer(l, &mut v);
+        }
+        if let Some(m) = mtp {
+            v.push(m.fc.key(false));
+            layer(&m.layer, &mut v);
+        }
+        v
     }
 
     /// RMSNorm on the host, for the draft head's two pre-norms: 5120
@@ -267,7 +397,7 @@ mod gpu {
         }
     }
 
-    fn floats(gpu: &Gpu, store: &Store, name: &str) -> Result<Buffer, String> {
+    fn floats(gpu: &Gpu, store: &Source, name: &str) -> Result<Buffer, String> {
         let (v, _) = store.floats(name)?;
         Ok(gpu.upload(&v))
     }
@@ -414,7 +544,7 @@ mod gpu {
     /// Every pipeline a step dispatches.
     struct Kernels {
         rms: Pipeline,
-        mv: HashMap<(usize, usize, bool), Pipeline>,
+        mv: HashMap<MvKey, Pipeline>,
         dense: Pipeline,
         conv: Pipeline,
         qk_q: Pipeline,
@@ -441,7 +571,7 @@ mod gpu {
     /// use of that size.
     struct Batch {
         rms: Pipeline,
-        mv: HashMap<(usize, usize, bool), Pipeline>,
+        mv: HashMap<MvKey, Pipeline>,
         dense: Pipeline,
         conv: Pipeline,
         qk_q: Pipeline,
@@ -552,7 +682,7 @@ mod gpu {
 
     impl Runner {
         pub fn load(model: &str, max_seq: usize) -> Result<Runner, String> {
-            let store = Store::open(model)?;
+            let store = Source::open(model)?;
             let cfg = Config::read(&store, max_seq)?;
             let gpu = Gpu::open()?;
             // Whole splits, and whole chunks of splits for the combine
@@ -562,34 +692,9 @@ mod gpu {
             let (hv, dv, dk) = (cfg.v_heads, cfg.v_dim, cfg.k_dim);
             let ch = cfg.conv_channels();
 
-            // One matvec pipeline per (shape, residual) the model uses.
-            let mut mv = HashMap::new();
-            let mut want: Vec<(usize, usize, bool)> = vec![(cfg.hidden, cfg.vocab, false)];
-            for l in 0..cfg.layers {
-                want.push((cfg.hidden, cfg.ffn, false));
-                want.push((cfg.ffn, cfg.hidden, true));
-                if cfg.is_linear(l) {
-                    want.push((cfg.hidden, ch, false));
-                    want.push((cfg.hidden, hv * dv, false));
-                    want.push((hv * dv, cfg.hidden, true));
-                } else {
-                    want.push((cfg.hidden, 2 * cfg.heads * cfg.head_dim, false));
-                    want.push((cfg.hidden, cfg.kv_heads * cfg.head_dim, false));
-                    want.push((cfg.heads * cfg.head_dim, cfg.hidden, true));
-                }
-            }
-            // `fc` is the only shape the draft head adds; its attention
-            // and feed-forward match the model's own.
-            if store.has("mtp.fc.weight") {
-                want.push((2 * cfg.hidden, cfg.hidden, false));
-            }
-            for key in want {
-                if let std::collections::hash_map::Entry::Vacant(slot) = mv.entry(key) {
-                    let (n_in, n_out, res) = key;
-                    let p = matvec_q(n_in, n_out, bo(gpu.target()), n_in, QLayout::NVFP4, res)?;
-                    slot.insert(compile(&gpu, &p, THREADS)?);
-                }
-            }
+            // Matvec pipelines are compiled once the weights are loaded,
+            // from the layouts those weights turn out to have.
+            let mv = HashMap::new();
 
             let delta = DeltaNet {
                 v_heads: hv,
@@ -613,7 +718,7 @@ mod gpu {
                 heads: cfg.kv_heads,
                 kv_cap: cap,
             };
-            let k = Kernels {
+            let mut k = Kernels {
                 // From `.lx`, not from Rust. The decode path's RMSNorm is
                 // the first kernel in the model to come out of the surface
                 // language, and `qwen_golden` is what says it is the same
@@ -635,7 +740,7 @@ mod gpu {
                 )?,
                 qk_q: compile(
                     &gpu,
-                    &build_delta_qk_rows(
+                    &build_delta_qk_rows_in(
                         1,
                         cfg.k_heads,
                         cfg.per_key(),
@@ -644,12 +749,13 @@ mod gpu {
                         0,
                         1.0 / dk as f32,
                         1e-6,
+                        cfg.v_tiled,
                     )?,
                     128,
                 )?,
                 qk_k: compile(
                     &gpu,
-                    &build_delta_qk_rows(
+                    &build_delta_qk_rows_in(
                         1,
                         cfg.k_heads,
                         cfg.per_key(),
@@ -658,6 +764,7 @@ mod gpu {
                         cfg.k_heads * dk,
                         (dk as f32).powf(-0.5),
                         1e-6,
+                        cfg.v_tiled,
                     )?,
                     128,
                 )?,
@@ -848,6 +955,13 @@ mod gpu {
             let bacts = acts_for(MAX_BATCH, X_DTYPE != DType::F32);
             let out_norm = floats(&gpu, &store, "model.language_model.norm.weight")?;
             let lm_head = QBuf::load(&gpu, &store, "lm_head.weight")?;
+            for key in mv_keys(&layers, &lm_head, mtp.as_ref()) {
+                if let std::collections::hash_map::Entry::Vacant(slot) = k.mv.entry(key) {
+                    let (n_in, n_out, res, layout) = key;
+                    let p = matvec_q(n_in, n_out, bo(gpu.target()), n_in, layout, res)?;
+                    slot.insert(compile(&gpu, &p, THREADS)?);
+                }
+            }
             let mtp_in = gpu.zeroed::<f32>(2 * cfg.hidden);
             let mtp_in_b = gpu.zeroed::<f32>(MAX_BATCH * 2 * cfg.hidden);
 
@@ -1365,26 +1479,26 @@ mod gpu {
             let mut d: Vec<Dispatch<'_>> = vec![
                 (
                     "mtp fc",
-                    &k.mv[&(m.fc.cols, m.fc.rows, false)],
+                    &k.mv[&m.fc.key(false)],
                     m.fc.bind(&self.mtp_in_b, None, &a.x),
                     None,
                 ),
                 ("mtp rmsnorm", &k.rms, vec![&a.x, &at.norm, &a.h], None),
                 (
                     "mtp matvec q",
-                    &k.mv[&(at.q.cols, at.q.rows, false)],
+                    &k.mv[&at.q.key(false)],
                     at.q.bind(&a.h, None, &a.q32),
                     None,
                 ),
                 (
                     "mtp matvec k/v",
-                    &k.mv[&(at.k.cols, at.k.rows, false)],
+                    &k.mv[&at.k.key(false)],
                     at.k.bind(&a.h, None, &a.k32),
                     None,
                 ),
                 (
                     "mtp matvec k/v",
-                    &k.mv[&(at.v.cols, at.v.rows, false)],
+                    &k.mv[&at.v.key(false)],
                     at.v.bind(&a.h, None, &a.v32),
                     None,
                 ),
@@ -1449,20 +1563,20 @@ mod gpu {
                 ("mtp gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated], None),
                 (
                     "mtp matvec o_proj",
-                    &k.mv[&(at.o.cols, at.o.rows, true)],
+                    &k.mv[&at.o.key(true)],
                     at.o.bind(&a.gated, Some(&a.x), &a.x2),
                     None,
                 ),
                 ("mtp rmsnorm", &k.rms, vec![&a.x2, &f.norm, &a.h], None),
                 (
                     "mtp matvec gate/up",
-                    &k.mv[&(f.gate.cols, f.gate.rows, false)],
+                    &k.mv[&f.gate.key(false)],
                     f.gate.bind(&a.h, None, &a.ffn_g),
                     None,
                 ),
                 (
                     "mtp matvec gate/up",
-                    &k.mv[&(f.up.cols, f.up.rows, false)],
+                    &k.mv[&f.up.key(false)],
                     f.up.bind(&a.h, None, &a.ffn_u),
                     None,
                 ),
@@ -1474,7 +1588,7 @@ mod gpu {
                 ),
                 (
                     "mtp matvec down",
-                    &k.mv[&(f.down.cols, f.down.rows, true)],
+                    &k.mv[&f.down.key(true)],
                     f.down.bind(&a.ffn_a, Some(&a.x2), &a.x),
                     None,
                 ),
@@ -1807,28 +1921,10 @@ mod gpu {
                 _ => 32,
             };
             let mut mv = HashMap::new();
-            let mut want: Vec<(usize, usize, bool)> = vec![(c.hidden, c.vocab, false)];
-            for l in 0..c.layers {
-                want.push((c.hidden, c.ffn, false));
-                want.push((c.ffn, c.hidden, true));
-                if c.is_linear(l) {
-                    want.push((c.hidden, ch, false));
-                    want.push((c.hidden, hv * dv, false));
-                    want.push((hv * dv, c.hidden, true));
-                } else {
-                    want.push((c.hidden, 2 * c.heads * c.head_dim, false));
-                    want.push((c.hidden, c.kv_heads * c.head_dim, false));
-                    want.push((c.heads * c.head_dim, c.hidden, true));
-                }
-            }
-            // `fc` is the only shape the draft head adds, and warming the
-            // head over a prompt runs it batched like everything else.
-            if self.mtp.is_some() {
-                want.push((2 * c.hidden, c.hidden, false));
-            }
+            let want = mv_keys(&self.layers, &self.lm_head, self.mtp.as_ref());
             for key in want {
                 if let std::collections::hash_map::Entry::Vacant(slot) = mv.entry(key) {
-                    let (n_in, n_out, res) = key;
+                    let (n_in, n_out, res, layout) = key;
                     // `res` marks the matmuls that accumulate into the
                     // residual -- down and o_proj -- and those read ffn_a
                     // and gated, not `h`, so they keep f32 inputs.
@@ -1847,7 +1943,7 @@ mod gpu {
                     } else {
                         X_DTYPE
                     };
-                    let p = matmul_q_x(t, n_in, n_out, bo, n_in, QLayout::NVFP4, res, xt)?;
+                    let p = matmul_q_x(t, n_in, n_out, bo, n_in, layout, res, xt)?;
                     slot.insert(compile(gpu, &p, THREADS)?);
                 }
             }
@@ -1893,7 +1989,7 @@ mod gpu {
                 )?,
                 qk_q: compile(
                     gpu,
-                    &build_delta_qk_rows(
+                    &build_delta_qk_rows_in(
                         t,
                         c.k_heads,
                         c.per_key(),
@@ -1902,12 +1998,13 @@ mod gpu {
                         0,
                         1.0 / dk as f32,
                         1e-6,
+                        c.v_tiled,
                     )?,
                     128,
                 )?,
                 qk_k: compile(
                     gpu,
-                    &build_delta_qk_rows(
+                    &build_delta_qk_rows_in(
                         t,
                         c.k_heads,
                         c.per_key(),
@@ -1916,6 +2013,7 @@ mod gpu {
                         c.k_heads * dk,
                         (dk as f32).powf(-0.5),
                         1e-6,
+                        c.v_tiled,
                     )?,
                     128,
                 )?,
@@ -1980,7 +2078,7 @@ mod gpu {
         }
 
         fn mv(&self, w: &QBuf, res: bool) -> &Pipeline {
-            &self.k.mv[&(w.cols, w.rows, res)]
+            &self.k.mv[&w.key(res)]
         }
 
         /// Per-call-site GPU time so far, slowest first.
@@ -2030,13 +2128,13 @@ mod gpu {
                     Mixer::Linear(l) => {
                         d.push((
                             "matvec qkv",
-                            &k.mv[&(l.qkv.cols, l.qkv.rows, false)],
+                            &k.mv[&l.qkv.key(false)],
                             l.qkv.bind(&a.h, None, &a.qkv),
                             None,
                         ));
                         d.push((
                             "matvec z",
-                            &k.mv[&(l.z.cols, l.z.rows, false)],
+                            &k.mv[&l.z.key(false)],
                             l.z.bind(&a.h, None, &a.z),
                             None,
                         ));
@@ -2102,7 +2200,7 @@ mod gpu {
                         ));
                         d.push((
                             "matvec out_proj",
-                            &k.mv[&(l.out.cols, l.out.rows, true)],
+                            &k.mv[&l.out.key(true)],
                             l.out.bind(&a.mixed, Some(&a.x), &a.x2),
                             None,
                         ));
@@ -2110,19 +2208,19 @@ mod gpu {
                     Mixer::Attn(at) => {
                         d.push((
                             "matvec q",
-                            &k.mv[&(at.q.cols, at.q.rows, false)],
+                            &k.mv[&at.q.key(false)],
                             at.q.bind(&a.h, None, &a.q32),
                             None,
                         ));
                         d.push((
                             "matvec k/v",
-                            &k.mv[&(at.k.cols, at.k.rows, false)],
+                            &k.mv[&at.k.key(false)],
                             at.k.bind(&a.h, None, &a.k32),
                             None,
                         ));
                         d.push((
                             "matvec k/v",
-                            &k.mv[&(at.v.cols, at.v.rows, false)],
+                            &k.mv[&at.v.key(false)],
                             at.v.bind(&a.h, None, &a.v32),
                             None,
                         ));
@@ -2197,7 +2295,7 @@ mod gpu {
                         d.push(("gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated], None));
                         d.push((
                             "matvec o_proj",
-                            &k.mv[&(at.o.cols, at.o.rows, true)],
+                            &k.mv[&at.o.key(true)],
                             at.o.bind(&a.gated, Some(&a.x), &a.x2),
                             None,
                         ));
@@ -2207,13 +2305,13 @@ mod gpu {
                 d.push(("rmsnorm", &k.rms, vec![&a.x2, &f.norm, &a.h], None));
                 d.push((
                     "matvec gate/up",
-                    &k.mv[&(f.gate.cols, f.gate.rows, false)],
+                    &k.mv[&f.gate.key(false)],
                     f.gate.bind(&a.h, None, &a.ffn_g),
                     None,
                 ));
                 d.push((
                     "matvec gate/up",
-                    &k.mv[&(f.up.cols, f.up.rows, false)],
+                    &k.mv[&f.up.key(false)],
                     f.up.bind(&a.h, None, &a.ffn_u),
                     None,
                 ));
@@ -2225,7 +2323,7 @@ mod gpu {
                 ));
                 d.push((
                     "matvec down",
-                    &k.mv[&(f.down.cols, f.down.rows, true)],
+                    &k.mv[&f.down.key(true)],
                     f.down.bind(&a.ffn_a, Some(&a.x2), &a.x),
                     None,
                 ));
@@ -2236,7 +2334,7 @@ mod gpu {
             d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
             d.push((
                 "matvec lm head",
-                &k.mv[&(out.cols, out.rows, false)],
+                &k.mv[&out.key(false)],
                 out.bind(&a.h, None, &a.logits),
                 None,
             ));
