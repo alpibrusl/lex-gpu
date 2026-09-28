@@ -1,8 +1,8 @@
 {
   "messages": [
     {
-      "content": "hi",
-      "role": "user"
+      "role": "user",
+      "content": "hi"
     }
   ],
   "reasoning_effort": "low"

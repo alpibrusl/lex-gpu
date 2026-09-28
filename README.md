@@ -238,10 +238,15 @@ The same architecture does not mean the same prompt. MiMo-v2.6 brings its
 own template in its GGUF — no newline between turns, a one-line tool block,
 tool results as their own `tool` turn, arguments as JSON — and the server
 picks the template from the model file, refusing a GGUF whose template it
-has not written out rather than handing it Qwen's. MiMo's fixtures come
-from transformers' Jinja environment, which its template was written for
-(`tojson(ensure_ascii=False)` keeps the client's key order and its
-non-ASCII as-is). Against Ollama, the prompt token counts agree exactly on
+has not written out rather than handing it Qwen's.
+
+Both templates' fixtures render through transformers' Jinja environment,
+not plain jinja2, because the two define `tojson` differently: plain
+Jinja sorts keys and escapes `' < > &` and non-ASCII, transformers' keeps
+the client's order and every character as itself — and transformers' is
+the one the training data went through. Rendering Qwen3.8's tools the
+plain way had cost 55 extra tokens (390 against 335) on one tool whose
+description said "don't" and "<pattern>". Against Ollama, the prompt token counts agree exactly on
 plain, system, tool, non-ASCII and tool-history prompts, and a
 call → result → answer loop runs end to end. A call's arguments go back to
 the client as the model wrote them, so the history it returns prints back

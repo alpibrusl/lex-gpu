@@ -1,20 +1,22 @@
 {
   "messages": [
     {
-      "content": "Be brief.",
-      "role": "system"
+      "role": "system",
+      "content": "Be brief."
     },
     {
-      "content": "hi",
-      "role": "user"
+      "role": "user",
+      "content": "hi"
     }
   ],
   "tools": [
     {
+      "type": "function",
       "function": {
-        "description": "Add two numbers.",
         "name": "add",
+        "description": "Add two numbers.",
         "parameters": {
+          "type": "object",
           "properties": {
             "a": {
               "type": "string"
@@ -26,11 +28,9 @@
           "required": [
             "a",
             "b"
-          ],
-          "type": "object"
+          ]
         }
-      },
-      "type": "function"
+      }
     }
   ]
 }

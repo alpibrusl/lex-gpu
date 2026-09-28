@@ -6,7 +6,7 @@ Reasoning effort is set to xhigh. Please think carefully through the task, valid
 You have access to the following functions:
 
 <tools>
-{"function": {"description": "True when a \u003c b \u0026 b \u003e c, the \u0027usual\u0027 way \u2014 na\u00efvely.", "name": "cmp", "parameters": {"properties": {"a": {"description": "\u003cleft\u003e", "type": "string"}}, "required": ["a"], "type": "object"}}, "type": "function"}
+{"type": "function", "function": {"name": "cmp", "description": "True when a < b & b > c, the 'usual' way — naïvely.", "parameters": {"type": "object", "properties": {"a": {"type": "string", "description": "<left>"}}, "required": ["a"]}}}
 </tools>
 
 If you choose to call a function ONLY reply in the following format with NO suffix:

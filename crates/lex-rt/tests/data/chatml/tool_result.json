@@ -1,34 +1,36 @@
 {
   "messages": [
     {
-      "content": "What is 17 + 25?",
-      "role": "user"
+      "role": "user",
+      "content": "What is 17 + 25?"
     },
     {
-      "content": "",
       "role": "assistant",
+      "content": "",
       "tool_calls": [
         {
-          "function": {
-            "arguments": "{\"a\":\"17\",\"b\":\"25\"}",
-            "name": "add"
-          },
           "id": "call_1",
-          "type": "function"
+          "type": "function",
+          "function": {
+            "name": "add",
+            "arguments": "{\"a\":\"17\",\"b\":\"25\"}"
+          }
         }
       ]
     },
     {
-      "content": "{\"result\":\"42\"}",
-      "role": "tool"
+      "role": "tool",
+      "content": "{\"result\":\"42\"}"
     }
   ],
   "tools": [
     {
+      "type": "function",
       "function": {
-        "description": "Add two numbers.",
         "name": "add",
+        "description": "Add two numbers.",
         "parameters": {
+          "type": "object",
           "properties": {
             "a": {
               "type": "string"
@@ -40,11 +42,9 @@
           "required": [
             "a",
             "b"
-          ],
-          "type": "object"
+          ]
         }
-      },
-      "type": "function"
+      }
     }
   ]
 }

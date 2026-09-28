@@ -1,12 +1,12 @@
 {
   "messages": [
     {
-      "content": "Be brief.",
-      "role": "system"
+      "role": "system",
+      "content": "Be brief."
     },
     {
-      "content": "hi",
-      "role": "user"
+      "role": "user",
+      "content": "hi"
     }
   ]
 }

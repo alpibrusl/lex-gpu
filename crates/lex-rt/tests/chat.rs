@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use lex_rt::chat::{Call, Template, parse_reply, render, render_within, tojson, tojson_raw};
+use lex_rt::chat::{Call, Template, parse_reply, render, render_within, tojson};
 use lex_rt::json::{Json, Map};
 
 fn data(sub: &str) -> PathBuf {
@@ -93,25 +93,18 @@ fn the_mimo_template_matches_its_own() {
     );
 }
 
-/// `tojson` is Jinja's, not `json.dumps`: sorted keys, spaced separators,
-/// and `< > & '` escaped on top of the non-ASCII escaping.
+/// `tojson` is Hugging Face's -- `json.dumps(ensure_ascii=False)` -- and
+/// not plain Jinja's: the client's key order, and every character as
+/// itself. Plain Jinja would sort these keys and write `\u0027z\u0027`.
 #[test]
-fn tojson_escapes_what_jinja_escapes() {
+fn tojson_is_the_one_the_models_were_trained_through() {
     let mut m = Map::new();
     m.insert("b".to_string(), Json::Num(1.0));
-    m.insert("a".to_string(), Json::Str("x < y & 'z' — naïve".into()));
+    m.insert("a".to_string(), Json::Str("x < y & 'z' — naïve\n".into()));
     m.insert("c".to_string(), Json::Arr(vec![Json::Bool(true), Json::Null]));
-    let m = Json::Obj(m);
     assert_eq!(
-        tojson(&m),
-        "{\"a\": \"x \\u003c y \\u0026 \\u0027z\\u0027 \\u2014 na\\u00efve\", \"b\": 1, \
-         \"c\": [true, null]}"
-    );
-    // `tojson(ensure_ascii=False)` under Hugging Face's environment is
-    // `json.dumps`: the order given, and every character as itself.
-    assert_eq!(
-        tojson_raw(&m),
-        "{\"b\": 1, \"a\": \"x < y & 'z' — naïve\", \"c\": [true, null]}"
+        tojson(&Json::Obj(m)),
+        "{\"b\": 1, \"a\": \"x < y & 'z' — naïve\\n\", \"c\": [true, null]}"
     );
 }
 

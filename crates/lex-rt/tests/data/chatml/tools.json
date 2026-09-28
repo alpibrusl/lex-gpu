@@ -1,16 +1,18 @@
 {
   "messages": [
     {
-      "content": "What is 17 + 25?",
-      "role": "user"
+      "role": "user",
+      "content": "What is 17 + 25?"
     }
   ],
   "tools": [
     {
+      "type": "function",
       "function": {
-        "description": "Add two numbers.",
         "name": "add",
+        "description": "Add two numbers.",
         "parameters": {
+          "type": "object",
           "properties": {
             "a": {
               "type": "string"
@@ -22,11 +24,9 @@
           "required": [
             "a",
             "b"
-          ],
-          "type": "object"
+          ]
         }
-      },
-      "type": "function"
+      }
     }
   ]
 }

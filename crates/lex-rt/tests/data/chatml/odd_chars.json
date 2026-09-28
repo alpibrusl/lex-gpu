@@ -1,29 +1,29 @@
 {
   "messages": [
     {
-      "content": "hi",
-      "role": "user"
+      "role": "user",
+      "content": "hi"
     }
   ],
   "tools": [
     {
+      "type": "function",
       "function": {
-        "description": "True when a < b & b > c, the 'usual' way \u2014 na\u00efvely.",
         "name": "cmp",
+        "description": "True when a < b & b > c, the 'usual' way \u2014 na\u00efvely.",
         "parameters": {
+          "type": "object",
           "properties": {
             "a": {
-              "description": "<left>",
-              "type": "string"
+              "type": "string",
+              "description": "<left>"
             }
           },
           "required": [
             "a"
-          ],
-          "type": "object"
+          ]
         }
-      },
-      "type": "function"
+      }
     }
   ]
 }

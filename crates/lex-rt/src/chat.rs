@@ -344,7 +344,7 @@ fn render_mimo(req: &Json) -> Result<String, String> {
                 match (f.get("input"), f.get("arguments")) {
                     (Some(Json::Str(input)), _) => s.push_str(input),
                     (_, Some(Json::Str(args))) => s.push_str(args),
-                    (_, Some(args)) => s.push_str(&tojson_raw(args)),
+                    (_, Some(args)) => s.push_str(&tojson(args)),
                     (_, None) => {}
                 }
                 s.push_str("</function></tool_call>");
@@ -379,7 +379,7 @@ fn mimo_tools(tools: &[Json], s: &mut String) {
     s.push_str("You are provided with the following tools:\n\n<tools>");
     for t in tools {
         s.push('\n');
-        s.push_str(&tojson_raw(t));
+        s.push_str(&tojson(t));
     }
     s.push_str("\n</tools>");
 }
@@ -411,77 +411,57 @@ fn mimo_content(c: Option<&Json>) -> Result<String, String> {
                 if let Some(t) = p.get("text") {
                     match t {
                         Json::Str(t) => out.push_str(t),
-                        other => out.push_str(&tojson_raw(other)),
+                        other => out.push_str(&tojson(other)),
                     }
                 }
             }
-            other => return Err(format!("a content part that is not text: {}", tojson_raw(other))),
+            other => return Err(format!("a content part that is not text: {}", tojson(other))),
         }
     }
     Ok(out)
 }
 
-/// Jinja's `tojson`, which is not `serde_json::to_string`: keys sort, the
-/// separators carry a space, non-ASCII escapes, and `< > & '` escape on
-/// top of that so the result is safe to drop into a page. All four are
-/// reachable from an ordinary tool description, so all four are copied.
+/// `tojson` as Hugging Face's template environment defines it, which is
+/// the one both models' prompts went through in training: `json.dumps`
+/// with `ensure_ascii=False` -- keys in the order the client wrote them,
+/// spaced separators, nothing escaped past what JSON itself requires.
+///
+/// Plain Jinja's filter is a different function: it sorts keys and escapes
+/// `< > & '` and everything past ASCII, to be safe inside a web page.
+/// Rendering Qwen3.8's tools that way cost 55 extra tokens on one tool
+/// whose description said "don't" and "<pattern>" (390 against 335), all
+/// of it escapes the model never saw in training.
 pub fn tojson(j: &Json) -> String {
     let mut s = String::new();
-    write_json(j, Jinja::PLAIN, &mut s);
+    write_json(j, &mut s);
     s
 }
 
-/// `tojson(ensure_ascii=False)` as Hugging Face's template environment
-/// defines it -- `json.dumps` and nothing else: keys in the order given,
-/// no HTML escaping, non-ASCII as itself. Plain Jinja's filter does not
-/// even take the argument; a template that passes it was written for this.
-pub fn tojson_raw(j: &Json) -> String {
-    let mut s = String::new();
-    write_json(j, Jinja::RAW, &mut s);
-    s
-}
-
-/// Which `tojson` is meant.
-#[derive(Clone, Copy)]
-struct Jinja {
-    /// Sort keys, escape `< > & '` and everything past ASCII.
-    escape: bool,
-}
-
-impl Jinja {
-    const PLAIN: Jinja = Jinja { escape: true };
-    const RAW: Jinja = Jinja { escape: false };
-}
-
-fn write_json(j: &Json, how: Jinja, out: &mut String) {
+fn write_json(j: &Json, out: &mut String) {
     match j {
         Json::Null => out.push_str("null"),
         Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Json::Num(n) => out.push_str(&number(*n)),
-        Json::Str(s) => write_str(s, how, out),
+        Json::Str(s) => write_str(s, out),
         Json::Arr(a) => {
             out.push('[');
             for (i, v) in a.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_json(v, how, out);
+                write_json(v, out);
             }
             out.push(']');
         }
         Json::Obj(m) => {
-            let mut members: Vec<(&String, &Json)> = m.iter().collect();
-            if how.escape {
-                members.sort_by(|a, b| a.0.cmp(b.0));
-            }
             out.push('{');
-            for (i, (k, v)) in members.into_iter().enumerate() {
+            for (i, (k, v)) in m.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_str(k, how, out);
+                write_str(k, out);
                 out.push_str(": ");
-                write_json(v, how, out);
+                write_json(v, out);
             }
             out.push('}');
         }
@@ -498,7 +478,7 @@ fn number(n: f64) -> String {
     }
 }
 
-fn write_str(s: &str, how: Jinja, out: &mut String) {
+fn write_str(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -510,20 +490,7 @@ fn write_str(s: &str, how: Jinja, out: &mut String) {
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c if !how.escape => out.push(c),
-            '<' => out.push_str("\\u003c"),
-            '>' => out.push_str("\\u003e"),
-            '&' => out.push_str("\\u0026"),
-            '\'' => out.push_str("\\u0027"),
-            c if (c as u32) < 0x7f => out.push(c),
-            c => {
-                // Astral characters escape as the surrogate pair, as
-                // `json.dumps` writes them.
-                let mut buf = [0u16; 2];
-                for unit in c.encode_utf16(&mut buf) {
-                    out.push_str(&format!("\\u{unit:04x}"));
-                }
-            }
+            c => out.push(c),
         }
     }
     out.push('"');

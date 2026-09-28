@@ -61,9 +61,9 @@ ADD = {"type": "function", "function": {
 NOW = {"type": "function", "function": {
     "name": "now", "description": "Current time.",
     "parameters": {"type": "object", "properties": {}}}}
-# jinja's tojson is not plain json.dumps: it sorts keys, escapes non-ASCII,
-# and then escapes < > & ' as \uXXXX. A description is free text, so all of
-# that is reachable from a real tool list.
+# Characters plain Jinja's tojson would escape (< > & ' and non-ASCII) and
+# transformers' does not. A description is free text, so all of them are
+# reachable from a real tool list.
 ODD = {"type": "function", "function": {
     "name": "cmp", "description": "True when a < b & b > c, the 'usual' way — na\u00efvely.",
     "parameters": {"type": "object",
@@ -230,12 +230,13 @@ def main():
     ap.add_argument("--out", default="crates/lex-rt/tests/data/chatml")
     ap.add_argument("--mimo-out", default="crates/lex-rt/tests/data/chatml_mimo")
     args = ap.parse_args()
-    from jinja2 import BaseLoader, Environment
+    from transformers.utils.chat_template_utils import _compile_jinja_template
 
+    # Through transformers' environment, not plain jinja2: the two define
+    # `tojson` differently (plain sorts keys and escapes ' < > & and
+    # non-ASCII), and transformers' is the one the training data saw.
     path, tpl = find_template()
-    env = Environment(loader=BaseLoader())
-    env.globals["raise_exception"] = lambda m: (_ for _ in ()).throw(Exception(m))
-    t = env.from_string(tpl)
+    t = _compile_jinja_template(tpl)
 
     os.makedirs(args.out, exist_ok=True)
     print(f"template from {path}")
@@ -243,8 +244,9 @@ def main():
         kw = {k: v for k, v in req.items() if k != "messages"}
         want = t.render(messages=for_template(req["messages"]),
                         add_generation_prompt=True, **kw)
+        # Key order is part of the prompt, so the request keeps its own.
         with open(os.path.join(args.out, name + ".json"), "w") as f:
-            json.dump(req, f, indent=2, sort_keys=True)
+            json.dump(req, f, indent=2)
             f.write("\n")
         with open(os.path.join(args.out, name + ".txt"), "w") as f:
             f.write(want)
