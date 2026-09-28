@@ -216,6 +216,19 @@ it is a golden test rather than an eyeball. Qwen3.8 wants
 `<function=name><parameter=k>`, not the `{"name":..,"arguments":..}` that
 earlier Qwens used.
 
+The same architecture does not mean the same prompt. MiMo-v2.6 brings its
+own template in its GGUF — no newline between turns, a one-line tool block,
+tool results as their own `tool` turn, arguments as JSON — and the server
+picks the template from the model file, refusing a GGUF whose template it
+has not written out rather than handing it Qwen's. MiMo's fixtures come
+from transformers' Jinja environment, which its template was written for
+(`tojson(ensure_ascii=False)` keeps the client's key order and its
+non-ASCII as-is). Against Ollama, the prompt token counts agree exactly on
+plain, system, tool, non-ASCII and tool-history prompts, and a
+call → result → answer loop runs end to end. A call's arguments go back to
+the client as the model wrote them, so the history it returns prints back
+byte for byte.
+
 One request at a time, deliberately: there is one GPU and a 14.5 GB model
 on it, so a second caller queues rather than interleaving two sequences
 through one KV cache. `--port`, `--max-seq` and `--depth` are the knobs.

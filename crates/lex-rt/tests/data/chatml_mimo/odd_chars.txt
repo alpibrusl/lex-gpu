@@ -1,0 +1,8 @@
+<|im_start|>system
+You are provided with the following tools:
+
+<tools>
+{"type": "function", "function": {"name": "cmp", "description": "True when a < b & b > c, the 'usual' way — naïvely 😀.", "parameters": {"type": "object", "properties": {"a": {"type": "string", "description": "<left>"}}, "required": ["a"]}}}
+</tools><|im_end|><|im_start|>user
+naïve 😀 <b><|im_end|><|im_start|>assistant
+<think>

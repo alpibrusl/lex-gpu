@@ -18,10 +18,81 @@
 //!   not the `{"name":..,"arguments":..}` that earlier Qwens used.
 //! - **The prompt opens `<think>` for the model**, so a reply *starts*
 //!   inside its reasoning and [`parse_reply`] treats it that way.
+//!
+//! Other models of the same architecture bring their own template, and
+//! "same architecture" says nothing about the prompt: MiMo-v2.6 runs on
+//! Qwen3.5's layers and writes its tool calls as JSON. [`Template`] names
+//! the templates written out here; a model whose template is none of them
+//! is refused rather than handed a prompt it was never trained on.
 
-use std::collections::BTreeMap;
+use crate::gguf::{Gguf, Value, gguf_path};
+use crate::json::{Json, Map};
 
-use crate::json::Json;
+/// A chat template this module can render.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Template {
+    /// Qwen3.8's, from the MLX checkpoint's `tokenizer_config.json`.
+    #[default]
+    Qwen38,
+    /// MiMo-v2.6's, embedded in its GGUF: the llama.cpp adapter of
+    /// XiaomiMiMo's own, with JSON tool arguments.
+    Mimo,
+}
+
+/// What MiMo's template does that the Rust rendering depends on. All of
+/// it, not a name: a template that changed any of these renders
+/// differently, and should be refused until it is checked.
+const MIMO_MARKS: [&str; 4] = [
+    "You are provided with the following tools:\\n\\n<tools>",
+    "'<tool_call><function=' ~ tool_call.name ~ '>'",
+    "tojson(ensure_ascii=False)",
+    "'<|im_start|>assistant\\n<think>' ~ reasoning ~ '</think>' ~ content",
+];
+
+impl Template {
+    /// The template an Ollama tag's model uses. An MLX store is Qwen3.8's
+    /// layout and carries its template; a GGUF says which in its header.
+    pub fn for_model(model: &str) -> Result<Template, String> {
+        let Some(path) = gguf_path(model)? else {
+            return Ok(Template::Qwen38);
+        };
+        let g = Gguf::open_header(&path)?;
+        let Some(Value::Str(jinja)) = g.meta.get("tokenizer.chat_template") else {
+            return Err(format!("{model}: the GGUF carries no chat template"));
+        };
+        Template::recognise(jinja).ok_or_else(|| {
+            format!(
+                "{model}: its chat template is not one this server renders \
+                 (Qwen3.8, MiMo-v2.6); refusing rather than guessing the prompt format"
+            )
+        })
+    }
+
+    /// Which template a Jinja source is, if it is one written out here.
+    pub fn recognise(jinja: &str) -> Option<Template> {
+        MIMO_MARKS
+            .iter()
+            .all(|m| jinja.contains(m))
+            .then_some(Template::Mimo)
+    }
+
+    /// `messages` and `tools` as one prompt string.
+    pub fn render(self, req: &Json) -> Result<String, String> {
+        match self {
+            Template::Qwen38 => render_qwen(req),
+            Template::Mimo => render_mimo(req),
+        }
+    }
+
+    /// Split a reply into reasoning, visible text and tool calls. See
+    /// [`parse_reply`].
+    pub fn parse_reply(self, text: &str, types: &[Json]) -> Reply {
+        match self {
+            Template::Qwen38 => split_reply(text, &|b| parse_call(b, types)),
+            Template::Mimo => split_reply(text, &|b| parse_json_call(b, types)),
+        }
+    }
+}
 
 const XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, \
                      validate key assumptions, consider plausible alternatives, and prioritize \
@@ -59,8 +130,12 @@ pub struct Reply {
     pub calls: Vec<Call>,
 }
 
-/// `messages` and `tools` as one prompt string.
+/// Qwen3.8's prompt for `messages` and `tools`.
 pub fn render(req: &Json) -> Result<String, String> {
+    Template::Qwen38.render(req)
+}
+
+fn render_qwen(req: &Json) -> Result<String, String> {
     let msgs = req
         .get("messages")
         .and_then(Json::arr)
@@ -221,41 +296,192 @@ fn text_of(m: &Json) -> String {
         .to_string()
 }
 
+/// MiMo-v2.6's prompt, after the template in its GGUF. It differs from
+/// Qwen3.8's in ways that each change the tokens:
+///
+/// - nothing follows `<|im_end|>` -- no newline between turns;
+/// - the tool block is one short sentence and the schemas, with no
+///   instructions on how to call, and it is its own system turn;
+/// - a system message prints where it stands, like any other;
+/// - a `tool` result is its own `tool` turn, not wrapped in a user turn;
+/// - content is not trimmed;
+/// - arguments that arrive as a string -- which is how the wire sends them
+///   -- print as that string, exactly as the model wrote them;
+/// - there is no reasoning-effort setting, only thinking on or off.
+fn render_mimo(req: &Json) -> Result<String, String> {
+    let msgs = req
+        .get("messages")
+        .and_then(Json::arr)
+        .ok_or("no `messages` array")?;
+    if msgs.is_empty() {
+        return Err("`messages` is empty".into());
+    }
+    let tools = req.get("tools").and_then(Json::arr).unwrap_or(&[]);
+
+    let mut s = String::new();
+    if !tools.is_empty() {
+        s.push_str("<|im_start|>system\n");
+        mimo_tools(tools, &mut s);
+        s.push_str("<|im_end|>");
+    }
+    for m in msgs {
+        let role = m
+            .get("role")
+            .and_then(Json::str)
+            .ok_or("a message has no `role`")?;
+        let content = mimo_content(m.get("content"))?;
+        if role == "assistant" {
+            let reasoning = m.get("reasoning_content").and_then(Json::str).unwrap_or("");
+            s.push_str("<|im_start|>assistant\n<think>");
+            s.push_str(reasoning);
+            s.push_str("</think>");
+            s.push_str(&content);
+            for c in m.get("tool_calls").and_then(Json::arr).unwrap_or(&[]) {
+                let f = c.get("function").or_else(|| c.get("custom")).unwrap_or(c);
+                s.push_str("<tool_call><function=");
+                s.push_str(f.get("name").and_then(Json::str).unwrap_or(""));
+                s.push('>');
+                match (f.get("input"), f.get("arguments")) {
+                    (Some(Json::Str(input)), _) => s.push_str(input),
+                    (_, Some(Json::Str(args))) => s.push_str(args),
+                    (_, Some(args)) => s.push_str(&tojson_raw(args)),
+                    (_, None) => {}
+                }
+                s.push_str("</function></tool_call>");
+            }
+            s.push_str("<|im_end|>");
+        } else {
+            s.push_str("<|im_start|>");
+            s.push_str(role);
+            s.push('\n');
+            s.push_str(&content);
+            let own = m.get("tools").and_then(Json::arr).unwrap_or(&[]);
+            if !own.is_empty() {
+                if !content.is_empty() {
+                    s.push_str("\n\n");
+                }
+                mimo_tools(own, &mut s);
+            }
+            s.push_str("<|im_end|>");
+        }
+    }
+    s.push_str("<|im_start|>assistant\n");
+    // `enable_thinking is false`: only an explicit false turns it off.
+    let thinking = req
+        .get("chat_template_kwargs")
+        .and_then(|k| k.get("enable_thinking"))
+        != Some(&Json::Bool(false));
+    s.push_str(if thinking { "<think>\n" } else { "<think></think>" });
+    Ok(s)
+}
+
+fn mimo_tools(tools: &[Json], s: &mut String) {
+    s.push_str("You are provided with the following tools:\n\n<tools>");
+    for t in tools {
+        s.push('\n');
+        s.push_str(&tojson_raw(t));
+    }
+    s.push_str("\n</tools>");
+}
+
+/// A message's content: a string, or a list of parts of which only text
+/// is something this server can read. The template would print a
+/// placeholder for an image and the model would then look for the image
+/// it stands for, so a picture is refused here rather than silently lost.
+fn mimo_content(c: Option<&Json>) -> Result<String, String> {
+    let parts = match c {
+        Some(Json::Str(s)) => return Ok(s.clone()),
+        Some(Json::Arr(parts)) => parts,
+        Some(Json::Obj(_)) => return Err("message content is an object, not text".into()),
+        // Absent, null, a number: the template prints nothing for these.
+        _ => return Ok(String::new()),
+    };
+    let mut out = String::new();
+    for p in parts {
+        match p {
+            Json::Str(s) => out.push_str(s),
+            Json::Obj(_) => {
+                let ty = p.get("type").and_then(Json::str).unwrap_or("");
+                let media = ["image", "image_url", "audio", "audio_url", "input_audio", "video", "video_url"];
+                if media.contains(&ty) || media.iter().any(|k| p.get(k).is_some()) {
+                    return Err(format!(
+                        "a `{ty}` content part: this server reads text only"
+                    ));
+                }
+                if let Some(t) = p.get("text") {
+                    match t {
+                        Json::Str(t) => out.push_str(t),
+                        other => out.push_str(&tojson_raw(other)),
+                    }
+                }
+            }
+            other => return Err(format!("a content part that is not text: {}", tojson_raw(other))),
+        }
+    }
+    Ok(out)
+}
+
 /// Jinja's `tojson`, which is not `serde_json::to_string`: keys sort, the
 /// separators carry a space, non-ASCII escapes, and `< > & '` escape on
 /// top of that so the result is safe to drop into a page. All four are
 /// reachable from an ordinary tool description, so all four are copied.
 pub fn tojson(j: &Json) -> String {
     let mut s = String::new();
-    write_json(j, &mut s);
+    write_json(j, Jinja::PLAIN, &mut s);
     s
 }
 
-fn write_json(j: &Json, out: &mut String) {
+/// `tojson(ensure_ascii=False)` as Hugging Face's template environment
+/// defines it -- `json.dumps` and nothing else: keys in the order given,
+/// no HTML escaping, non-ASCII as itself. Plain Jinja's filter does not
+/// even take the argument; a template that passes it was written for this.
+pub fn tojson_raw(j: &Json) -> String {
+    let mut s = String::new();
+    write_json(j, Jinja::RAW, &mut s);
+    s
+}
+
+/// Which `tojson` is meant.
+#[derive(Clone, Copy)]
+struct Jinja {
+    /// Sort keys, escape `< > & '` and everything past ASCII.
+    escape: bool,
+}
+
+impl Jinja {
+    const PLAIN: Jinja = Jinja { escape: true };
+    const RAW: Jinja = Jinja { escape: false };
+}
+
+fn write_json(j: &Json, how: Jinja, out: &mut String) {
     match j {
         Json::Null => out.push_str("null"),
         Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Json::Num(n) => out.push_str(&number(*n)),
-        Json::Str(s) => write_str(s, out),
+        Json::Str(s) => write_str(s, how, out),
         Json::Arr(a) => {
             out.push('[');
             for (i, v) in a.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_json(v, out);
+                write_json(v, how, out);
             }
             out.push(']');
         }
         Json::Obj(m) => {
+            let mut members: Vec<(&String, &Json)> = m.iter().collect();
+            if how.escape {
+                members.sort_by(|a, b| a.0.cmp(b.0));
+            }
             out.push('{');
-            for (i, (k, v)) in m.iter().enumerate() {
+            for (i, (k, v)) in members.into_iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_str(k, out);
+                write_str(k, how, out);
                 out.push_str(": ");
-                write_json(v, out);
+                write_json(v, how, out);
             }
             out.push('}');
         }
@@ -272,7 +498,7 @@ fn number(n: f64) -> String {
     }
 }
 
-fn write_str(s: &str, out: &mut String) {
+fn write_str(s: &str, how: Jinja, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -283,11 +509,12 @@ fn write_str(s: &str, out: &mut String) {
             '\t' => out.push_str("\\t"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if !how.escape => out.push(c),
             '<' => out.push_str("\\u003c"),
             '>' => out.push_str("\\u003e"),
             '&' => out.push_str("\\u0026"),
             '\'' => out.push_str("\\u0027"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c if (c as u32) < 0x7f => out.push(c),
             c => {
                 // Astral characters escape as the surrogate pair, as
@@ -310,6 +537,13 @@ fn write_str(s: &str, out: &mut String) {
 /// text, so the declared schema is the only thing that can say whether
 /// `1` meant a number or a string.
 pub fn parse_reply(text: &str, types: &[Json]) -> Reply {
+    Template::Qwen38.parse_reply(text, types)
+}
+
+/// The split both templates share -- reasoning, then prose with
+/// `<tool_call>` blocks in it -- with what is inside a block left to
+/// `call`.
+fn split_reply(text: &str, call: &dyn Fn(&str) -> Option<Call>) -> Reply {
     let (reasoning, rest) = match text.split_once("</think>") {
         Some((a, b)) => (a, b),
         // No close tag: the whole thing is still reasoning, which is what a
@@ -330,7 +564,7 @@ pub fn parse_reply(text: &str, types: &[Json]) -> Reply {
             // Truncated mid-call: take what there is rather than drop it.
             None => (after, ""),
         };
-        if let Some(c) = parse_call(body, types) {
+        if let Some(c) = call(body) {
             r.calls.push(c);
         }
         tail = next;
@@ -346,7 +580,7 @@ fn parse_call(body: &str, types: &[Json]) -> Option<Call> {
     let close = after.find('>')?;
     let name = after[..close].trim().to_string();
     let schema = properties_of(types, &name);
-    let mut args: BTreeMap<String, Json> = BTreeMap::new();
+    let mut args = Map::new();
     let mut tail = &after[close + 1..];
     while let Some(p) = tail.find("<parameter=") {
         let a = &tail[p + "<parameter=".len()..];
@@ -364,6 +598,32 @@ fn parse_call(body: &str, types: &[Json]) -> Option<Call> {
         name,
         arguments: tojson(&Json::Obj(args)),
     })
+}
+
+/// MiMo's call: `<function=name>{"k": v}</function>`, the arguments
+/// already JSON and already typed by the model.
+///
+/// The arguments go back to the client as the model wrote them, not
+/// re-serialised: the client returns them in the next request's history,
+/// the template prints a string argument verbatim, and so the model reads
+/// back exactly what it wrote. A body that is not a JSON object still
+/// comes back as a call -- dropping it would end an agent's turn as if the
+/// model had asked for nothing -- and the client's error on it is feedback
+/// the model can act on. A body in Qwen's `<parameter=` form is read as
+/// that, since the two families are close enough to trade habits.
+fn parse_json_call(body: &str, types: &[Json]) -> Option<Call> {
+    let open = body.find("<function=")?;
+    let after = &body[open + "<function=".len()..];
+    let close = after.find('>')?;
+    let name = after[..close].trim().to_string();
+    let inner = &after[close + 1..];
+    let inner = inner.split_once("</function>").map_or(inner, |(a, _)| a);
+    if inner.contains("<parameter=") {
+        return parse_call(body, types);
+    }
+    let raw = inner.trim();
+    let arguments = if raw.is_empty() { "{}".to_string() } else { raw.to_string() };
+    Some(Call { name, arguments })
 }
 
 fn properties_of(types: &[Json], name: &str) -> Option<Json> {
@@ -414,11 +674,19 @@ pub enum Piece {
 /// emit the difference and never has to retract.
 #[derive(Default)]
 pub struct Stream {
+    template: Template,
     reasoning: usize,
     content: usize,
 }
 
 impl Stream {
+    pub fn new(template: Template) -> Stream {
+        Stream {
+            template,
+            ..Stream::default()
+        }
+    }
+
     /// New pieces, given everything generated so far.
     pub fn push(&mut self, all: &str) -> Vec<Piece> {
         self.advance(&all[..settled(all)])
@@ -427,11 +695,11 @@ impl Stream {
     /// The last pieces, plus the finished reply.
     pub fn finish(&mut self, all: &str, types: &[Json]) -> (Vec<Piece>, Reply) {
         let pieces = self.advance(all);
-        (pieces, parse_reply(all, types))
+        (pieces, self.template.parse_reply(all, types))
     }
 
     fn advance(&mut self, text: &str) -> Vec<Piece> {
-        let r = parse_reply(text, &[]);
+        let r = self.template.parse_reply(text, &[]);
         let mut out = vec![];
         if r.reasoning.len() > self.reasoning {
             out.push(Piece::Reasoning(r.reasoning[self.reasoning..].to_string()));
@@ -509,12 +777,35 @@ fn turns(msgs: &[Json]) -> Vec<usize> {
 /// going, which is why it finishes tasks this did not. So this drops too --
 /// whole turns, oldest first, never the system message and never the last
 /// turn, which is the one actually being answered.
+///
+/// This is Qwen3.8's; [`Template::render_within`] is any template's.
 pub fn render_within(
     req: &Json,
     budget: usize,
     count: &mut dyn FnMut(&str) -> usize,
 ) -> Result<(String, usize), String> {
-    let full = render(req)?;
+    Template::Qwen38.render_within(req, budget, count)
+}
+
+impl Template {
+    /// Render `req`, trimmed to `budget` tokens. See [`render_within`].
+    pub fn render_within(
+        self,
+        req: &Json,
+        budget: usize,
+        count: &mut dyn FnMut(&str) -> usize,
+    ) -> Result<(String, usize), String> {
+        trim(self, req, budget, count)
+    }
+}
+
+fn trim(
+    t: Template,
+    req: &Json,
+    budget: usize,
+    count: &mut dyn FnMut(&str) -> usize,
+) -> Result<(String, usize), String> {
+    let full = t.render(req)?;
     if count(&full) <= budget {
         return Ok((full, 0));
     }
@@ -524,7 +815,7 @@ pub fn render_within(
     let keep_from = |d: usize| -> Result<String, String> {
         let mut kept = head.clone();
         kept.extend(msgs[starts[d]..].iter().cloned());
-        render_msgs(req, &kept)
+        render_msgs(t, req, &kept)
     };
     // Binary search the fewest turns to drop: the prompt only shrinks as
     // more go, and tokenising a long transcript is not cheap enough to
@@ -552,7 +843,7 @@ pub fn render_within(
     let mut kept = head.clone();
     kept.extend(msgs[starts[lo]..].iter().cloned());
     loop {
-        let rendered = render_msgs(req, &kept)?;
+        let rendered = render_msgs(t, req, &kept)?;
         if count(&rendered) <= budget {
             return Ok((rendered, dropped));
         }
@@ -578,12 +869,12 @@ pub fn render_within(
 }
 
 /// `req` with its messages replaced.
-fn render_msgs(req: &Json, msgs: &[Json]) -> Result<String, String> {
+fn render_msgs(t: Template, req: &Json, msgs: &[Json]) -> Result<String, String> {
     let Json::Obj(mut o) = req.clone() else {
         return Err("request is not an object".into());
     };
     o.insert("messages".into(), Json::Arr(msgs.to_vec()));
-    render(&Json::Obj(o))
+    t.render(&Json::Obj(o))
 }
 
 /// Halve a message's content, cutting from the middle and saying so. Two

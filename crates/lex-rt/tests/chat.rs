@@ -7,20 +7,20 @@
 //! block in the wrong shape does not fail loudly, it just produces a model
 //! that never calls anything.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use lex_rt::chat::{Call, parse_reply, render, render_within, tojson};
-use lex_rt::json::Json;
+use lex_rt::chat::{Call, Template, parse_reply, render, render_within, tojson, tojson_raw};
+use lex_rt::json::{Json, Map};
 
-fn dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/chatml")
+fn data(sub: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(sub)
 }
 
-#[test]
-fn the_rust_template_matches_the_models_own() {
-    let mut cases: Vec<String> = fs::read_dir(dir())
+/// Every fixture in `sub`, rendered by `t` and compared byte for byte.
+fn matches_its_fixtures(t: Template, sub: &str, needed: &[&str]) {
+    let dir = data(sub);
+    let mut cases: Vec<String> = fs::read_dir(&dir)
         .expect("fixture directory")
         .filter_map(|e| {
             let p = e.ok()?.path();
@@ -31,47 +31,87 @@ fn the_rust_template_matches_the_models_own() {
     // A fixture directory that quietly emptied would otherwise pass.
     assert!(
         cases.len() >= 10,
-        "only {} fixtures; run scripts/chat_fixtures.py",
+        "only {} fixtures in {sub}; run scripts/chat_fixtures.py",
         cases.len()
     );
 
     for name in &cases {
-        let req = fs::read_to_string(dir().join(format!("{name}.json"))).expect("request");
-        let want = fs::read_to_string(dir().join(format!("{name}.txt"))).expect("expected");
-        let got = render(&Json::parse(&req).expect("request json"))
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let req = fs::read_to_string(dir.join(format!("{name}.json"))).expect("request");
+        let want = fs::read_to_string(dir.join(format!("{name}.txt"))).expect("expected");
+        let got = t
+            .render(&Json::parse(&req).expect("request json"))
+            .unwrap_or_else(|e| panic!("{sub}/{name}: {e}"));
         if got != want {
             let at = got
                 .char_indices()
                 .zip(want.chars())
                 .find(|((_, a), b)| a != b)
                 .map_or(got.len().min(want.len()), |((i, _), _)| i);
+            let near = |s: &str| {
+                let mut a = at.saturating_sub(40);
+                while !s.is_char_boundary(a) {
+                    a -= 1;
+                }
+                let mut b = (at + 60).min(s.len());
+                while !s.is_char_boundary(b) {
+                    b += 1;
+                }
+                s[a..b].to_string()
+            };
             panic!(
-                "{name}: prompts differ at byte {at}\n  ours: {:?}\n  jinja: {:?}",
-                &got[at.saturating_sub(40)..(at + 60).min(got.len())],
-                &want[at.saturating_sub(40)..(at + 60).min(want.len())],
+                "{sub}/{name}: prompts differ at byte {at}\n  ours: {:?}\n  jinja: {:?}",
+                near(&got),
+                near(&want),
             );
         }
     }
-    // The tool cases are the ones with no second opinion in the wild, so
-    // make sure they are actually among what just passed.
-    for needed in ["tools", "tool_result", "two_tool_results", "odd_chars"] {
-        assert!(cases.iter().any(|c| c == needed), "missing case {needed}");
+    // The cases with no second opinion in the wild, so make sure they are
+    // actually among what just passed.
+    for n in needed {
+        assert!(cases.iter().any(|c| c == n), "{sub}: missing case {n}");
     }
+}
+
+#[test]
+fn the_rust_template_matches_the_models_own() {
+    matches_its_fixtures(
+        Template::Qwen38,
+        "chatml",
+        &["tools", "tool_result", "two_tool_results", "odd_chars"],
+    );
+}
+
+/// MiMo's fixtures come from transformers' Jinja environment, which is
+/// what its template was written for (`tojson(ensure_ascii=False)`,
+/// `{% generation %}`).
+#[test]
+fn the_mimo_template_matches_its_own() {
+    matches_its_fixtures(
+        Template::Mimo,
+        "chatml_mimo",
+        &["tools", "tool_result", "odd_chars", "object_args", "no_think", "text_parts"],
+    );
 }
 
 /// `tojson` is Jinja's, not `json.dumps`: sorted keys, spaced separators,
 /// and `< > & '` escaped on top of the non-ASCII escaping.
 #[test]
 fn tojson_escapes_what_jinja_escapes() {
-    let mut m = BTreeMap::new();
+    let mut m = Map::new();
     m.insert("b".to_string(), Json::Num(1.0));
     m.insert("a".to_string(), Json::Str("x < y & 'z' — naïve".into()));
     m.insert("c".to_string(), Json::Arr(vec![Json::Bool(true), Json::Null]));
+    let m = Json::Obj(m);
     assert_eq!(
-        tojson(&Json::Obj(m)),
+        tojson(&m),
         "{\"a\": \"x \\u003c y \\u0026 \\u0027z\\u0027 \\u2014 na\\u00efve\", \"b\": 1, \
          \"c\": [true, null]}"
+    );
+    // `tojson(ensure_ascii=False)` under Hugging Face's environment is
+    // `json.dumps`: the order given, and every character as itself.
+    assert_eq!(
+        tojson_raw(&m),
+        "{\"b\": 1, \"a\": \"x < y & 'z' — naïve\", \"c\": [true, null]}"
     );
 }
 
@@ -311,4 +351,114 @@ fn a_window_too_small_for_anything_still_says_so() {
         render_within(&req, 5, &mut count).is_err(),
         "a window that cannot hold even an elided turn has to say so"
     );
+}
+
+/// MiMo writes its arguments as JSON, and they go back to the client as
+/// written: the model already typed them.
+#[test]
+fn a_mimo_call_comes_back_as_the_model_wrote_it() {
+    let r = Template::Mimo.parse_reply(
+        "Adding.\n</think>Sure.<tool_call><function=add>{\"a\": 17, \"note\": \"01234\"}\
+         </function></tool_call>",
+        &tool_types(),
+    );
+    assert_eq!(r.reasoning, "Adding.");
+    assert_eq!(r.content, "Sure.");
+    assert_eq!(
+        r.calls,
+        vec![Call {
+            name: "add".into(),
+            arguments: "{\"a\": 17, \"note\": \"01234\"}".into(),
+        }]
+    );
+
+    // No arguments at all is still a call, with an empty object.
+    let r = Template::Mimo.parse_reply("</think><tool_call><function=now></function></tool_call>", &[]);
+    assert_eq!(r.calls[0].arguments, "{}");
+
+    // Qwen's parameter form, which a relative may slip into, reads as that.
+    let r = Template::Mimo.parse_reply(
+        "</think><tool_call>\n<function=add>\n<parameter=a>\n17\n</parameter>\n</function>\n</tool_call>",
+        &tool_types(),
+    );
+    assert_eq!(r.calls[0].arguments, "{\"a\": 17}");
+}
+
+/// What the model wrote, returned by the client as history, must print
+/// back as exactly what the model wrote. Anything else and every later
+/// turn reads a call it never made.
+#[test]
+fn a_mimo_call_round_trips_through_the_history_unchanged() {
+    let said = "<tool_call><function=add>{\"a\":17,\"b\": 25}</function></tool_call>";
+    let reply = Template::Mimo.parse_reply(&format!("x</think>{said}"), &tool_types());
+    let c = &reply.calls[0];
+    let req = Json::parse(&format!(
+        r#"{{"messages":[{{"role":"user","content":"go"}},
+            {{"role":"assistant","content":"","tool_calls":[{{"id":"c","type":"function",
+              "function":{{"name":{},"arguments":{}}}}}]}},
+            {{"role":"tool","content":"42"}}]}}"#,
+        tojson(&Json::Str(c.name.clone())),
+        tojson(&Json::Str(c.arguments.clone())),
+    ))
+    .expect("json");
+    let prompt = Template::Mimo.render(&req).expect("render");
+    assert!(prompt.contains(said), "the call changed on the way back:\n{prompt}");
+}
+
+#[test]
+fn a_mimo_stream_splits_like_the_finished_reply() {
+    use lex_rt::chat::{Piece, Stream};
+
+    let full = "mulling\n</think>On it.<tool_call><function=add>{\"a\": 7}</function></tool_call>";
+    let mut s = Stream::new(Template::Mimo);
+    let mut content = String::new();
+    for i in 1..full.len() {
+        if full.is_char_boundary(i) {
+            for p in s.push(&full[..i]) {
+                if let Piece::Content(t) = p {
+                    content.push_str(&t);
+                }
+            }
+        }
+    }
+    let (last, reply) = s.finish(full, &tool_types());
+    for p in last {
+        if let Piece::Content(t) = p {
+            content.push_str(&t);
+        }
+    }
+    assert_eq!(content, "On it.");
+    assert_eq!(reply.calls[0].arguments, "{\"a\": 7}");
+}
+
+/// The template would print a placeholder and the model would then go
+/// looking for a picture that is not there.
+#[test]
+fn a_picture_is_refused_not_dropped() {
+    let req = Json::parse(
+        r#"{"messages":[{"role":"user","content":[{"type":"text","text":"what is this"},
+            {"type":"image_url","image_url":{"url":"data:,"}}]}]}"#,
+    )
+    .unwrap();
+    let e = Template::Mimo.render(&req).expect_err("an image must not vanish");
+    assert!(e.contains("text only"), "{e}");
+}
+
+/// The template is picked from the model's own file, and a GGUF whose
+/// template is not one written out here is refused, not given Qwen's.
+#[test]
+fn each_model_gets_its_own_template() {
+    assert_eq!(Template::recognise(""), None);
+    assert_eq!(
+        Template::recognise("{{ '<|im_start|>' + message.role }}<tool_call>"),
+        None
+    );
+    if lex_rt::gguf::gguf_path("maternion/mimo-v2.6:9b").ok().flatten().is_some() {
+        assert_eq!(Template::for_model("maternion/mimo-v2.6:9b"), Ok(Template::Mimo));
+    } else {
+        eprintln!("skipping the MiMo half: maternion/mimo-v2.6:9b is not pulled");
+    }
+    if lex_rt::qwen::Store::open("qwen3.8:27b-mlx").is_ok() {
+        assert_eq!(Template::for_model("qwen3.8:27b-mlx"), Ok(Template::Qwen38));
+    }
 }

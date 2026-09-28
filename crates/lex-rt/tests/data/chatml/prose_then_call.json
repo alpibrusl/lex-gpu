@@ -10,10 +10,7 @@
       "tool_calls": [
         {
           "function": {
-            "arguments": {
-              "a": "17",
-              "b": "25"
-            },
+            "arguments": "{\"a\":\"17\",\"b\":\"25\"}",
             "name": "add"
           },
           "id": "call_1",

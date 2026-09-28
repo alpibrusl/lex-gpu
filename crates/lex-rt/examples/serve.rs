@@ -30,7 +30,7 @@ mod serve {
     use std::net::{TcpListener, TcpStream};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use lex_rt::chat::{self, Piece, Stream};
+    use lex_rt::chat::{self, Piece, Stream, Template};
 use lex_rt::json::Json;
 use lex_rt::sample::Sampler;
     use lex_rt::qwen_run::{Checkpoint, Runner, evict_index};
@@ -70,12 +70,16 @@ use lex_rt::sample::Sampler;
         }
 
         let tok = Tokenizer::for_model(&model)?;
+        // Before the weights: a model whose prompt format is unknown should
+        // be refused in a second, not after a minute of loading.
+        let template = Template::for_model(&model)?;
+        let defaults = Defaults::for_model(&model)?;
         let mut rt = Runner::load(&model, max_seq)?;
         let stop: Vec<u32> = STOP.iter().filter_map(|s| tok.id_of(s)).collect();
         // Speculation is only a win where there is a draft head to do it.
         let depth = if rt.has_mtp() { depth } else { 0 };
         eprintln!(
-            "{model} on {} — {} tokens of context, depth {depth}\n\
+            "{model} on {} — {} tokens of context, depth {depth}, {template:?} template\n\
              listening on http://127.0.0.1:{port}",
             rt.device(),
             max_seq
@@ -83,11 +87,18 @@ use lex_rt::sample::Sampler;
 
         let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
         let mut cache = Cache::default();
+        let ctx = Ctx {
+            tok: &tok,
+            stop: &stop,
+            depth,
+            model: &model,
+            max_seq,
+            template,
+            defaults,
+        };
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { continue };
-            if let Err(e) = handle(
-                &mut conn, &mut rt, &tok, &stop, depth, &model, max_seq, &mut cache,
-            ) {
+            if let Err(e) = handle(&mut conn, &mut rt, &ctx, &mut cache) {
                 // A client that hangs up mid-stream is ordinary, not an
                 // error worth stopping the server over.
                 eprintln!("request: {e}");
@@ -144,17 +155,61 @@ use lex_rt::sample::Sampler;
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// What every request is served with.
+    struct Ctx<'a> {
+        tok: &'a Tokenizer,
+        stop: &'a [u32],
+        depth: usize,
+        model: &'a str,
+        max_seq: usize,
+        template: Template,
+        defaults: Defaults,
+    }
+
+    /// Sampling when the request does not say: the checkpoint's own
+    /// recommendation. Greedy decoding is not a neutral default for a
+    /// thinking model -- it repeats until the client gives up.
+    #[derive(Clone, Copy)]
+    struct Defaults {
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+    }
+
+    impl Defaults {
+        /// Qwen3.8's `generation_config.json` says 1.0, 0.95, 20. A GGUF
+        /// carries its model's own in `general.sampling.*` -- MiMo's say
+        /// 0.6, 0.95, 20 -- and each key it has overrides.
+        fn for_model(model: &str) -> Result<Defaults, String> {
+            let mut d = Defaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+            };
+            if let Some(path) = lex_rt::gguf::gguf_path(model)? {
+                let g = lex_rt::gguf::Gguf::open_header(&path)?;
+                let f = |k: &str| g.meta.get(k).and_then(|v| v.as_float());
+                if let Some(t) = f("general.sampling.temp") {
+                    d.temperature = t as f32;
+                }
+                if let Some(p) = f("general.sampling.top_p") {
+                    d.top_p = p as f32;
+                }
+                if let Some(k) = g.meta.get("general.sampling.top_k").and_then(|v| v.as_int()) {
+                    d.top_k = k.max(0) as usize;
+                }
+            }
+            Ok(d)
+        }
+    }
+
     fn handle(
         conn: &mut TcpStream,
         rt: &mut Runner,
-        tok: &Tokenizer,
-        stop: &[u32],
-        depth: usize,
-        model: &str,
-        max_seq: usize,
+        ctx: &Ctx,
         cache: &mut Cache,
     ) -> Result<(), String> {
+        let model = ctx.model;
         let mut r = BufReader::new(conn.try_clone().map_err(|e| e.to_string())?);
         let mut line = String::new();
         r.read_line(&mut line).map_err(|e| e.to_string())?;
@@ -185,9 +240,7 @@ use lex_rt::sample::Sampler;
                     quote(model)
                 ),
             ),
-            ("POST", "/v1/chat/completions") => {
-                chat(conn, rt, tok, stop, depth, model, max_seq, &body, cache)
-            }
+            ("POST", "/v1/chat/completions") => chat(conn, rt, ctx, &body, cache),
             ("GET", "/health") => send(conn, 200, "text/plain", "ok\n"),
             _ => send(
                 conn,
@@ -198,18 +251,22 @@ use lex_rt::sample::Sampler;
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn chat(
         conn: &mut TcpStream,
         rt: &mut Runner,
-        tok: &Tokenizer,
-        stop: &[u32],
-        depth: usize,
-        model: &str,
-        max_seq: usize,
+        ctx: &Ctx,
         body: &str,
         cache: &mut Cache,
     ) -> Result<(), String> {
+        let Ctx {
+            tok,
+            stop,
+            depth,
+            model,
+            max_seq,
+            template,
+            defaults,
+        } = *ctx;
         let j = match Json::parse(body) {
             Ok(j) => j,
             Err(e) => {
@@ -223,13 +280,10 @@ use lex_rt::sample::Sampler;
         };
         let stream = matches!(j.get("stream"), Some(Json::Bool(true)));
         let asked = j.get("max_tokens").and_then(Json::usize).unwrap_or(512);
-        // The checkpoint's own generation_config: do_sample, 1.0, 0.95, 20.
-        // Greedy decoding is not a neutral default for a thinking model --
-        // it repeats until the client gives up.
         let num = |k: &str| j.get(k).and_then(Json::num);
-        let temperature = num("temperature").unwrap_or(1.0) as f32;
-        let top_p = num("top_p").unwrap_or(0.95) as f32;
-        let top_k = j.get("top_k").and_then(Json::usize).unwrap_or(20);
+        let temperature = num("temperature").map_or(defaults.temperature, |t| t as f32);
+        let top_p = num("top_p").map_or(defaults.top_p, |p| p as f32);
+        let top_k = j.get("top_k").and_then(Json::usize).unwrap_or(defaults.top_k);
         let seed = j
             .get("seed")
             .and_then(Json::usize)
@@ -240,7 +294,7 @@ use lex_rt::sample::Sampler;
         // generate nothing, which is a refusal by another name.
         let room = (max_seq / 4).min(1024);
         let (prompt, dropped) =
-            match chat::render_within(&j, max_seq - room, &mut |t| tok.encode(t).len()) {
+            match template.render_within(&j, max_seq - room, &mut |t| tok.encode(t).len()) {
                 Ok(p) => p,
                 Err(e) => {
                     return send(
@@ -312,7 +366,7 @@ use lex_rt::sample::Sampler;
                 )
             };
             sse(conn, &chunk(r#"{"role":"assistant"}"#, "null".into()))?;
-            let mut split = Stream::default();
+            let mut split = Stream::new(template);
             let (text, reason, _) = generate(rt, tok, stop, depth, want, logits, &mut sampler, &mut |all| {
                 for p in split.push(all) {
                     // Reasoning goes in its own field. A client that shows
@@ -353,7 +407,7 @@ use lex_rt::sample::Sampler;
         }
 
         let (text, reason, n) = generate(rt, tok, stop, depth, want, logits, &mut sampler, &mut |_| Ok(()))?;
-        let reply = chat::parse_reply(&text, &types);
+        let reply = template.parse_reply(&text, &types);
         let calls: Vec<String> = reply
             .calls
             .iter()
