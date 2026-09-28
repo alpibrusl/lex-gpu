@@ -142,15 +142,20 @@ Raising it needs a tiled GEMM on the matrix units; `examples/gemm_probe`
 measures one at 6.95 ms/token against the batched matvec's best 8.49,
 with the crossover at 16 tokens.
 
-**Qwen on the L4 is correct and slow.** The full golden suite passes there
-against the f32 reference — 24 steps over 3 prompts, worst |dlogprob|
-0.00064 against a tolerance of 0.02 — at 9.1 tok/s, up from 6.4 once the
-decode matvec read two rows per simdgroup rather than one
-([`docs/roadmap-weeks.md`](docs/roadmap-weeks.md)). That is 132 GB/s of a
-~300 GB/s card, 44% of its roof, where Metal reaches 75% of its own.
-Bandwidth scaling alone would predict 15.6. The CUDA backend is days old
-and issues every dispatch on the default stream in order, while Metal runs
-a concurrent encoder with hazard barriers.
+**Qwen on the L4 is correct, and speculating it doubles its speed.** The
+full golden suite passes there against the f32 reference — 24 steps over
+3 prompts, worst |dlogprob| 0.00064 against a tolerance of 0.02. Plain
+decode is 9.6 tok/s; speculating at depth 1 it is **21.6 (2.25x)**, with
+87.1% of drafts accepted, because a verify of three tokens costs 0.97 of
+a plain step there. (An earlier "speculation is a loss on CUDA" timed the
+first verify, which compiles its kernels with NVRTC; see
+[`docs/roadmap-weeks.md`](docs/roadmap-weeks.md).)
+
+Plain decode is still slow: 132 GB/s of a ~300 GB/s card, 44% of its
+roof, where Metal reaches 75% of its own. Timed per kernel with events
+(`examples/qwen_profile`), the matvecs are 92% of the step and run at
+140–156 GB/s; everything else together is about 5 ms of 106, so the fix
+is the decode matvec, not streams or launch overhead.
 
 | Phase | State | Details |
 | --- | --- | --- |

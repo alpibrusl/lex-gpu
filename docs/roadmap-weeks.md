@@ -389,17 +389,35 @@ wrong about.
 Until then the target value stays at 2, which is right for the model in
 daily use and wrong by 6% for the 1B.
 
-Speculation on CUDA is now a loss: 6.2 tok/s against 9.1 plain, where
-before the change it was 6.4 against 6.4. Nothing about it got slower —
-the decode step got 42% faster and the verify did not, so the break-even
-moved. The verify of two tokens costs about 2.7 steps there against 1.15
-on Metal, and that gap is its own investigation: the batched matvec on
-Ada already reaches 67% of roof, so the cost is somewhere else in the
-batched path.
+~~Speculation on CUDA is now a loss: 6.2 tok/s against 9.1 plain.~~
+**Retracted 2026-09-28: that was the measurement, not the machine.** A
+batch size's kernels compile the first time it is used, and on CUDA that
+is an NVRTC compile of every kernel -- seconds, inside a timed loop of a
+few seconds. `examples/mtp` timed the first speculation, so it timed the
+compile. Warmed, on the same L4:
 
-So the next CUDA work is that verify, and after it streams and events —
-which remain unmeasured, and which bought only 4% when they were added
-on Metal.
+| | tok/s |
+| --- | --- |
+| plain decode | 9.6 |
+| speculating, depth 1 (87.1% accepted) | **21.6 (2.25x)** |
+
+`examples/qwen_profile` (events between launches, which sum to the
+untimed step within 1%) says why it can beat 2x at depth 1: a verify of
+*three* tokens costs 0.97 of a plain step (101.4 against 105.0 ms at
+context 0; 108.7 against 112.2 at 1024). The batched path's matvec is
+faster than the decode path's even though it does three times the
+arithmetic.
+
+**Where the decode step's time actually goes** on the L4, from the same
+profile: matvecs are 92% of it, and everything else -- norms, the
+recurrence, attention, rope, the KV append -- is about 5 ms of 106. So
+streams and events, the other candidate, could buy at most about 5%. The
+matvecs run at 140-156 GB/s inside the model, half the card's ~300. The
+189 GB/s above came from `examples/matvec`, which repeats one 50 MB
+matrix on a card with 48 MB of L2, and so flattered it.
+
+So the next CUDA work is the decode matvec: first, whether the batched
+kernel at one token already beats it, since at three tokens it does.
 
 ## M4 — first proof: a Llama on CUDA
 
