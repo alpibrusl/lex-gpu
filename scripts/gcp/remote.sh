@@ -161,6 +161,26 @@ if [ -n "${QWEN:-}" ]; then
   sudo systemctl stop ollama 2>/dev/null || true
   nvidia-smi --query-gpu=memory.total,memory.used --format=csv | tee -a "$R/machine.txt"
 
+  # The matvec structures, timed against the emitted one on this card
+  # (no model needed; synthetic weights, four matrices to defeat the L2).
+  cargo run --release -p lex-cuda --example mv_variants 2>&1 | tee "$R/mv-variants.log" \
+    | grep -E "variant|GB/s|read|emitted|unroll|warp"
+  [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+  grep -q "warp_4rows" "$R/mv-variants.log" || { echo "mv_variants printed no table"; fail=1; }
+
+  if [ -n "${SPEED:-}" ]; then
+    # Speed runs still check what they time: the kernels against the
+    # interpreter (the GEMM among them), and prefill against stepping --
+    # a minute or two, not the golden suite's fifteen.
+    cargo test --release -p lex-cuda 2>&1 | tee "$R/cuda-test.log" | grep -E "test result|FAILED|panicked"
+    [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+    cargo test --release -p lex-rt --test qwen_golden prefill -- --nocapture 2>&1 \
+      | tee "$R/qwen-prefill-golden.log" | grep -E "prefill vs|test result|panicked|SKIPPED"
+    [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+    grep -q "test result: ok. [1-9]" "$R/qwen-prefill-golden.log" \
+      || { echo "no prefill golden ran"; fail=1; }
+  fi
+
   if [ -z "${SPEED:-}" ]; then
     QOUT=$(cargo test --release -p lex-rt --test qwen_golden -- --nocapture 2>&1)
     echo "$QOUT" >> "$R/qwen-cuda.log"
