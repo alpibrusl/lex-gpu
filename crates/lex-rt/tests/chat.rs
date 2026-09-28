@@ -455,3 +455,72 @@ fn each_model_gets_its_own_template() {
         assert_eq!(Template::for_model("qwen3.8:27b-mlx"), Ok(Template::Qwen38));
     }
 }
+
+/// An agent's history grows by a turn per request. Once it is over budget,
+/// trimming must not move the cut every turn: the prefix cache only helps a
+/// prompt that begins the way the last one did, and a cut that slides one
+/// turn per request makes every prompt begin somewhere new -- the whole
+/// window re-read, every turn, for the rest of a long task.
+#[test]
+fn trimming_keeps_the_start_of_the_prompt_still_while_history_grows() {
+    for t in [Template::Qwen38, Template::Mimo] {
+        let budget = 8000;
+        // Exact and additive, as a tokenizer is across `<|im_start|>`:
+        // special tokens split the text, so turns count independently.
+        let mut count = |s: &str| s.len();
+        let step = budget / 4;
+        let (mut prev, mut prev_removed) = (String::new(), 0usize);
+        let (mut jumps, mut trimmed, mut over) = (0, 0, 0usize);
+        for rounds in 1..80 {
+            let mut m = vec![
+                r#"{"role":"system","content":"SYSTEM"}"#.to_string(),
+                r#"{"role":"user","content":"TASK"}"#.to_string(),
+            ];
+            for i in 0..rounds {
+                m.push(format!(
+                    r#"{{"role":"assistant","content":"","tool_calls":[{{"id":"c{i}","type":"function",
+                       "function":{{"name":"grep","arguments":"{{\"p\":\"{i}\"}}"}}}}]}}"#
+                ));
+                // Results of uneven size, as a real task's are.
+                m.push(format!(
+                    r#"{{"role":"tool","content":"R{i} {}"}}"#,
+                    "x".repeat(150 + (i * 97) % 400)
+                ));
+            }
+            let req = Json::parse(&format!(r#"{{"messages":[{}]}}"#, m.join(","))).expect("json");
+            let (prompt, _) = t.render_within(&req, budget, &mut count).expect("render");
+            let removed = count(&t.render(&req).unwrap()) - count(&prompt);
+            assert!(count(&prompt) <= budget, "{t:?}: over budget at {rounds} rounds");
+            assert!(prompt.contains("TASK") && prompt.contains(&format!("R{} ", rounds - 1)));
+            if removed > 0 {
+                trimmed += 1;
+            }
+            if removed == prev_removed {
+                // Nothing more dropped, so the new prompt must begin with
+                // all of the old one but its generation prompt -- which the
+                // new one replaces with the turn the model gave.
+                let shared = prev.bytes().zip(prompt.bytes()).take_while(|(a, b)| a == b).count();
+                assert!(
+                    shared + 40 >= prev.len(),
+                    "{t:?}: the start moved at {rounds} rounds with nothing more dropped"
+                );
+            } else {
+                assert!(removed > prev_removed, "{t:?}: the cut moved backwards at {rounds}");
+                jumps += 1;
+            }
+            over = count(&t.render(&req).unwrap()).saturating_sub(budget);
+            prev = prompt;
+            prev_removed = removed;
+        }
+        // The cut moves when the overflow crosses a multiple of the step,
+        // so at most once per step of growth.
+        assert!(
+            jumps <= over.div_ceil(step),
+            "{t:?}: {jumps} moves for {over} tokens of overflow at a step of {step}"
+        );
+        assert!(trimmed > 30, "{t:?}: only {trimmed} trimmed turns, so nothing is being tested");
+        // Cutting at the fewest turns that fit would move on every one.
+        assert!(jumps < trimmed / 2, "{t:?}: {jumps} jumps over {trimmed} trimmed turns");
+        eprintln!("{t:?}: the start moved {jumps} times over {trimmed} trimmed turns");
+    }
+}

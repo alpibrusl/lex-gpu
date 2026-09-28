@@ -743,7 +743,9 @@ fn turns(msgs: &[Json]) -> Vec<usize> {
 /// partway through with the work half done. Ollama drops history and keeps
 /// going, which is why it finishes tasks this did not. So this drops too --
 /// whole turns, oldest first, never the system message and never the last
-/// turn, which is the one actually being answered.
+/// turn, which is the one actually being answered -- and in steps rather
+/// than a turn at a time, so that consecutive turns of one conversation
+/// keep beginning the same way and the prefix cache keeps working.
 ///
 /// This is Qwen3.8's; [`Template::render_within`] is any template's.
 pub fn render_within(
@@ -773,7 +775,8 @@ fn trim(
     count: &mut dyn FnMut(&str) -> usize,
 ) -> Result<(String, usize), String> {
     let full = t.render(req)?;
-    if count(&full) <= budget {
+    let total = count(&full);
+    if total <= budget {
         return Ok((full, 0));
     }
     let msgs = req.get("messages").and_then(Json::arr).ok_or("no messages")?;
@@ -784,13 +787,36 @@ fn trim(
         kept.extend(msgs[starts[d]..].iter().cloned());
         render_msgs(t, req, &kept)
     };
-    // Binary search the fewest turns to drop: the prompt only shrinks as
-    // more go, and tokenising a long transcript is not cheap enough to
-    // walk one at a time.
-    let (mut lo, mut hi) = (0usize, starts.len().saturating_sub(1));
+
+    // Where to cut. Not at the fewest turns that fit: an agent's history
+    // grows every turn, so that cut moves every turn, the kept history
+    // starts somewhere new each time, and the prefix cache -- which only
+    // helps a prompt that begins the way the last one did -- misses on
+    // every turn of a long task, re-reading the whole window at prefill
+    // speed.
+    //
+    // So the cut sits on a grid: at the first turn where what it removes
+    // reaches a multiple of `step`, taking the smallest multiple that
+    // fits. What a cut at a given turn removes does not change as turns
+    // are appended after it -- turns render independently between
+    // `<|im_start|>` markers -- so the cut only moves when the overflow
+    // crosses the next multiple of `step`: once per `step` tokens of
+    // growth, where cutting at the fewest turns that fit moves on every
+    // turn. It depends on nothing but the request, so it is the same cut
+    // whichever request asks.
+    //
+    // The price is up to `step` tokens of history dropped that would have
+    // fit, a quarter of the budget at worst and an eighth on average,
+    // against re-reading the window on every turn.
+    let step = (budget / 4).max(1);
+    let need = (total - budget).div_ceil(step) * step;
+    let last = starts.len().saturating_sub(1);
+    // The first turn whose cut removes at least `need`; what a cut removes
+    // only grows with the turn, so it can be searched for.
+    let (mut lo, mut hi) = (0usize, last);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if count(&keep_from(mid)?) <= budget {
+        if total.saturating_sub(count(&keep_from(mid)?)) >= need {
             hi = mid;
         } else {
             lo = mid + 1;
