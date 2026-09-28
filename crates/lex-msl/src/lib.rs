@@ -11,6 +11,7 @@
 //! with no Metal toolchain anywhere near it.
 
 pub mod dialect;
+pub mod gemm;
 pub mod program;
 
 use std::fmt::Write as _;

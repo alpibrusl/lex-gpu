@@ -200,6 +200,7 @@ mod gpu {
     use lex_front::{Program, check};
     use lex_ir::{DType, Kernel, Space, Target, plan};
     use crate::dev::{Buffer, Gpu, Pipeline, Step};
+    use lex_msl::gemm::{Gemm, gemm_nvfp4};
     use lex_msl::program::lower_with;
 
     use super::{Config, rope_tables};
@@ -564,8 +565,24 @@ mod gpu {
         silu: Pipeline,
     }
 
-    /// Largest batch a single [`Runner::forward`] takes.
+    /// Largest batch the batched matvec serves: a verify, or a prefill
+    /// whose weights are not all NVFP4. Its accumulators live in registers,
+    /// one per (row, token), and past about 16 tokens they spill.
     pub const MAX_BATCH: usize = 8;
+
+    /// Largest batch a single [`Runner::forward`] takes. Past `MAX_BATCH`
+    /// the matmuls go through the matrix-unit GEMM (`lex_msl::gemm`), which
+    /// keeps its accumulators in fragments and so does not spill -- and
+    /// every token more in a chunk is one fewer read of the 14.5 GB of
+    /// weights over a prompt.
+    pub const PREFILL_MAX: usize = 128;
+
+    /// The GEMM chunk sizes. A prompt is cut into these, largest first, and
+    /// its last few tokens into one batched-matvec chunk of at most
+    /// `MAX_BATCH`: a fixed set of sizes, so the kernels for each are
+    /// compiled once at load -- on CUDA each size is seconds of NVRTC, and a
+    /// set that grew with every new prompt length would pay them per prompt.
+    const GEMM_SIZES: [usize; 4] = [128, 64, 32, 16];
 
     /// Every pipeline a batch of `t` tokens dispatches, compiled on first
     /// use of that size.
@@ -679,6 +696,9 @@ mod gpu {
         /// launches queued as normal. Either way it says where the time
         /// goes, and on Metal the step is much slower for it.
         pub sync: bool,
+        /// Every matrix is NVFP4, which is what the prefill GEMM reads.
+        /// Otherwise prefill stays at `MAX_BATCH`.
+        gemm_ok: bool,
         prof: std::cell::RefCell<std::collections::BTreeMap<&'static str, (usize, f64)>>,
     }
 
@@ -954,9 +974,12 @@ mod gpu {
                 }
             };
             let acts = acts_for(1, false);
-            let bacts = acts_for(MAX_BATCH, X_DTYPE != DType::F32);
+            let bacts = acts_for(PREFILL_MAX, X_DTYPE != DType::F32);
             let out_norm = floats(&gpu, &store, "model.language_model.norm.weight")?;
             let lm_head = QBuf::load(&gpu, &store, "lm_head.weight")?;
+            let gemm_ok = mv_keys(&layers, &lm_head, mtp.as_ref())
+                .iter()
+                .all(|&(_, _, _, layout)| layout == QLayout::NVFP4);
             for key in mv_keys(&layers, &lm_head, mtp.as_ref()) {
                 if let std::collections::hash_map::Entry::Vacant(slot) = k.mv.entry(key) {
                     let (n_in, n_out, res, layout) = key;
@@ -965,7 +988,7 @@ mod gpu {
                 }
             }
             let mtp_in = gpu.zeroed::<f32>(2 * cfg.hidden);
-            let mtp_in_b = gpu.zeroed::<f32>(MAX_BATCH * 2 * cfg.hidden);
+            let mtp_in_b = gpu.zeroed::<f32>(PREFILL_MAX * 2 * cfg.hidden);
 
             // Only a checkpoint with a draft head can reject anything.
             let snap = if mtp.is_some() {
@@ -1022,6 +1045,7 @@ mod gpu {
                 cap,
                 pos: 0,
                 sync: std::env::var_os("LEX_SYNC").is_some(),
+                gemm_ok,
                 prof: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             })
         }
@@ -1372,8 +1396,10 @@ mod gpu {
             let mut logits = vec![];
             let mut done = 0;
             while done < n {
-                let t = MAX_BATCH.min(n - done);
-                let out = self.forward(&tokens[done..done + t], true)?;
+                let t = self.chunk(n - done);
+                // Only the last row's logits: the rest are never read, and
+                // at 64 tokens they are 64 MB of download a chunk.
+                let out = self.forward(&tokens[done..done + t], false)?;
                 logits = out.last().cloned().expect("a batch is never empty");
                 let hs = self.batch_hidden_all(t);
                 // The last prompt position pairs with a token the prompt
@@ -1800,8 +1826,9 @@ mod gpu {
             snap: bool,
         ) -> Result<Vec<Vec<f32>>, String> {
             let t = tokens.len();
-            if t == 0 || t > MAX_BATCH {
-                return Err(format!("a batch is 1..={MAX_BATCH} tokens, not {t}"));
+            let most = if self.gemm_ok { PREFILL_MAX } else { MAX_BATCH };
+            if t == 0 || t > most {
+                return Err(format!("a batch is 1..={most} tokens, not {t}"));
             }
             if self.pos + t > self.cap {
                 return Err(format!("the cache is full ({} positions)", self.cap));
@@ -1880,7 +1907,44 @@ mod gpu {
             for t in 1..=MAX_BATCH {
                 self.batch(t)?;
             }
+            if self.gemm_ok {
+                for t in GEMM_SIZES {
+                    if t <= self.prefill_limit() {
+                        self.batch(t)?;
+                    }
+                }
+            }
             Ok(())
+        }
+
+        /// The largest prefill chunk: `LEX_PREFILL_CHUNK` if set (rounded
+        /// down to a GEMM size, so a sweep never compiles a size the load
+        /// did not), else 128 where the GEMM applies and `MAX_BATCH` where
+        /// it does not. On an M4 Max, 512 tokens prefill at 87.4 tok/s in
+        /// chunks of 8, 96.2 in 64s and 103 in 128s.
+        fn prefill_limit(&self) -> usize {
+            if !self.gemm_ok {
+                return MAX_BATCH;
+            }
+            let want = std::env::var("LEX_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(128);
+            GEMM_SIZES
+                .into_iter()
+                .find(|&g| g <= want)
+                .unwrap_or(MAX_BATCH)
+        }
+
+        /// How many of `left` prompt tokens the next prefill chunk takes: the
+        /// largest GEMM size that fits under the limit, else the rest up to
+        /// `MAX_BATCH` for the batched matvec.
+        fn chunk(&self, left: usize) -> usize {
+            let limit = self.prefill_limit();
+            GEMM_SIZES
+                .into_iter()
+                .find(|&g| self.gemm_ok && g <= limit && g <= left)
+                .unwrap_or(left.min(MAX_BATCH))
         }
 
         /// Compile the pipelines for a batch of `t`, once.
@@ -1932,6 +1996,25 @@ mod gpu {
                     } else {
                         X_DTYPE
                     };
+                    if t > MAX_BATCH {
+                        // Past the batched matvec's reach: the GEMM, bound
+                        // exactly as `matmul_q_x` is.
+                        if layout != QLayout::NVFP4 {
+                            return Err(format!(
+                                "a batch of {t} needs the GEMM, which reads NVFP4, not {layout:?}"
+                            ));
+                        }
+                        let g = Gemm {
+                            m: t,
+                            n: n_out,
+                            k: n_in,
+                            residual: res,
+                            x_half: xt == DType::F16,
+                        };
+                        let l = gemm_nvfp4(&g, crate::dev::gemm_backend())?;
+                        slot.insert(gpu.build_lowered(&l)?);
+                        continue;
+                    }
                     let p = matmul_q_x(t, n_in, n_out, bo, n_in, layout, res, xt)?;
                     slot.insert(compile(gpu, &p, THREADS)?);
                 }

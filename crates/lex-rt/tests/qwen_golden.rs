@@ -480,6 +480,43 @@ fn prefill_lands_where_the_same_tokens_land_one_by_one() {
     eprintln!("prefill vs stepping: worst {worst:e} of scale");
 }
 
+/// A prompt long enough for the prefill GEMM's big chunks: 150 tokens go
+/// 64 + 64 + 16 through the matrix units and the last 6 through the batched
+/// matvec, and the answer has to be the one stepping gives. The GEMM rounds
+/// weights to half where the matvec keeps f32, so this is where that would
+/// show -- over 64 layers, not one kernel.
+#[test]
+fn a_long_prefill_through_the_gemm_lands_where_stepping_does() {
+    let _lock = one_at_a_time();
+    let (model, _) = parse(include_str!("data/qwen35_27b_golden.txt"));
+    let prompt: Vec<u32> = (0..150).map(|i| 1000 + (i as u32 * 7919) % 200000).collect();
+    let mut rt = match Runner::load(&model, prompt.len() + 16) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+    rt.reset();
+    let batched = rt.prefill(&prompt).expect("prefill");
+    rt.reset();
+    let mut serial = vec![];
+    for &t in &prompt {
+        serial = rt.step(t).expect("step");
+    }
+    let scale = serial.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+    let worst = batched
+        .iter()
+        .zip(&serial)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
+        / scale;
+    let top = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap();
+    eprintln!("150-token prefill vs stepping: worst {worst:e} of scale");
+    assert_eq!(top(&batched), top(&serial), "the next token changed");
+    assert!(worst < 2e-3, "prefill differs from stepping by {worst:e} of scale");
+}
+
 /// Speculation lands where greedy lands *when drafts are rejected*.
 ///
 /// `speculation_lands_exactly_where_greedy_lands` runs on a short, easy

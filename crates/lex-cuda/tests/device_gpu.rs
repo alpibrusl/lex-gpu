@@ -202,3 +202,67 @@ fn nvfp4_matmul_loaded_wide_matches_the_interpreter() {
         same(&g, &prog, tensors, 4, 1e-4);
     }
 }
+
+/// The hand-scheduled prefill GEMM (`lex_msl::gemm`) against the
+/// interpreter running the `matmul_q_x` it stands in for. Ragged tokens and
+/// rows, with and without the residual, half and f32 activations. The GEMM
+/// rounds weights to half for the tensor cores, so the bar is half's.
+#[test]
+fn the_gemm_matches_the_matmul_it_replaces() {
+    use lex_front::llama::matmul_q_x;
+    use lex_msl::gemm::{Backend, Gemm, gemm_nvfp4};
+    let Some(g) = gpu() else { return };
+    for c in [
+        Gemm { m: 40, n: 100, k: 512, residual: false, x_half: true },
+        Gemm { m: 40, n: 100, k: 512, residual: true, x_half: true },
+        Gemm { m: 64, n: 128, k: 512, residual: false, x_half: false },
+        Gemm { m: 17, n: 48, k: 256, residual: true, x_half: false },
+        Gemm { m: 96, n: 192, k: 1024, residual: false, x_half: true },
+    ] {
+        let (m, n, k) = (c.m, c.n, c.k);
+        let xt = if c.x_half { DType::F16 } else { DType::F32 };
+        let prog = matmul_q_x(m, k, n, 4, k, QLayout::NVFP4, c.residual, xt).expect("program");
+        let codes: Vec<f32> = (0..n * k / 2)
+            .map(|i| ((i.wrapping_mul(97).wrapping_add(3) & 0xFF) as i32 - 128) as f32)
+            .collect();
+        let scales: Vec<f32> = (0..n * k / 16)
+            .map(|i| (0x34i32 + (i % 7) as i32 - 128) as f32)
+            .collect();
+        let rows: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32 * 0.125).collect();
+        let mut tensors = vec![
+            Tensor::new(xt, &[m, k], &fill(m * k, 3)),
+            Tensor::new(DType::I8, &[n, k / 2], &codes),
+            Tensor::new(DType::I8, &[n, k / 16], &scales),
+            Tensor::new(DType::F32, &[n], &rows),
+        ];
+        if c.residual {
+            tensors.push(Tensor::new(DType::F32, &[m, n], &fill(m * n, 11)));
+        }
+        tensors.push(Tensor::zeros(DType::F32, &[m, n]));
+        let out = tensors.len() - 1;
+
+        let pipe = g
+            .build_lowered(&gemm_nvfp4(&c, Backend::Cuda).expect("gemm"))
+            .unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        let bufs: Vec<_> = tensors
+            .iter()
+            .map(|t| match t.dtype {
+                DType::F32 => g.upload(&t.data),
+                DType::F16 => g.upload(&t.data.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>()),
+                DType::I8 => g.upload(&t.data.iter().map(|&x| x as i8).collect::<Vec<_>>()),
+            })
+            .collect();
+        let refs: Vec<_> = bufs.iter().collect();
+        g.run(&pipe, &refs).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        let mut got = vec![0.0f32; m * n];
+        g.download(&bufs[out], &mut got);
+
+        run(&prog, &mut tensors).expect("interpret");
+        let want = &tensors[out].data;
+        let scale = want.iter().fold(1e-6f32, |a, x| a.max(x.abs()));
+        assert!(scale > 1e-3, "{c:?}: the reference output is all but zero");
+        let err = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max) / scale;
+        eprintln!("{c:?}: {err:e} of scale");
+        assert!(err < 2e-3, "{c:?}: GEMM vs interpreter {err:e} of scale");
+    }
+}

@@ -37,6 +37,18 @@ pub fn dialect() -> &'static dyn lex_msl::dialect::Dialect {
     }
 }
 
+/// Which matrix units the hand-scheduled GEMM is written for.
+pub fn gemm_backend() -> lex_msl::gemm::Backend {
+    #[cfg(target_os = "macos")]
+    {
+        lex_msl::gemm::Backend::Metal
+    }
+    #[cfg(target_os = "linux")]
+    {
+        lex_msl::gemm::Backend::Cuda
+    }
+}
+
 /// Write the CUDA form of every program the runtime compiles, when
 /// `LEX_DUMP_CUDA` names a directory.
 ///

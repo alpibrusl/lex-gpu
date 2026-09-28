@@ -164,6 +164,13 @@ fn main() -> Result<(), String> {
         1e3 * s,
         pre as f64 / s
     );
+    // And where it goes: the chunk size changes every kernel's shape, not
+    // only the matmuls', so a size that is slower has to be taken apart.
+    rt.sync = true;
+    rt.reset();
+    rt.clear_profile();
+    rt.prefill(&ids)?;
+    table(&rt.profile(), 1, s);
     Ok(())
 }
 
