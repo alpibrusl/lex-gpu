@@ -415,7 +415,7 @@ impl Gpu {
         let ptx = compile_ptx(&self.rtc, &source, &kernel.name, &self.arch)?;
         let [gx, gy, _] = plan.launch.threadgroups;
         let [tx, _, _] = plan.launch.threads_per_threadgroup;
-        self.module(&ptx, &kernel.name, (gx, gy), tx, plan.threadgroup_bytes)
+        self.module(&ptx, &kernel.name, (gx, gy), tx)
     }
 
     /// Compile emitted CUDA for *this* device and take its entry point.
@@ -430,19 +430,25 @@ impl Gpu {
             &lowered.entry,
             (lowered.grid, lowered.grid2.max(1)),
             lowered.threads,
-            lowered.threadgroup_bytes,
         )
     }
 
     /// Load PTX and take its entry point.
+    ///
+    /// No dynamic shared memory. Both emitters declare every threadgroup
+    /// array statically (`__shared__ float scratch[..]`), so a byte count
+    /// passed at launch as well was reserved *on top* of those arrays and
+    /// never used: each kernel held its shared memory twice, which for the
+    /// ones with real tiles -- attention, the GEMM -- halves how many of
+    /// them fit on an SM.
     fn module(
         &self,
         ptx: &[u8],
         entry: &str,
         grid: (usize, usize),
         threads: usize,
-        shared: usize,
     ) -> Result<Pipeline, String> {
+        let shared = 0usize;
         unsafe {
             let mut module: CUmodule = ptr::null_mut();
             check(
