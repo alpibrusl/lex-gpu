@@ -8,16 +8,17 @@
 //! the condition is met and this is the first slice of the answer.
 //!
 //! What it does today: `algo` declarations with parameters, `let`
-//! bindings over the elementwise and reduction ops, and a `store`. It
-//! parses `rmsnorm` into a program byte-identical to the Rust one, which
-//! is the whole of its claim — see `tests/syntax.rs`, which holds it to
-//! the emitter goldens rather than to itself.
+//! bindings over the elementwise and reduction ops, a `store`, and
+//! `schedule` blocks that set `threads` and `chunk` per target. It parses
+//! `rmsnorm` and `silu_mul` into programs byte-identical to the Rust ones,
+//! which is the whole of its claim — see `tests/syntax.rs`, which holds it
+//! to the emitter goldens rather than to itself.
 //!
 //! What it does not do, stated because a surface that hides its holes is
-//! worse than no surface: no `schedule` blocks, no loops, no grid, no
-//! layouts or memory spaces in the type, no autotuner `?`. Those are the
-//! interesting half and they are next; this half is the part that has to
-//! exist before any of them can be written down.
+//! worse than no surface: no loops, no index arithmetic, no layouts or
+//! memory spaces in the type, no autotuner `?`. Those are the interesting
+//! half and they are next; this half is the part that has to exist before
+//! any of them can be written down.
 //!
 //! ## The linear discipline is visible
 //!

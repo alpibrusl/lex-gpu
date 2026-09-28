@@ -11,16 +11,20 @@ exactly once. Tiles are what lex is made of.
 because the rest of this file is measurements and they deserve the same
 honesty:**
 
-- **The surface syntax is one slice deep.** `.lx` files parse, and
-  [`rmsnorm.lx`](crates/lex-front/lx/rmsnorm.lx) is held to emitting
-  MSL byte-identical to the Rust that built it. What exists is `algo`
-  declarations, parameters, `let` bindings over the elementwise and
-  reduction ops, and `store`. What does not: `schedule` blocks, loops, the
-  grid, layouts and memory spaces in the type, the autotuner's `?` — which
-  is to say the half that makes it a *language* rather than a notation.
-  Most kernels are still Rust that builds the typed IR; see
-  [`llama.rs`](crates/lex-front/src/llama.rs).
-  [`docs/design.md`](docs/design.md) has the rest of the intended syntax.
+- **The surface syntax is two kernels deep.** `.lx` files parse, and
+  [`rmsnorm.lx`](crates/lex-front/lx/rmsnorm.lx) and
+  [`silu_mul.lx`](crates/lex-front/lx/silu_mul.lx) are each held to
+  emitting MSL byte-identical to the Rust that built them. What exists is
+  `algo` declarations, parameters, `let` bindings over the elementwise and
+  reduction ops, `store`, and `schedule` blocks that bind an algorithm to
+  a target with `threads` and `chunk`. What does not: loops, index
+  arithmetic, layouts and memory spaces in the type, the autotuner's `?`
+  — which is to say the half that makes it a *language* rather than a
+  notation. Every kernel the runtime runs is still Rust that builds the
+  typed IR (about thirty builders; see
+  [`llama.rs`](crates/lex-front/src/llama.rs)) — typed and checked, but
+  not written in the surface. [`docs/design.md`](docs/design.md) has the
+  rest of the intended syntax.
 - **The type system's case is still an argument.** Linear tiles and effects
   are supposed to catch across targets what each target's own tooling
   catches only on that target. Two backends now exist, so that is testable
@@ -37,6 +41,13 @@ the one that matters — 48 of its 64 layers carry a recurrent state
 instead of a KV cache, its weights are NVFP4, and it has a
 multi-token-prediction head. Porting the runtime to CUDA took three
 lines.
+
+**Two things are called Lex.** This repository's kernel language is
+`lex`, with `.lx` files. [Lex](https://github.com/alpibrusl/lex-lang) is the
+general-purpose language — the `lex` command, `.lex` files — that
+lex-llm and lex-code are written in, and that
+[`scripts/energy.lex`](scripts/energy.lex) is written in here. The kernel
+language is not embedded in it; they share a name and an author.
 
 What *is* real: the linear type system, the checker, the reference
 interpreter, two backends, a 27.8B model that runs end to end on the
@@ -552,11 +563,13 @@ Read the diff before committing it.
 ## Not built yet
 
 - **Layouts in the type:** no swizzle or MMA-fragment layouts are checked yet.
-- **A surface syntax:** no lexer, no parser, no file extension. Programs are
-  built through the Rust IR API, and schedules are builder parameters. The
-  syntax in `docs/design.md` is deliberately unbuilt until a second backend
-  says what it has to express — designing it against one target would mean
-  designing it twice.
+- **Most of the surface syntax:** `.lx` parses algorithms, elementwise and
+  reduction ops, and schedules with `threads` and `chunk` — enough for
+  `rmsnorm` and `silu_mul`. Loops, index arithmetic and layouts are not
+  parsed, so the matvec, attention and the gated-delta recurrence are
+  still built through the Rust IR API. The measurement that most wants a
+  schedule block — rows per simdgroup, 1 on Apple and 2 on Ada — is still
+  a constant in the target table.
 - **Fast lowering:** simdgroup matrices, split-K decode and minimal barriers
   are P3.
 - **Around the model:** the embedding lookup and KV append as kernels (host
