@@ -419,6 +419,24 @@ matrix on a card with 48 MB of L2, and so flattered it.
 So the next CUDA work is the decode matvec: first, whether the batched
 kernel at one token already beats it, since at three tokens it does.
 
+**It does, a little, and not on Metal** (`qwen_profile`'s fourth pass,
+decoding the same positions through `forward(&[t])`, warmed):
+
+| | step | batch path | |
+| --- | --- | --- | --- |
+| L4, context 0 | 103.9 ms | 95.5 ms | 1.09x |
+| L4, context 1024 | 107.9 ms | 102.0 ms | 1.06x |
+| M4 Max, context 0 | 39.7 ms | 44.3 ms | 0.90x |
+
+The difference is the matvec (gate/up 304 against 324 us a call), and
+both sit near 150-165 GB/s of ~300 -- so this is not the fix, and `step`
+stays as it is: on CUDA the server decodes Qwen through speculation, which
+already runs the batch path, and rerouting `step` would move the draft
+head's hidden state between buffers for a few percent on the path that
+runs least. The fix is a CUDA matvec that reads at 80% of the roof, which
+is where the remaining 2x is. (Speculation reproduced on a second L4, in
+another zone: 21.8 against 9.7, 2.24x.)
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`
