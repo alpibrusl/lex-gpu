@@ -1428,6 +1428,23 @@ mod gpu {
         /// two halves are normalised on the host, as the single-row draft
         /// does: 10240 values per row against the 239 MB the head reads.
         fn mtp_warm(&mut self, hs: &[f32], next: &[u32]) -> Result<(), String> {
+            // In the chunk sizes prefill uses, which are compiled at load.
+            // A prefill chunk warms one row fewer than it read -- the last
+            // prompt position pairs with a token the prompt does not have --
+            // so warming in one piece asked for a batch of 63 or 127, a size
+            // nothing had compiled: on CUDA a whole batch's worth of NVRTC,
+            // 43 s inside a 512-token prefill whose kernels took 2.7.
+            let h = self.cfg.hidden;
+            let mut done = 0;
+            while done < next.len() {
+                let t = self.chunk(next.len() - done);
+                self.mtp_warm_rows(&hs[done * h..(done + t) * h], &next[done..done + t])?;
+                done += t;
+            }
+            Ok(())
+        }
+
+        fn mtp_warm_rows(&mut self, hs: &[f32], next: &[u32]) -> Result<(), String> {
             let t = next.len();
             self.batch(t)?;
             let c = self.cfg.clone();
@@ -1915,6 +1932,13 @@ mod gpu {
                 }
             }
             Ok(())
+        }
+
+        /// The batch sizes compiled so far, ascending.
+        pub fn compiled_batch_sizes(&self) -> Vec<usize> {
+            let mut v: Vec<usize> = self.batches.keys().copied().collect();
+            v.sort_unstable();
+            v
         }
 
         /// The largest prefill chunk: `LEX_PREFILL_CHUNK` if set (rounded

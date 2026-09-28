@@ -517,6 +517,38 @@ fn a_long_prefill_through_the_gemm_lands_where_stepping_does() {
     assert!(worst < 2e-3, "prefill differs from stepping by {worst:e} of scale");
 }
 
+/// Prefill compiles nothing after load. Every batch size a prompt is cut
+/// into -- including the draft head's warm-up, one row shorter than each
+/// chunk -- has to come from the set `compile_batches` builds. On CUDA a
+/// size compiled on first use is seconds of NVRTC inside a request: a
+/// 512-token prefill once spent 43 s compiling and 2.7 s computing.
+#[test]
+fn prefill_compiles_nothing_after_load() {
+    let _lock = one_at_a_time();
+    let (model, _) = parse(include_str!("data/qwen35_27b_golden.txt"));
+    let mut rt = match Runner::load(&model, 600) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+    rt.compile_batches().expect("compile");
+    let before = rt.compiled_batch_sizes();
+    // 256 and 64 end on a full GEMM chunk, so the head warms 127 and 63
+    // rows at the end: the case that compiled. The rest end in a short tail.
+    for n in [256usize, 64, 150, 77, 129, 9] {
+        rt.reset();
+        let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i as u32 * 104729) % 200000).collect();
+        rt.prefill(&prompt).expect("prefill");
+    }
+    assert_eq!(
+        rt.compiled_batch_sizes(),
+        before,
+        "a prefill compiled a batch size compile_batches did not"
+    );
+}
+
 /// Speculation lands where greedy lands *when drafts are rejected*.
 ///
 /// `speculation_lands_exactly_where_greedy_lands` runs on a short, easy
