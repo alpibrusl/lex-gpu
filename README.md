@@ -133,7 +133,11 @@ with the target's probability for it, else resample without it -- now
 lets both be true at once, at 38 tok/s sampled; the energy row has not
 been re-measured since.
 
-**Prefill is the weak point: 90 tok/s against Ollama's ~250.** Not a
+**Prefill now runs on the matrix units: 123 tok/s on an M4 Max (was 87),
+200 on an L4 (was 40), against Ollama's ~250 on the Mac.** 512 tokens in
+128-token chunks through a hand-scheduled NVFP4 GEMM (`lex_msl::gemm`);
+see [`docs/roadmap-weeks.md`](docs/roadmap-weeks.md) M5a. What follows is
+how it stood before: Not a
 mystery. 512 tokens is 28.5 TFLOP, and at the measured 13.7 TFLOP/s that
 is 246 tok/s — which is what Ollama gets, because it prefills in large
 batches and pays only the arithmetic. `MAX_BATCH` is 8 here, so a

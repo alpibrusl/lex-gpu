@@ -437,6 +437,49 @@ runs least. The fix is a CUDA matvec that reads at 80% of the roof, which
 is where the remaining 2x is. (Speculation reproduced on a second L4, in
 another zone: 21.8 against 9.7, 2.24x.)
 
+## M5a — prefill on the matrix units, and why the L4's decode is slow (2026-09-28)
+
+**Prefill.** The batched matvec keeps an accumulator per (row, token) in
+registers and spills past ~16 tokens, so prefill ran in chunks of 8 and a
+512-token prompt read the 14.5 GB of weights 64 times. `lex_msl::gemm` is
+a tiled GEMM on the matrix units -- `wmma` on CUDA, `simdgroup_matrix` on
+Metal -- dequantising NVFP4 to half as it stages. It is hand-scheduled,
+not lowered from a program (the IR has `MatMulNT`, not fragments). Qwen's
+runner cuts prompts into 128/64/32/16-token GEMM chunks and a tail of at
+most 8 through the matvec, all compiled at load.
+
+| 512-token prefill | chunk 8 | chunk 64 | chunk 128 |
+| --- | --- | --- | --- |
+| M4 Max | 87.4 | 114 | **123** |
+| NVIDIA L4 | 39.6 | 172.8 | **199.9** |
+
+On Metal the tile is 32 tokens by 64 rows in one shared buffer: taller
+token tiles (which dequantise each weight fewer times) were *slower*,
+wider weight tiles faster (32x32 100, 64x32 82, 128x32 67, 64x64 101,
+32x64 123, 32x128 120 tok/s). The first L4 numbers said 64-token chunks
+ran at 11.2 tok/s; the kernels summed to 2.7 s of 45.7. The draft head's
+warm-up asked for batches of 63 and 127 rows, sizes nothing had compiled,
+and NVRTC compiled a whole batch set inside the request. It now walks the
+precompiled sizes, and a golden fails if a prefill compiles anything.
+
+**The L4's decode matvec is clock-bound, not bandwidth-bound.**
+`examples/mv_variants` times the emitted kernel alone at the gate/up shape:
+237 us, 212 GB/s, against 258 GB/s for a plain read of the same bytes --
+82%. Inside the model the same kernel takes 351 us. Not the working set:
+cycling 3.2 GB instead of 200 MB costs 2% (208 GB/s). The clocks: through
+the model runs the card sits at its 72 W cap (reason 0x4 in 347 of 1491
+samples, 75 W peak) and the SM clock drops to a median 1395 MHz from 2040,
+while the memory clock stays at 6251. 2040/1395 = 1.46; 351/237 = 1.48.
+
+So on this card the matvec's cost is instructions per weight byte, paid
+in power: widening its loads changed nothing (the load count was not the
+limit), and restructuring it gains 11% at full clock (one warp a row, 236
+GB/s) and loses it over a large working set (185 GB/s at 64 matrices).
+The lever is fewer instructions per byte: decode E2M1 through a table to
+int8 and multiply with `dp4a` against int8-quantised activations, as
+llama.cpp does for its four-bit formats -- which changes the arithmetic,
+so it is a golden-suite question as much as a speed one.
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`
