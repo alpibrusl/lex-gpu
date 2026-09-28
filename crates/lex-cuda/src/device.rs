@@ -38,6 +38,7 @@ type CUmodule = *mut c_void;
 type CUfunction = *mut c_void;
 type CUdeviceptr = u64;
 type CUstream = *mut c_void;
+type CUevent = *mut c_void;
 type NvrtcResult = c_int;
 type NvrtcProgram = *mut c_void;
 
@@ -121,6 +122,10 @@ api!(struct Driver {
         CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint,
         c_uint, CUstream, *mut *mut c_void, *mut *mut c_void,
     ) -> CUresult;
+    fn cuEventCreate(*mut CUevent, c_uint) -> CUresult;
+    fn cuEventRecord(CUevent, CUstream) -> CUresult;
+    fn cuEventElapsedTime(*mut f32, CUevent, CUevent) -> CUresult;
+    fn cuEventDestroy_v2(CUevent) -> CUresult;
 });
 
 api!(pub struct Nvrtc {
@@ -606,6 +611,60 @@ impl Gpu {
             check(&self.cu, (self.cu.cuCtxSynchronize)(), "cuCtxSynchronize").expect("sync");
         }
         (cpu, t0.elapsed().as_secs_f64())
+    }
+
+    /// Run `steps` in order and return each one's GPU time, in seconds.
+    ///
+    /// An event goes on the stream before the first launch and after each
+    /// one, and nothing waits until the end, so the launches queue exactly
+    /// as in [`Gpu::run_launches`] -- unlike synchronising after each,
+    /// which idles the GPU for a host round trip per kernel and was
+    /// measured to make per-kernel times sum to twice the real step. On one
+    /// in-order stream the interval between two events is the kernel
+    /// between them plus any time the GPU waited for the host to launch it,
+    /// and that wait is a real cost of the normal path too.
+    pub fn run_each_timed(&self, steps: &[Step<'_>]) -> Vec<f64> {
+        let d = &self.cu;
+        let mut ev: Vec<CUevent> = vec![ptr::null_mut(); steps.len() + 1];
+        unsafe {
+            for e in &mut ev {
+                check(d, (d.cuEventCreate)(e, 0), "cuEventCreate").expect("event");
+            }
+            check(d, (d.cuEventRecord)(ev[0], ptr::null_mut()), "cuEventRecord").expect("record");
+        }
+        for (i, &(p, buffers, groups)) in steps.iter().enumerate() {
+            let (gx, gy) = match groups {
+                None => (p.grid.0, p.grid.1),
+                Some([x, y]) => {
+                    assert!(
+                        x as c_uint <= p.grid.0 && y as c_uint <= p.grid.1,
+                        "launch of {x}x{y} over a plan of {}x{}",
+                        p.grid.0,
+                        p.grid.1
+                    );
+                    (x as c_uint, y as c_uint)
+                }
+            };
+            self.launch(p, buffers, gx, gy).expect("cuLaunchKernel");
+            unsafe {
+                check(d, (d.cuEventRecord)(ev[i + 1], ptr::null_mut()), "cuEventRecord")
+                    .expect("record");
+            }
+        }
+        let mut out = Vec::with_capacity(steps.len());
+        unsafe {
+            check(d, (d.cuCtxSynchronize)(), "cuCtxSynchronize").expect("sync");
+            for w in ev.windows(2) {
+                let mut ms = 0f32;
+                check(d, (d.cuEventElapsedTime)(&mut ms, w[0], w[1]), "cuEventElapsedTime")
+                    .expect("elapsed");
+                out.push(ms as f64 / 1e3);
+            }
+            for e in ev {
+                (d.cuEventDestroy_v2)(e);
+            }
+        }
+        out
     }
 
     /// One launch, no synchronise.

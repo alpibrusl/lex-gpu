@@ -175,6 +175,19 @@ if [ -n "${QWEN:-}" ]; then
     | tee -a "$R/qwen-cuda.log" | grep -E "tok/s|offset 1"
   [ "${PIPESTATUS[0]}" = 0 ] || fail=1
 
+  # Where the decode step's time goes, per call site, from events between
+  # launches queued as normal -- and what a verify costs in steps, which
+  # is why speculation loses here (2.7 steps for two tokens, against 1.15
+  # on Metal). At two contexts, because attention's share grows with it.
+  for ctx in 0 1024; do
+    cargo run --release -p lex-rt --example qwen_profile -- \
+      --tokens 32 --context $ctx --verify 3 2>&1 | tee "$R/qwen-profile-ctx$ctx.log" \
+      | grep -E "ms/token|verify of|timed sum"
+    [ "${PIPESTATUS[0]}" = 0 ] || fail=1
+    grep -q "verify of" "$R/qwen-profile-ctx$ctx.log" \
+      || { echo "qwen_profile at context $ctx printed no verify line"; fail=1; }
+  done
+
   # Every schedule constant in this repository was chosen on an M4 Max.
   # `bo` and `threads` set rows per simdgroup and therefore register
   # pressure, and the right value is a property of the register file, not

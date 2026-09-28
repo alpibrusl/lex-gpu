@@ -673,9 +673,11 @@ mod gpu {
         batches: HashMap<usize, Batch>,
         cap: usize,
         pos: usize,
-        /// Time each dispatch on its own, from the command buffer's
-        /// timestamps, instead of one buffer per token. The step is much
-        /// slower this way; it says where the time goes.
+        /// Time each dispatch (`LEX_SYNC`): on Metal each in its own
+        /// command buffer, from its timestamps, which serialises what the
+        /// concurrent encoder would overlap; on CUDA from events between
+        /// launches queued as normal. Either way it says where the time
+        /// goes, and on Metal the step is much slower for it.
         pub sync: bool,
         prof: std::cell::RefCell<std::collections::BTreeMap<&'static str, (usize, f64)>>,
     }
@@ -1766,21 +1768,7 @@ mod gpu {
             if !self.skip.is_empty() {
                 plan.retain(|d| !self.skip.iter().any(|s| d.0 == s));
             }
-            if self.sync {
-                for (label, p, b, g) in &plan {
-                    let (_, t) = self.gpu.run_launches(&[(p, b.as_slice(), *g)]);
-                    let mut prof = self.prof.borrow_mut();
-                    let e = prof.entry(label).or_insert((0, 0.0));
-                    e.0 += 1;
-                    e.1 += t;
-                }
-            } else {
-                let steps: Vec<Step<'_>> = plan
-                    .iter()
-                    .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
-                    .collect();
-                self.gpu.run_launches(&steps);
-            }
+            self.dispatch(&plan);
             drop(plan);
             self.pos += 1;
             let mut logits = vec![0.0f32; c.vocab];
@@ -1862,21 +1850,7 @@ mod gpu {
             // record where the time went. Without it prefill can only be
             // measured in total, which is enough to see a chunk size cost
             // more than the one below it and not enough to say why.
-            if self.sync {
-                for (label, p, b, g) in &plan {
-                    let (_, ms) = self.gpu.run_launches(&[(p, b.as_slice(), *g)]);
-                    let mut prof = self.prof.borrow_mut();
-                    let e = prof.entry(label).or_insert((0, 0.0));
-                    e.0 += 1;
-                    e.1 += ms;
-                }
-            } else {
-                let steps: Vec<Step<'_>> = plan
-                    .iter()
-                    .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
-                    .collect();
-                self.gpu.run_launches(&steps);
-            }
+            self.dispatch(&plan);
             drop(plan);
             self.pos += t;
 
@@ -2079,6 +2053,26 @@ mod gpu {
 
         fn mv(&self, w: &QBuf, res: bool) -> &Pipeline {
             &self.k.mv[&w.key(res)]
+        }
+
+        /// Run a plan in one go -- or, with `sync`, timed per dispatch
+        /// (`Gpu::run_each_timed`) and booked to each call site.
+        fn dispatch(&self, plan: &[Dispatch<'_>]) {
+            let steps: Vec<Step<'_>> = plan
+                .iter()
+                .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
+                .collect();
+            if !self.sync {
+                self.gpu.run_launches(&steps);
+                return;
+            }
+            let times = self.gpu.run_each_timed(&steps);
+            let mut prof = self.prof.borrow_mut();
+            for ((label, ..), t) in plan.iter().zip(times) {
+                let e = prof.entry(*label).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += t;
+            }
         }
 
         /// Per-call-site GPU time so far, slowest first.
