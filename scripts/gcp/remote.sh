@@ -192,7 +192,7 @@ if [ -n "${QWEN:-}" ]; then
   for ctx in 0 1024; do
     cargo run --release -p lex-rt --example qwen_profile -- \
       --tokens 32 --context $ctx --verify 3 2>&1 | tee "$R/qwen-profile-ctx$ctx.log" \
-      | grep -E "ms/token|verify of|timed sum"
+      | grep -E "ms/token|verify of|timed sum|batch path"
     [ "${PIPESTATUS[0]}" = 0 ] || fail=1
     grep -q "verify of" "$R/qwen-profile-ctx$ctx.log" \
       || { echo "qwen_profile at context $ctx printed no verify line"; fail=1; }

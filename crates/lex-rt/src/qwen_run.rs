@@ -1868,6 +1868,21 @@ mod gpu {
             }
         }
 
+        /// Compile the pipelines for every batch size a prefill chunk or a
+        /// verify can have, now rather than on first use.
+        ///
+        /// On CUDA each size is an NVRTC compile of every kernel, seconds
+        /// of it, and a size is otherwise compiled inside whichever request
+        /// first needs it -- so a server's first speculative reply pays for
+        /// it, and so did a benchmark that timed a first verify and
+        /// concluded speculation was a loss. On Metal it is quick.
+        pub fn compile_batches(&mut self) -> Result<(), String> {
+            for t in 1..=MAX_BATCH {
+                self.batch(t)?;
+            }
+            Ok(())
+        }
+
         /// Compile the pipelines for a batch of `t`, once.
         fn batch(&mut self, t: usize) -> Result<(), String> {
             if self.batches.contains_key(&t) {

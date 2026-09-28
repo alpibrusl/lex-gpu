@@ -16,6 +16,10 @@
 //!    step, both normal, as a ratio. Speculation pays only while that
 //!    ratio stays well under the tokens it commits per cycle. Then the
 //!    batch timed per call site, so the part that grew is named.
+//! 4. **Decode through the batch path**: the same positions as pass 1, one
+//!    token at a time through `forward` instead of `step`. On an L4 a
+//!    verify of three cost 0.97 of a step, so the batched kernels may beat
+//!    the decode ones even at one token; this says whether, and where.
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn main() -> Result<(), String> {
@@ -112,6 +116,31 @@ fn main() -> Result<(), String> {
         rt.forward(&batch, true)?;
     }
     table(&rt.profile(), rounds, many / rounds as f64);
+
+    // 4. Decode, one token at a time, through the batch path.
+    rt.sync = false;
+    start(&mut rt)?;
+    rt.forward(&[1000], false)?;
+    start(&mut rt)?;
+    let t = Instant::now();
+    for i in 0..tokens {
+        rt.forward(&[(1000 + i) as u32], false)?;
+    }
+    let one_s = t.elapsed().as_secs_f64() / tokens as f64;
+    println!(
+        "\ndecode via the batch path: {:.2} ms/token ({:.1} tok/s) against step's {:.2} = {:.2}x",
+        1e3 * one_s,
+        1.0 / one_s,
+        1e3 * step_s,
+        step_s / one_s
+    );
+    rt.sync = true;
+    start(&mut rt)?;
+    rt.clear_profile();
+    for i in 0..tokens {
+        rt.forward(&[(1000 + i) as u32], false)?;
+    }
+    table(&rt.profile(), tokens, one_s);
     Ok(())
 }
 

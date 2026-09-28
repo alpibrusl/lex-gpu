@@ -75,6 +75,11 @@ use lex_rt::sample::Sampler;
         let template = Template::for_model(&model)?;
         let defaults = Defaults::for_model(&model)?;
         let mut rt = Runner::load(&model, max_seq)?;
+        // Every batch size now, not inside the first request that needs
+        // one: on CUDA each is seconds of NVRTC.
+        let t = std::time::Instant::now();
+        rt.compile_batches()?;
+        eprintln!("batch kernels compiled in {:.1} s", t.elapsed().as_secs_f64());
         let stop: Vec<u32> = STOP.iter().filter_map(|s| tok.id_of(s)).collect();
         // Speculation is only a win where there is a draft head to do it.
         let depth = if rt.has_mtp() { depth } else { 0 };
