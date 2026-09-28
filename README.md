@@ -16,15 +16,19 @@ honesty:**
   [`llama.rs`](crates/lex-front/src/llama.rs) for what a kernel looks like
   today. [`docs/design.md`](docs/design.md) has the intended syntax, with the
   algorithm/schedule split; it is a design, not an implementation.
-- **Only Metal exists.** The claim that matters here is portability, and
-  nothing demonstrates it until a second backend does. Until then the type
-  system's case — that linear tiles and effects catch across targets what
-  each target's own tooling catches only on that target — is an argument,
-  not a result.
+- **A second backend exists, but it is early.** `lex-cuda` emits CUDA C from
+  the same typed IR the Metal backend does, and on a real NVIDIA L4 three
+  kernels — `rmsnorm`, `silu_mul`, and an `nvfp4` quantised matvec — match
+  the reference interpreter (`crates/lex-cuda/tests/device_gpu.rs`). That is
+  the portability claim's first real evidence, not the whole of it: there is
+  no CUDA decode loop yet (`lex-rt` is Metal-only), no GEMM kernel that
+  matches on device, and [`docs/roadmap.md`](docs/roadmap.md)'s own P4/P5
+  rows still describe this as ahead of them rather than caught up.
 
 What *is* real: the linear type system, the checker, the reference
-interpreter, the MSL backend, and a 27.8B model that runs end to end on the
-kernels it generates and answers with the same tokens as Ollama.
+interpreter, the MSL backend and (behind the CUDA dialect above) an early
+NVIDIA path, and a 27.8B model that runs end to end on Metal kernels it
+generates and answers with the same tokens as Ollama.
 
 The full design is in [`docs/design.md`](docs/design.md). The plan for getting
 there is in [`docs/roadmap.md`](docs/roadmap.md).
@@ -306,8 +310,8 @@ positions) and prefills at ~900 tok/s. The 1B decodes at 263–266 tok/s and
 prefills at 5,300–6,200 tok/s. The cloud script creates the VM, runs the
 workspace tests and the same benchmark on the GPU, copies the results home,
 and deletes the VM. [`docs/cloud.md`](docs/cloud.md) covers GPUs, EU zones,
-quota and the cost guard rails. It becomes the CUDA backend's test bed
-once that backend exists.
+quota and the cost guard rails. This is the CUDA backend's test bed: it's
+where `lex-cuda`'s device-gated tests actually ran, on a real L4.
 
 ## Layering
 
@@ -329,6 +333,7 @@ in its smallest possible form.
 | `lex-front` | Typed tile programs: linearity, effect and pipe-protocol checker; concurrent reference interpreter | yes |
 | `lex-msl` | MSL emission for P0 kernels; lowering of `lex-front` programs; golden files | yes |
 | `lex-metal` | Compile, allocate, dispatch, time | **no** |
+| `lex-cuda` | CUDA C emission from the same IR; device dispatch via a CUDA runtime opened at load time, not linked | yes (emission); device tests need an NVIDIA GPU |
 | `lex-bench` | Harness: emit, verify, measure (`--flash` for decode attention) | yes (device path gated) |
 | `lex-rt` | Runtime: GGUF reader, Q8_0/Q4_K/Q6_K repacking, Llama decode loop over lex kernels | yes (decode loop gated) |
 
