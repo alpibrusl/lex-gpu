@@ -18,6 +18,12 @@ fail=0
 step() { echo; echo "=== $*"; }
 
 step "waiting for the NVIDIA driver"
+# The pre-built image carries the driver already; with no module for the
+# kernel it booted there is nothing to wait for, only GPU time to lose.
+if [ -d "$HOME/lex-target" ] && ! find "/lib/modules/$(uname -r)" -name 'nvidia.ko*' | grep -q .; then
+  echo "no NVIDIA module for kernel $(uname -r) in the pre-built image; rebuild it (build_image.sh)"
+  exit 1
+fi
 for i in $(seq 1 90); do nvidia-smi >/dev/null 2>&1 && break; sleep 10; done
 nvidia-smi | tee "$R/nvidia-smi.txt" || { echo "no NVIDIA driver after 15 min"; exit 1; }
 { lscpu | head -20; nvcc --version 2>/dev/null || ls /usr/local | grep -i cuda; } > "$R/machine.txt"

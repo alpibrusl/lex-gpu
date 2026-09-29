@@ -18,6 +18,18 @@ set -euo pipefail
 cd "$HOME/lex-gpu"
 step() { echo; echo "=== $*"; }
 
+step "keep the kernel the driver was built for"
+# The base image's NVIDIA driver is a precompiled module for the kernel it
+# ships, and its packages are held. Left running, unattended-upgrades
+# installed a newer kernel on the first builder; the GPU VM booted into it
+# and had no driver (7.0.0-1013, modules only for 1011). Stopped here, the
+# kernel packages held, and checked again at the end.
+sudo systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer \
+  >/dev/null 2>&1 || true
+while sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1; do sleep 5; done
+sudo apt-mark hold linux-image-gcp linux-gcp linux-headers-gcp >/dev/null 2>&1 || true
+uname -r
+
 step "system packages"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential python3 >/dev/null
@@ -55,6 +67,20 @@ find . -type f -print0 | xargs -0 sha256sum > "$HOME/lex-src.sha256"
 wc -l < "$HOME/lex-src.sha256"
 cd "$HOME"
 rm -rf "$HOME/lex-gpu" "$HOME/src.tar.gz" "$HOME/results"
+# Any kernel that slipped in without the driver goes, and the one a GPU VM
+# will boot -- the newest left -- must have it, or there is no image.
+for k in $(ls /lib/modules); do
+  [ -e "/boot/vmlinuz-$k" ] || continue
+  if ! find "/lib/modules/$k" -name 'nvidia.ko*' | grep -q .; then
+    echo "removing kernel $k: no NVIDIA module for it"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "linux-image-$k" "linux-modules-$k" >/dev/null
+  fi
+done
+sudo update-grub >/dev/null 2>&1 || true
+boot=$(ls /boot/vmlinuz-* | sed 's|^/boot/vmlinuz-||' | sort -V | tail -1)
+find "/lib/modules/$boot" -name 'nvidia.ko*' | grep -q . ||
+  { echo "kernel $boot has no NVIDIA module; not an image a GPU can use"; exit 1; }
+echo "boot kernel $boot has the NVIDIA module"
 sudo apt-get clean
 sync
 df -h / | tail -1
