@@ -4,3 +4,6 @@
 .DS_Store
 __pycache__/
 /results
+
+# A generated command-line descriptor from another tool; not part of this repo.
+/.cli
