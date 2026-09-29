@@ -23,8 +23,9 @@
 //! all -- multiply-accumulate in fragments, and write back through shared
 //! memory so partial tiles can be guarded.
 //! - CUDA: `wmma` 16x16x16, 64x64 tiles, four warps of 32x32.
-//! - Metal: `simdgroup_matrix` 8x8, 32x32 tiles, four simdgroups of 16x16,
-//!   the kernel `examples/gemm_probe` measured.
+//! - Metal: `simdgroup_matrix` 8x8, 64x64 tiles at a full chunk, four
+//!   simdgroups of 32x32, the next step's loads in registers while this
+//!   step multiplies.
 
 use crate::dialect::{Cuda, Dialect, Msl};
 use crate::program::Lowered;
@@ -212,22 +213,25 @@ extern "C" __global__ void {entry}(
 }
 
 fn metal(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
-    // The tile: 32 tokens by 64 rows, measured rather than reasoned. At 128
-    // tokens a chunk, 512-token prefill on an M4 Max (tok/s, gate/up ms a
-    // call):
+    // The tile, measured rather than reasoned (`examples/gemm_metal`, ms a
+    // call on an M4 Max, weights streaming from memory):
     //
-    //   tokens x rows   32x32  64x32  128x32  64x64  32x64  32x128
-    //   tok/s            100    82     67     101    123    120
-    //   gate/up ms       3.4    4.0    6.1    3.7    2.6    2.8
+    //   tokens  tile (tok x rows x K)   gate/up   down   qkv   out_proj
+    //   128     32x64x32                  2.18    2.33   1.28    0.85
+    //   128     64x64x32                  2.01    2.11   1.19    0.76
+    //   128     64x64x64                  1.97    2.07   1.16    0.78
+    //    64     32x64x64                  1.13    1.23   0.68    0.45
+    //    64     64x64x64                  1.04    1.36   0.62    0.54
+    //    32     32x64x64                  0.62    0.89   0.37    0.32
     //
-    // Taller token tiles dequantise each weight fewer times and are
-    // *slower*; wider weight tiles are faster. At 32x64 the staging loop has
-    // exactly one 16-value group for each of the 128 threads, where 32x32
-    // left half of them idle. The staging tiles and the output tile share
-    // one buffer (the output is only written after the last multiply),
-    // which took 64x64 from 72 tok/s to 101: occupancy, as ever. 64x128
-    // does not fit the 32 KB a threadgroup may declare.
-    // `LEX_GEMM_BM` (tokens) and `LEX_GEMM_BN` (rows) to measure others.
+    // Before the next step's loads were issued ahead of the multiplies the
+    // answer was the other way round: taller token tiles were *slower*
+    // (64x64 101 tok/s of prefill against 32x64's 123), each step waiting on
+    // its own loads with nothing to hide them behind. With the loads hidden,
+    // a taller tile's fewer re-reads of each weight pay, and 64 tokens by 64
+    // rows is best at a full chunk; below 128 tokens half its rows are
+    // padding, so 32. 64x128 does not fit the 32 KB a threadgroup may
+    // declare. `LEX_GEMM_BM`, `LEX_GEMM_BN`, `LEX_GEMM_BK` measure others.
     let pick = |var: &str, default: usize| {
         std::env::var(var)
             .ok()
@@ -235,16 +239,10 @@ fn metal(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
             .filter(|t| [32, 64, 128].contains(t))
             .unwrap_or(default)
     };
-    let (bm, bn, threads) = (pick("LEX_GEMM_BM", 32), pick("LEX_GEMM_BN", 64), 128usize);
-    // The K step: 32. Twice the depth a step halves the barriers and was
-    // measured slower at 32x64 -- prefill 112-119 tok/s against 123, gate/up
-    // unchanged at 2.64 ms -- as it was at 32x32 in `gemm_probe`.
-    // `LEX_GEMM_BK=64` keeps it for measuring, where the reduction allows.
-    let bk = match std::env::var("LEX_GEMM_BK")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        Some(64) if g.k.is_multiple_of(64) => 64,
+    let bm = pick("LEX_GEMM_BM", if g.m > 64 { 64 } else { 32 });
+    let (bn, threads) = (pick("LEX_GEMM_BN", 64), 128usize);
+    let bk = match pick("LEX_GEMM_BK", 64) {
+        64 if g.k.is_multiple_of(64) => 64,
         _ => BK,
     };
     // Four simdgroups as 2x2, each (bm/2) rows by (bn/2) columns of 8x8.
@@ -254,7 +252,15 @@ fn metal(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
     // the float output tile.
     let staged = (bm * bkp + bn * bkp).div_ceil(2);
     let words = staged.max(bm * bnp);
-    let xt = if g.x_half { "half" } else { "float" };
+    let (xt, xv) = if g.x_half {
+        ("half", "half4")
+    } else {
+        ("float", "float4")
+    };
+    // What each thread stages a K step: `na` four-value runs of activations
+    // and `nb` sixteen-value weight groups, rounded up and guarded.
+    let (nav, ng) = (bm * bk / 4, bn * bk / 16);
+    let (na, nb) = (nav.div_ceil(threads), ng.div_ceil(threads));
     let rparam = if g.residual {
         "    device const float *r [[buffer(4)]],\n"
     } else {
@@ -265,6 +271,35 @@ fn metal(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
         " + r[(m0 + rr) * N + j0 + c]"
     } else {
         ""
+    };
+    // The next K step's activations and weights, from device memory into
+    // registers: issued before the current step's multiplies, so their
+    // latency hides behind them instead of in front of a barrier. The
+    // weights come as the group's eight bytes in one load and its scale;
+    // out-of-range rows fetch nothing and stage as zeros.
+    let fetch = |p: &str| {
+        format!(
+            r#"        for (uint i = 0; i < {na}u; ++i) {{
+            const uint e = tid + i * {threads}u;
+            const uint rr = e / {bk4}u, c = (e % {bk4}u) * 4u;
+            xa[i] = {xv}(0);
+            if (e < {nav}u && m0 + rr < M) xa[i] = *(device const {xv} *)(x + (m0 + rr) * K + {p} + c);
+        }}
+        for (uint i = 0; i < {nb}u; ++i) {{
+            const uint gi = tid + i * {threads}u;
+            const uint rr = gi / {bk16}u, c0 = (gi % {bk16}u) * 16u;
+            const uint j = j0 + rr;
+            wq[i] = uint2(0);
+            ws[i] = 0;
+            if (gi < {ng}u && j < N) {{
+                wq[i] = *(device const uint2 *)(q + j * (K / 2u) + ({p} + c0) / 2u);
+                ws[i] = (uchar)s[j * (K / 16u) + ({p} + c0) / 16u];
+            }}
+        }}
+"#,
+            bk4 = bk / 4,
+            bk16 = bk / 16,
+        )
     };
     let (m, n, k) = (g.m, g.n, g.k);
     let source = format!(
@@ -296,30 +331,39 @@ kernel void {entry}(
     for (uint a = 0; a < {fm}u; ++a)
         for (uint b = 0; b < {nf}u; ++b) acc[a][b] = simdgroup_matrix<float, 8, 8>(0.0f);
 
+    // A thread's weight groups keep their row from one K step to the next,
+    // so the row scale is read once. The 16384 undoes `fp4_pair`'s bias.
+    float gsr[{nb}];
+    for (uint i = 0; i < {nb}u; ++i) {{
+        const uint gi = tid + i * {threads}u, j = j0 + gi / {bk16}u;
+        gsr[i] = (gi < {ng}u && j < N) ? gs[j] * 16384.0f : 0.0f;
+    }}
+    {xv} xa[{na}];
+    uint2 wq[{nb}];
+    uchar ws[{nb}];
+{fetch0}
     for (uint p0 = 0; p0 < K; p0 += {bk}u) {{
-        for (uint e = tid; e < {bm}u * {bk}u; e += {threads}u) {{
-            const uint rr = e / {bk}u, c = e % {bk}u;
-            As[rr * {bkp}u + c] = (m0 + rr < M) ? half(x[(m0 + rr) * K + p0 + c]) : half(0.0h);
+        for (uint i = 0; i < {na}u; ++i) {{
+            const uint e = tid + i * {threads}u;
+            const uint rr = e / {bk4}u, c = (e % {bk4}u) * 4u;
+            if (e < {nav}u) *(threadgroup half4 *)(As + rr * {bkp}u + c) = half4(xa[i]);
         }}
-        // One thread per group of 16: the FP8 scale once, then 8 bytes.
-        for (uint gi = tid; gi < {bn}u * {bk}u / 16u; gi += {threads}u) {{
-            const uint rr = gi / ({bk}u / 16u), c0 = (gi % ({bk}u / 16u)) * 16u;
-            const uint j = j0 + rr;
-            threadgroup half *row = Bs + rr * {bkp}u + c0;
-            if (j < N) {{
-                const float sc = fp8_e4m3((uint)(uchar)s[j * (K / 16u) + (p0 + c0) / 16u])
-                    * gs[j] * 16384.0f;
-                const uint base = j * (K / 2u) + (p0 + c0) / 2u;
-                for (uint b = 0; b < 8u; ++b) {{
-                    const float2 v = fp4_pair((uint)(uchar)q[base + b]);
-                    row[2u * b] = half(v.x * sc);
-                    row[2u * b + 1u] = half(v.y * sc);
-                }}
-            }} else {{
-                for (uint c = 0; c < 16u; ++c) row[c] = half(0.0h);
+        // A group's sixteen values as four half4, two bytes each.
+        for (uint i = 0; i < {nb}u; ++i) {{
+            const uint gi = tid + i * {threads}u;
+            if (gi >= {ng}u) continue;
+            const uint rr = gi / {bk16}u, c0 = (gi % {bk16}u) * 16u;
+            const float sc = fp8_e4m3((uint)ws[i]) * gsr[i];
+            threadgroup half4 *row = (threadgroup half4 *)(Bs + rr * {bkp}u + c0);
+            for (uint b = 0; b < 4u; ++b) {{
+                const uint w = (b < 2u ? wq[i].x : wq[i].y) >> ((b & 1u) * 16u);
+                const float2 lo = fp4_pair(w & 0xFFu), hi = fp4_pair((w >> 8u) & 0xFFu);
+                row[b] = half4(half(lo.x * sc), half(lo.y * sc), half(hi.x * sc), half(hi.y * sc));
             }}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (p0 + {bk}u < K) {{
+{fetch1}        }}
         for (uint kk = 0; kk < {bk}u; kk += 8u) {{
             simdgroup_matrix<half, 8, 8> a[{fm}], b[{nf}];
             for (uint i = 0; i < {fm}u; ++i)
@@ -353,6 +397,10 @@ kernel void {entry}(
         gy = m.div_ceil(bm),
         nf8 = nf * 8,
         fm8 = fm * 8,
+        bk4 = bk / 4,
+        bk16 = bk / 16,
+        fetch0 = fetch("0u"),
+        fetch1 = fetch(&format!("(p0 + {bk}u)")),
     );
     Lowered {
         entry,
