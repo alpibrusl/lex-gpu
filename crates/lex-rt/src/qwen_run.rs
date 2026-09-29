@@ -1027,7 +1027,7 @@ mod gpu {
                 let mut i8k = Int8 {
                     mm: HashMap::new(),
                     quant: HashMap::new(),
-                    xq: gpu.zeroed::<i8>(SPEC_MAX * widest),
+                    xq: gpu.zeroed::<i16>(SPEC_MAX * widest),
                     xs: gpu.zeroed::<f32>(SPEC_MAX * widest / 16),
                 };
                 // Decode's: one token, f32 activations.

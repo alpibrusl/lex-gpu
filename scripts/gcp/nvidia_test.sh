@@ -27,6 +27,8 @@
 #                cheaper and can be preempted mid-run; use SPOT=0 only for
 #                a run long enough that losing it matters.
 #   MODELS       Ollama models for the baseline (default: llama3.2:1b llama3.1:8b).
+#   LEX_INT8=1   run with the int8 decode path on (lex_msl::int8), so the
+#                golden suite checks its arithmetic.
 #   SPEED=1      only Qwen's timing (qwen_profile, mtp): no test suites, no
 #                Ollama baseline, no sweep. Implies QWEN=1. Minutes instead
 #                of most of an hour, for a question about speed.
@@ -155,7 +157,7 @@ gc compute scp --zone "$ZONE" "$OUT/src.tar.gz" "$NAME:~/src.tar.gz"
 # A failing run must still bring its logs home: no errexit from here on.
 set +e
 gc compute ssh "$NAME" --zone "$ZONE" --command \
-  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' QWEN='${QWEN:-}' SPEED='${SPEED:-}' bash lex-gpu/scripts/gcp/remote.sh" \
+  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' QWEN='${QWEN:-}' SPEED='${SPEED:-}' LEX_INT8='${LEX_INT8:-}' bash lex-gpu/scripts/gcp/remote.sh" \
   2>&1 | tee "$OUT/remote.log"
 status=${PIPESTATUS[0]}
 gc compute scp --zone "$ZONE" --recurse "$NAME:~/results/*" "$OUT/" || true

@@ -304,10 +304,10 @@ fn the_gemm_matches_the_matmul_it_replaces() {
     }
 }
 
-/// The int8 matmul (`lex_msl::int8`): the input quantised by `quant16`,
-/// then E2M1 through `__byte_perm` tables and `__dp4a`. Against the
-/// interpreter running `matmul_q_x`: activations carry 8 bits and a scale
-/// per 16 values, so the bar is a percent of scale, not half's precision.
+/// The int8 matmul (`lex_msl::int8`): the input quantised to int16 by
+/// `quant16`, E2M1 through `__byte_perm` tables, `__dp2a`. Against the
+/// interpreter running `matmul_q_x`: activations carry 16 bits, so the bar
+/// is the GEMM's, not the percent 8-bit activations needed.
 /// And a token's result must not depend on its batch: bit-identical alone
 /// and among others, which a speculative verify checked against plain
 /// decode relies on.
@@ -345,7 +345,7 @@ fn the_int8_matmul_matches_the_matmul_and_ignores_its_batch() {
         } else {
             g.upload(&x)
         };
-        let xq = g.zeroed::<i8>(m * k);
+        let xq = g.zeroed::<i16>(m * k);
         let xs = g.zeroed::<f32>(m * k / 16);
         let rb = g.upload(&r);
         let yb = g.zeroed::<f32>(m * n);
@@ -388,7 +388,7 @@ fn the_int8_matmul_matches_the_matmul_and_ignores_its_batch() {
             .fold(0.0f32, f32::max)
             / scale;
         eprintln!("int8 m={m} residual={residual} x_half={x_half}: {err:e} of scale");
-        assert!(err < 1e-2, "m={m}: int8 vs interpreter {err:e} of scale");
+        assert!(err < 2e-3, "m={m}: int8 vs interpreter {err:e} of scale");
 
         // The first token of the f32, no-residual batches: alone (m=1) and
         // first of three must agree to the bit -- same input, same order.
@@ -407,7 +407,7 @@ fn the_int8_matmul_matches_the_matmul_and_ignores_its_batch() {
     // check explicitly on f32 at m=3 too.
     let x = fill(3 * k, 3);
     let xb = g.upload(&x);
-    let xq = g.zeroed::<i8>(3 * k);
+    let xq = g.zeroed::<i16>(3 * k);
     let xs = g.zeroed::<f32>(3 * k / 16);
     let yb = g.zeroed::<f32>(3 * n);
     let quant = g

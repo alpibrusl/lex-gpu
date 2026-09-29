@@ -109,6 +109,7 @@ api!(struct Driver {
     fn cuDeviceGetAttribute(*mut c_int, c_int, CUdevice) -> CUresult;
     fn cuCtxCreate_v2(*mut CUcontext, c_uint, CUdevice) -> CUresult;
     fn cuModuleLoadData(*mut CUmodule, *const c_void) -> CUresult;
+    fn cuModuleUnload(CUmodule) -> CUresult;
     fn cuModuleGetFunction(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
     fn cuMemAlloc_v2(*mut CUdeviceptr, usize) -> CUresult;
     fn cuMemFree_v2(CUdeviceptr) -> CUresult;
@@ -279,8 +280,20 @@ pub struct Pipeline {
     grid: (c_uint, c_uint),
     threads: c_uint,
     shared: c_uint,
-    /// Kept alive: the function borrows the module.
-    _module: CUmodule,
+    /// Kept alive while the pipeline is, and unloaded with it: the
+    /// function borrows the module. Without the unload every compiled
+    /// kernel stayed resident for the life of the process, and a test suite
+    /// that loads the model once per test ran the device out of memory.
+    module: CUmodule,
+    unload: unsafe extern "C" fn(CUmodule) -> CUresult,
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (self.unload)(self.module);
+        }
+    }
 }
 
 /// What `lex-metal` reports under the same name, so a runtime written
@@ -472,7 +485,8 @@ impl Gpu {
                 grid: (grid.0 as c_uint, grid.1.max(1) as c_uint),
                 threads: threads as c_uint,
                 shared: shared as c_uint,
-                _module: module,
+                module,
+                unload: self.cu.cuModuleUnload,
             })
         }
     }
