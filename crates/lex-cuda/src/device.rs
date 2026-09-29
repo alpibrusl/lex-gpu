@@ -26,6 +26,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::ptr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use lex_ir::{Kernel, Plan, Target};
@@ -108,6 +109,7 @@ api!(struct Driver {
     fn cuDeviceGetName(*mut c_char, c_int, CUdevice) -> CUresult;
     fn cuDeviceGetAttribute(*mut c_int, c_int, CUdevice) -> CUresult;
     fn cuCtxCreate_v2(*mut CUcontext, c_uint, CUdevice) -> CUresult;
+    fn cuCtxDestroy_v2(CUcontext) -> CUresult;
     fn cuModuleLoadData(*mut CUmodule, *const c_void) -> CUresult;
     fn cuModuleUnload(CUmodule) -> CUresult;
     fn cuModuleGetFunction(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
@@ -258,6 +260,7 @@ pub struct Buffer {
     /// The driver table this was allocated from. A `Buffer` never outlives
     /// its `Gpu`, which owns the loaded library.
     free: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
+    _ctx: Arc<Context>,
 }
 
 impl Buffer {
@@ -286,6 +289,7 @@ pub struct Pipeline {
     /// that loads the model once per test ran the device out of memory.
     module: CUmodule,
     unload: unsafe extern "C" fn(CUmodule) -> CUresult,
+    _ctx: Arc<Context>,
 }
 
 impl Drop for Pipeline {
@@ -313,10 +317,33 @@ pub struct Gpu {
     cu: Driver,
     rtc: Nvrtc,
     dev: CUdevice,
-    _ctx: CUcontext,
+    ctx: Arc<Context>,
     name: String,
     arch: String,
     target: Target,
+}
+
+/// A CUDA context, destroyed when the last thing made in it goes. Every
+/// `Gpu::open` creates one, and none used to be destroyed: a test binary
+/// that loads the model once per test kept every context's memory until it
+/// ran the L4 out eleven tests in. The `Gpu`, and each buffer and pipeline
+/// made from it, hold it -- so a buffer that outlives its `Gpu` still frees
+/// into its own context, never into a newer one that reused the address.
+struct Context {
+    ctx: CUcontext,
+    destroy: unsafe extern "C" fn(CUcontext) -> CUresult,
+}
+
+// The handle is an opaque driver pointer, valid from any thread.
+unsafe impl Send for Context {}
+unsafe impl Sync for Context {}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (self.destroy)(self.ctx);
+        }
+    }
 }
 
 impl Gpu {
@@ -332,6 +359,11 @@ impl Gpu {
             check(&cu, (cu.cuDeviceGet)(&mut dev, 0), "cuDeviceGet")?;
             let mut ctx: CUcontext = ptr::null_mut();
             check(&cu, (cu.cuCtxCreate_v2)(&mut ctx, 0, dev), "cuCtxCreate")?;
+            // Owned from here, so an error below destroys it too.
+            let ctx = Arc::new(Context {
+                ctx,
+                destroy: cu.cuCtxDestroy_v2,
+            });
 
             let mut raw: [c_char; 256] = [0; 256];
             check(
@@ -356,7 +388,7 @@ impl Gpu {
                 cu,
                 rtc,
                 dev,
-                _ctx: ctx,
+                ctx,
                 name,
                 arch: format!("compute_{major}{minor}"),
                 // Hopper's split barriers and TMA are a different lowering
@@ -487,6 +519,7 @@ impl Gpu {
                 shared: shared as c_uint,
                 module,
                 unload: self.cu.cuModuleUnload,
+                _ctx: self.ctx.clone(),
             })
         }
     }
@@ -533,6 +566,7 @@ impl Gpu {
             ptr: ptr_,
             bytes: bytes.max(1),
             free: self.cu.cuMemFree_v2,
+            _ctx: self.ctx.clone(),
         }
     }
 

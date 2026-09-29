@@ -27,6 +27,8 @@
 #                cheaper and can be preempted mid-run; use SPOT=0 only for
 #                a run long enough that losing it matters.
 #   MODELS       Ollama models for the baseline (default: llama3.2:1b llama3.1:8b).
+#   IMAGE_FAMILY boot from this family in GCP_PROJECT (default lex-gpu-l4,
+#                made by build_image.sh), else the stock Deep Learning image.
 #   LEX_INT8=1   run with the int8 decode path on (lex_msl::int8), so the
 #                golden suite checks its arithmetic.
 #   SPEED=1      only Qwen's timing (qwen_profile, mtp): no test suites, no
@@ -79,7 +81,17 @@ gc() { gcloud --project "$GCP_PROJECT" --quiet "$@"; }
 FAMILY="$(gcloud compute images list --project deeplearning-platform-release \
   --filter='family~^common-cu12.*ubuntu' --format='value(family)' | sort | tail -1)"
 [ -n "$FAMILY" ] || { echo "no common-cu12 ubuntu image family found" >&2; exit 1; }
-echo "image family: deeplearning-platform-release/$FAMILY"
+# The image scripts/gcp/build_image.sh makes on a CPU VM -- Rust, a release
+# build, Ollama, the models already on it -- when there is one: installing
+# all that here took the first 15-20 minutes of every run at GPU prices.
+IMAGE_FAMILY="${IMAGE_FAMILY:-lex-gpu-l4}"
+if gc compute images describe-from-family "$IMAGE_FAMILY" >/dev/null 2>&1; then
+  IMG=(--image-project "$GCP_PROJECT" --image-family "$IMAGE_FAMILY")
+  echo "image: $GCP_PROJECT/$(gc compute images describe-from-family "$IMAGE_FAMILY" --format='value(name)') (pre-built)"
+else
+  IMG=(--image-project deeplearning-platform-release --image-family "$FAMILY")
+  echo "image family: deeplearning-platform-release/$FAMILY (no pre-built $IMAGE_FAMILY; run build_image.sh)"
+fi
 
 ZONE=""
 # Where the VM named $NAME is, if it exists anywhere in the project. Asked
@@ -129,7 +141,7 @@ for r in $REGIONS; do
       --machine-type "$MACHINE" \
       --maintenance-policy TERMINATE ${spot_flags[@]+"${spot_flags[@]}"} \
       --max-run-duration "$MAX_RUN" --instance-termination-action DELETE \
-      --image-project deeplearning-platform-release --image-family "$FAMILY" \
+      "${IMG[@]}" \
       --boot-disk-size 150GB --boot-disk-type pd-ssd \
       --metadata install-nvidia-driver=True \
       --labels purpose=lex-gpu-test 2>"$OUT/create-$r.log" >/dev/null; then

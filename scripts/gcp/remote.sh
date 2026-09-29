@@ -36,6 +36,20 @@ if ! command -v cargo >/dev/null; then
 fi
 . "$HOME/.cargo/env"
 rustc --version | tee -a "$R/machine.txt"
+# A pre-built image (build_image.sh) carries a release build here; building
+# into it recompiles only what changed since, not the whole workspace.
+# Cargo decides by modification time, and `git archive` stamps every file
+# with the commit's time -- newer than the image's build, so all of it
+# would look changed. Files whose contents match the ones the image was
+# built from are put back in the past; the rest keep their new time.
+if [ -d "$HOME/lex-target" ]; then
+  export CARGO_TARGET_DIR="$HOME/lex-target"
+  if [ -f "$HOME/lex-src.sha256" ]; then
+    sha256sum -c "$HOME/lex-src.sha256" 2>/dev/null | sed -n 's/: OK$//p' |
+      xargs -r -d '\n' touch -d 2000-01-01
+  fi
+  echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR (pre-built)" | tee -a "$R/machine.txt"
+fi
 
 # SPEED=1 is for a question about speed: it skips everything that checks
 # correctness or measures Ollama, which is most of an hour, and keeps the
