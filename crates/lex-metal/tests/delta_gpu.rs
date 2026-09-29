@@ -83,6 +83,9 @@ fn chunked_error(gpu: &Gpu, d: DeltaChunk, gate: impl Fn(usize) -> f32) -> (f32,
     (err(&y, &tensors[6].data), err(&s, &tensors[0].data))
 }
 
+/// A head's gate, by head.
+type Gate = Box<dyn Fn(usize) -> f32>;
+
 #[test]
 fn chunked_delta_rule_matches_the_step_program() {
     let Some(gpu) = Gpu::open().ok() else {
@@ -100,7 +103,7 @@ fn chunked_delta_rule_matches_the_step_program() {
     // Mild decay; one chunk and several; `v` behind other columns as the
     // model's convolution output lays it; and a head whose gate underflows
     // to nothing, which a log of the gate must survive.
-    let cases: Vec<(DeltaChunk, Box<dyn Fn(usize) -> f32>)> = vec![
+    let cases: Vec<(DeltaChunk, Gate)> = vec![
         (
             shape(16, 0, 384),
             Box::new(|i| 0.9 + 0.09 * ((i % 5) as f32 / 4.0)),
