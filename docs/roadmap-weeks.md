@@ -480,6 +480,29 @@ int8 and multiply with `dp4a` against int8-quantised activations, as
 llama.cpp does for its four-bit formats -- which changes the arithmetic,
 so it is a golden-suite question as much as a speed one.
 
+## M5b — where Metal's Qwen decode goes (2026-09-29, GPU idle)
+
+Plain decode is at the memory roof: 37.0 ms a token, gate/up reading
+~460 GB/s of a 463 GB/s copy, so a one-token step has nowhere to go.
+Ollama's 57 tok/s is speculation. Ours, traced over 143 greedy cycles:
+
+| per cycle | ms |
+| --- | --- |
+| draft (2 tokens) | 5.3 |
+| verify (3 tokens) | 48.7 |
+| undo | 2.6 |
+| total, 2.09 tokens committed | 55.7 -> 37.5 tok/s |
+
+At this acceptance, 57 tok/s is a 36 ms cycle -- about one plain step.
+The verify is the lever: 1.28 steps for three tokens. `LEX_BATCH_BO` is
+not (16, 32, 64 all 1.28). Summing each NVFP4 run unscaled and scaling
+once, as the single-row kernel already did, took it to 1.21 (47.3 -> 45.0
+ms). Through the servers (`scripts/serve_bench.py`): greedy 39.4 against
+Ollama's 57.1, sampled 42.4 against 53.4. What remains is the verify's
+other 0.2 steps (the recurrence and attention over three tokens cost 2.7x
+and 2.5x a step's), undo, and acceptance -- a third draft is accepted
+often enough to try again now that the verify is cheaper.
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`
