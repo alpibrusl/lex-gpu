@@ -618,6 +618,21 @@ mod gpu {
 
     /// Every pipeline a batch of `t` tokens dispatches, compiled on first
     /// use of that size.
+    /// Which rows of a batch go through `lm_head`.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Head {
+        /// Every row: a verify judges each token.
+        All,
+        /// The last row only, through the decode step's head: what the
+        /// next token is sampled from. The batched head over a prefill
+        /// chunk computed 128 rows of logits to keep one, 35 ms a chunk
+        /// on an M4 Max.
+        Last,
+        /// None: a prefill chunk before the last, or a replay whose logits
+        /// the speculation already has.
+        Skip,
+    }
+
     struct Batch {
         rms: Pipeline,
         mv: HashMap<MvKey, Pipeline>,
@@ -637,6 +652,9 @@ mod gpu {
         attn_combine: Pipeline,
         mul: Pipeline,
         silu: Pipeline,
+        /// The batch's last row of the residual into the decode step's
+        /// `x`, for a head over that row alone ([`Head::Last`]).
+        last_row: Pipeline,
         /// The same delta and conv kernels, writing per-token snapshots.
         /// Only for batches a speculative verify can use.
         delta_snap: Option<Pipeline>,
@@ -1313,7 +1331,7 @@ mod gpu {
             let mut fed = vec![last];
             fed.extend(&drafts);
             let mark = std::time::Instant::now();
-            let logits = self.forward_with(&fed, true, true)?;
+            let logits = self.forward_with(&fed, Head::All, true)?;
             let t_verify = mark.elapsed().as_secs_f64() * 1e3;
 
             // How many drafts survive, longest prefix only. The first
@@ -1354,7 +1372,7 @@ mod gpu {
                 if !self.roll_back_to(kept, fed.len()) {
                     self.restore();
                     if kept > 0 {
-                        self.forward(&committed, false)?;
+                        self.forward_with(&committed, Head::Skip, false)?;
                     } else {
                         self.step(last)?;
                     }
@@ -1516,10 +1534,17 @@ mod gpu {
             let mut done = 0;
             while done < n {
                 let t = self.chunk(n - done);
-                // Only the last row's logits: the rest are never read, and
-                // at 64 tokens they are 64 MB of download a chunk.
-                let out = self.forward(&tokens[done..done + t], false)?;
-                logits = out.last().cloned().expect("a batch is never empty");
+                // Logits for the prompt's last token only: every other row's
+                // are never read, and no chunk before the last has it.
+                let head = if done + t == n {
+                    Head::Last
+                } else {
+                    Head::Skip
+                };
+                let out = self.forward_with(&tokens[done..done + t], head, false)?;
+                if let Some(last) = out.into_iter().last() {
+                    logits = last;
+                }
                 let hs = self.batch_hidden_all(t);
                 // The last prompt position pairs with a token the prompt
                 // does not have -- the one the model is about to generate.
@@ -1952,7 +1977,8 @@ mod gpu {
         /// kernel, so the batch lands exactly where the same tokens would
         /// have one at a time.
         pub fn forward(&mut self, tokens: &[u32], all: bool) -> Result<Vec<Vec<f32>>, String> {
-            self.forward_with(tokens, all, false)
+            let head = if all { Head::All } else { Head::Last };
+            self.forward_with(tokens, head, false)
         }
 
         /// [`Self::forward`] recording where each gated-delta layer stood
@@ -1962,7 +1988,7 @@ mod gpu {
         fn forward_with(
             &mut self,
             tokens: &[u32],
-            all: bool,
+            head: Head,
             snap: bool,
         ) -> Result<Vec<Vec<f32>>, String> {
             let t = tokens.len();
@@ -2003,7 +2029,7 @@ mod gpu {
                 &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
             );
 
-            let mut plan = self.batch_plan_with(t, snap);
+            let mut plan = self.batch_plan_with(t, snap, head);
             if !self.skip.is_empty() {
                 // Exact labels, not prefixes. `"matvec qkv"` starts with
                 // `"matvec q"`, so a prefix match silently ablates two call
@@ -2023,16 +2049,18 @@ mod gpu {
             self.pos += t;
 
             let v = c.vocab;
-            if all {
-                let mut flat = vec![0.0f32; t * v];
-                self.gpu.download(&self.bacts.logits, &mut flat);
-                Ok(flat.chunks(v).map(<[f32]>::to_vec).collect())
-            } else {
-                // Only the last row is wanted, so only the last row moves.
-                let mut last = vec![0.0f32; v];
-                self.gpu
-                    .download_at(&self.bacts.logits, (t - 1) * v, &mut last);
-                Ok(vec![last])
+            match head {
+                Head::All => {
+                    let mut flat = vec![0.0f32; t * v];
+                    self.gpu.download(&self.bacts.logits, &mut flat);
+                    Ok(flat.chunks(v).map(<[f32]>::to_vec).collect())
+                }
+                Head::Last => {
+                    let mut last = vec![0.0f32; v];
+                    self.gpu.download(&self.acts.logits, &mut last);
+                    Ok(vec![last])
+                }
+                Head::Skip => Ok(vec![]),
             }
         }
 
@@ -2298,6 +2326,11 @@ mod gpu {
                     &lex_front::llama::silu_mul(t * c.ffn, THREADS, X_DTYPE)?,
                     THREADS,
                 )?,
+                last_row: compile(
+                    gpu,
+                    &lex_front::qwen::copy_block(t, 1, c.hidden, t - 1)?,
+                    THREADS,
+                )?,
                 // Only a batch a verify can roll back from, and only when
                 // there is a draft head to reject anything in the first
                 // place. Prefill runs at MAX_BATCH and skips both.
@@ -2426,7 +2459,7 @@ mod gpu {
         /// It falls back to the ordinary kernels when the batch is larger
         /// than `SPEC_MAX` or the checkpoint has no draft head, and the
         /// caller then pays the replay as before.
-        fn batch_plan_with(&self, t: usize, snap: bool) -> Vec<Dispatch<'_>> {
+        fn batch_plan_with(&self, t: usize, snap: bool, head: Head) -> Vec<Dispatch<'_>> {
             let a = &self.bacts;
             let k = &self.batches[&t];
             // The gated-delta layers in order, for indexing the snapshots.
@@ -2641,16 +2674,41 @@ mod gpu {
                     None,
                 ));
             }
-            // Every token's logits: a verify needs them all, and the head
-            // is 0.7 GB against the 14.5 the batch has already moved.
             let out = &self.lm_head;
-            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
-            d.push((
-                "matvec lm head",
-                &k.mv[&out.key(false)],
-                out.bind(&a.h, None, &a.logits),
-                None,
-            ));
+            match head {
+                // Every token's logits: a verify needs them all, and the
+                // head is 0.7 GB against the 14.5 the batch has moved.
+                Head::All => {
+                    d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
+                    d.push((
+                        "matvec lm head",
+                        &k.mv[&out.key(false)],
+                        out.bind(&a.h, None, &a.logits),
+                        None,
+                    ));
+                }
+                // The residual, not the normed `h`: the batch stores `h` as
+                // f16 and the decode step reads it as f32. Normed here by
+                // the decode step's own kernel, the row goes through the
+                // same arithmetic a step would give it.
+                Head::Last => {
+                    let one = &self.acts;
+                    d.push(("lm head row", &k.last_row, vec![&a.x, &one.x], None));
+                    d.push((
+                        "rmsnorm",
+                        &self.k.rms,
+                        vec![&one.x, &self.out_norm, &one.h],
+                        None,
+                    ));
+                    d.push((
+                        "matvec lm head",
+                        self.mv(out, false),
+                        out.bind(&one.h, None, &one.logits),
+                        None,
+                    ));
+                }
+                Head::Skip => {}
+            }
             d
         }
 
