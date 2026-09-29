@@ -38,6 +38,14 @@
 #                gated-delta / NVFP4 / draft-head model. 14.5 GB to pull,
 #                and Ollama cannot run it here to compare against (MLX is
 #                macOS-only), so the check is our own golden file.
+#   JOB          run this one shell command on the GPU and nothing else --
+#                no test suites, no Ollama baseline, no Llama models:
+#                  JOB='cargo test --release -p lex-rt --test qwen_golden'
+#                  JOB='LEX_INT8=1 cargo run --release -p lex-rt --example qwen_profile -- --tokens 8'
+#                It runs in the source tree, from the pre-built image (Rust,
+#                a release build, qwen3.8 on disk), with Ollama's service
+#                stopped so its models do not hold GPU memory. Its output
+#                comes home as job.log; the exit status is the job's.
 #   MAX_RUN      hard cap on the VM's life (default 2h). GCE deletes the VM
 #                when it expires, even if this script is killed.
 #   KEEP=1       leave the VM running afterwards (debugging); you delete it.
@@ -166,10 +174,16 @@ done
 
 git -C "$ROOT" archive --format=tar.gz -o "$OUT/src.tar.gz" HEAD
 gc compute scp --zone "$ZONE" "$OUT/src.tar.gz" "$NAME:~/src.tar.gz"
+# A job travels as a file, not inside the ssh command line below, so its
+# own quotes need no escaping.
+if [ -n "${JOB:-}" ]; then
+  printf '%s\n' "$JOB" > "$OUT/job.sh"
+  gc compute scp --zone "$ZONE" "$OUT/job.sh" "$NAME:~/job.sh"
+fi
 # A failing run must still bring its logs home: no errexit from here on.
 set +e
 gc compute ssh "$NAME" --zone "$ZONE" --command \
-  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' QWEN='${QWEN:-}' SPEED='${SPEED:-}' LEX_INT8='${LEX_INT8:-}' bash lex-gpu/scripts/gcp/remote.sh" \
+  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' QWEN='${QWEN:-}' SPEED='${SPEED:-}' LEX_INT8='${LEX_INT8:-}' JOB='${JOB:+1}' bash lex-gpu/scripts/gcp/remote.sh" \
   2>&1 | tee "$OUT/remote.log"
 status=${PIPESTATUS[0]}
 gc compute scp --zone "$ZONE" --recurse "$NAME:~/results/*" "$OUT/" || true

@@ -61,6 +61,22 @@ if [ -d "$HOME/lex-target" ]; then
   echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR (pre-built)" | tee -a "$R/machine.txt"
 fi
 
+# JOB: one command, and nothing else (nvidia_test.sh copied it to
+# ~/job.sh). The driver and the toolchain above are all it needs; the
+# pre-built image already holds the release build and qwen3.8.
+if [ -n "${JOB:-}" ]; then
+  step "job"
+  export OLLAMA_MODELS="$HOME/.ollama/models"
+  # The service would keep whatever it last served on the GPU.
+  sudo systemctl stop ollama 2>/dev/null || true
+  cat "$HOME/job.sh"
+  nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader | tee -a "$R/machine.txt"
+  bash -e -o pipefail "$HOME/job.sh" 2>&1 | tee "$R/job.log"
+  status=${PIPESTATUS[0]}
+  echo "=== job exit $status"
+  exit "$status"
+fi
+
 # SPEED=1 is for a question about speed: it skips everything that checks
 # correctness or measures Ollama, which is most of an hour, and keeps the
 # Qwen fetch and the timing. It is not a test run and says nothing about
