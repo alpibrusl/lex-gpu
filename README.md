@@ -133,11 +133,14 @@ with the target's probability for it, else resample without it -- now
 lets both be true at once, at 38 tok/s sampled; the energy row has not
 been re-measured since.
 
-**Prefill now runs on the matrix units: 123 tok/s on an M4 Max (was 87),
-200 on an L4 (was 40), against Ollama's ~250 on the Mac.** 512 tokens in
-128-token chunks through a hand-scheduled NVFP4 GEMM (`lex_msl::gemm`);
-see [`docs/roadmap-weeks.md`](docs/roadmap-weeks.md) M5a. What follows is
-how it stood before: Not a
+**Prefill: 203 tok/s on an M4 Max (was 87, then 123), 234 on an L4 (was
+40, then 199), against Ollama's 250-260 on the Mac.** 512 tokens in 128-token
+chunks: a hand-scheduled NVFP4 GEMM (`lex_msl::gemm`) at 12.7 TFLOPS
+against MLX's 13.9 on the same shapes, the gated delta rule solved a
+16-token chunk at a time (`lex_msl::delta`), attention spread over
+tokens, and the vocabulary projection run for the last token only. See
+[`docs/roadmap-weeks.md`](docs/roadmap-weeks.md) M5a and M5c. What follows
+is how it stood before: Not a
 mystery. 512 tokens is 28.5 TFLOP, and at the measured 13.7 TFLOP/s that
 is 246 tok/s — which is what Ollama gets, because it prefills in large
 batches and pays only the arithmetic. `MAX_BATCH` is 8 here, so a
