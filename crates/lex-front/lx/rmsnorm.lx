@@ -1,0 +1,38 @@
+// y = x * rsqrt(mean(x^2) + eps) * w, over one row of n.
+//
+// The same program as `lex_front::llama::rmsnorm`, written in the surface
+// instead of in Rust. `tests/syntax.rs` requires the two to lower to the
+// same MSL, byte for byte -- an equivalent program would not be evidence
+// that the surface builds *this* IR.
+//
+// `&x` borrows and `x` moves. The checker counts consumptions, so which
+// is which is not a detail: `&x * &x` leaves x alive for the multiply at
+// the end, and the bare `x` there is what finally spends it.
+
+algo rmsnorm(n, eps)
+  in  x: f32[1, n]
+  in  w: f32[1, n]
+  out y: f32[1, n]
+{
+  let x  = load x
+  let sq = &x * &x
+  let ss = rowsum sq
+  let ms = ss * (1 / n)
+  let t  = ms + eps
+  let r  = rsqrt t
+  let xn = x * r
+  let w  = load w
+  store xn * w -> y
+}
+
+// The algorithm above names no target. These bind it to one each, which
+// is the split the whole design rests on: the algorithm is checked once
+// and the vendor knowledge lives here, in the short part.
+//
+// Both say 256 today because rmsnorm's shape does not depend on the
+// machine. The matvec's does -- one output row per simdgroup on Apple,
+// two on Ada, measured at 107 GB/s against 189 -- and that is the next
+// thing these blocks should carry.
+
+schedule rmsnorm for apple-m-series { threads 256 }
+schedule rmsnorm for nvidia-ada     { threads 256 }

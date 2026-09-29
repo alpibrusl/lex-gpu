@@ -1,14 +1,27 @@
-# Testing on NVIDIA in Google Cloud (EU)
+# Testing on NVIDIA in Google Cloud
 
-`scripts/gcp/nvidia_test.sh` rents one NVIDIA GPU in an EU region, runs the
-tests and the Ollama baseline on it, copies the results to
-`results/gcp/<time>-<gpu>/`, and deletes the VM.
+`scripts/gcp/nvidia_test.sh` rents one NVIDIA GPU, runs the tests and the
+Ollama baseline on it, copies the results to `results/gcp/<time>-<gpu>/`,
+and deletes the VM.
 
 ```sh
 gcloud auth login                                   # once; the script cannot prompt
-GCP_PROJECT=<project> scripts/gcp/nvidia_test.sh    # L4, europe-west4 first
-GCP_PROJECT=<project> GPU=a100 SPOT=1 scripts/gcp/nvidia_test.sh
+GCP_PROJECT=<project> scripts/gcp/nvidia_test.sh    # L4, EU zones first, then US
+GCP_PROJECT=<project> GPU=a100 scripts/gcp/nvidia_test.sh
+GCP_PROJECT=<project> QWEN=1 scripts/gcp/nvidia_test.sh   # also the 27B
 ```
+
+**Spot by default.** Around 60-70% cheaper, and these runs are
+repeatable, so a preemption costs the run and not the results. `SPOT=0`
+buys an on-demand VM for a run long enough that losing it would matter.
+The default was the other way round for a day, and every run in that day
+quietly cost three times what it should have.
+
+**EU first, then US.** L4 capacity in `europe-west` was unavailable for
+an entire afternoon, and the harness tries nineteen zones before giving
+up. These runs carry no user data — public model weights and this
+repository — which is why leaving the EU is allowed here; set `ZONES`
+explicitly to pin a region.
 
 ## What it runs
 

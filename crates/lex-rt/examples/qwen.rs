@@ -1,8 +1,8 @@
-//! Decode with Qwen3.5 on lex kernels.
+//! Decode with Qwen3.8 on lex kernels.
 //!
 //! cargo run --release -p lex-rt --example qwen -- --steps 8
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn main() -> Result<(), String> {
     use lex_rt::qwen_run::Runner;
     use std::time::Instant;
@@ -37,6 +37,20 @@ fn main() -> Result<(), String> {
     let mut logits = vec![];
     for &id in &ids {
         logits = rt.step(id)?;
+    }
+    // The first position's top five, against a reference's own: one wrong
+    // token says something is off, where the right one ranks says how far.
+    if std::env::var_os("LEX_TOP5").is_some() {
+        let m = logits.iter().cloned().fold(f32::MIN, f32::max);
+        let z: f32 = logits.iter().map(|x| (x - m).exp()).sum();
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+        for &i in idx.iter().take(5) {
+            println!(
+                "   top  token {i:6}  logprob {:+.4}",
+                logits[i] - m - z.ln()
+            );
+        }
     }
     let t = Instant::now();
     for i in 0..steps {
@@ -102,7 +116,7 @@ fn main() -> Result<(), String> {
 }
 
 /// The likeliest token and its log-probability.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn top(logits: &[f32]) -> (u32, f32) {
     let best = (0..logits.len())
         .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
@@ -112,7 +126,7 @@ fn top(logits: &[f32]) -> (u32, f32) {
     (best as u32, -sum.ln())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn main() {
     eprintln!("qwen needs a Metal device");
     std::process::exit(1);

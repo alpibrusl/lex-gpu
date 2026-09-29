@@ -8,12 +8,12 @@
 //! cargo run --release -p lex-rt --example matvec
 //! BO=16 THREADS=128 cargo run --release -p lex-rt --example matvec
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn main() -> Result<(), String> {
     use lex_front::llama::{QLayout, matmul_q, matmul_q_x, matvec_q};
     use lex_ir::DType;
-    use lex_metal::{Buffer, Gpu, Step};
-    use lex_msl::program::lower;
+    use lex_msl::program::lower_with;
+    use lex_rt::dev::{Buffer, Gpu, Step};
 
     let env = |k: &str, d: usize| {
         std::env::var(k)
@@ -29,7 +29,7 @@ fn main() -> Result<(), String> {
         "matrix", "n_in", "n_out", "MB", "us", "GB/s"
     );
     let shapes = [
-        // Qwen3.5-27B (MLX, nvfp4), the decode matvecs by size.
+        // Qwen3.8-27B (MLX, nvfp4), the decode matvecs by size.
         ("qwen gate/up (nvfp4)", 5120, 17408, QLayout::NVFP4),
         ("qwen down (nvfp4)", 17408, 5120, QLayout::NVFP4),
         ("qwen qkv-in (nvfp4)", 5120, 12288, QLayout::NVFP4),
@@ -56,11 +56,24 @@ fn main() -> Result<(), String> {
         ("down (Q4_K)", 14336, 4096, QLayout::Q4_K),
         ("down (Q6_K)", 14336, 4096, QLayout::Q6_K),
         ("lm head (Q6_K)", 4096, 128256, QLayout::Q6_K),
+        // Llama-3.2 1B (Q8_0). Narrower than anything above, and the one
+        // model that got *slower* when `bo` was raised for Ada -- so the
+        // rows-per-simdgroup optimum is not a property of the machine
+        // alone, and these are the shapes that say so.
+        ("1b q/o (Q8_0)", 2048, 2048, QLayout::Q8_0),
+        ("1b gate/up (Q8_0)", 2048, 8192, QLayout::Q8_0),
+        ("1b down (Q8_0)", 8192, 2048, QLayout::Q8_0),
+        ("1b lm head (Q8_0)", 2048, 128256, QLayout::Q8_0),
     ];
     for (label, n_in, n_out, layout) in shapes {
         let prog = matvec_q(n_in, n_out, bo, n_in, layout, false)?;
         lex_front::check(&prog, gpu.target()).map_err(|e| format!("{e:?}"))?;
-        let pipe = gpu.build_lowered(&lower(&prog, gpu.target(), threads)?)?;
+        let pipe = gpu.build_lowered(&lower_with(
+            &prog,
+            gpu.target(),
+            threads,
+            lex_rt::dev::dialect(),
+        )?)?;
         let bytes = |p: &lex_front::ir::Param| {
             let n: usize = p.shape.iter().product();
             n * match p.dtype {
@@ -198,7 +211,12 @@ fn main() -> Result<(), String> {
             if lex_front::check(&prog, gpu.target()).is_err() {
                 continue;
             }
-            let Ok(pipe) = gpu.build_lowered(&lower(&prog, gpu.target(), threads)?) else {
+            let Ok(pipe) = gpu.build_lowered(&lower_with(
+                &prog,
+                gpu.target(),
+                threads,
+                lex_rt::dev::dialect(),
+            )?) else {
                 continue;
             };
             let binds: Vec<Vec<&Buffer>> = sets
@@ -234,7 +252,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn main() {
     eprintln!("matvec needs a Metal device");
     std::process::exit(1);

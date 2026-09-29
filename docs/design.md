@@ -123,13 +123,35 @@ Source files are **`.lx`**. `.lex` belongs to `lex-lang`, the sibling
 project; the two are separate languages in one family, so they take
 separate extensions rather than one being a dialect of the other.
 
-Nothing reads a `.lx` file yet. There is no lexer and no parser: programs
-are built through the Rust IR API, and the syntax below is a design. It
-stays unbuilt deliberately until a second backend exists, because the
-parts worth arguing about — how schedules are written, what an autotuner's
-`?` binds to, how layouts and MMA fragments appear in types — are exactly
-the parts a second target would rewrite. A surface designed against one
-backend is a surface designed twice.
+That condition has been met, and the first slice exists. `lex-front`'s
+`syntax` module reads a `.lx` file into the same IR the Rust API builds:
+`algo` declarations, parameters, `let` bindings over the elementwise and
+reduction ops, and a `store`. `crates/lex-front/tests/lx/rmsnorm.lx` is
+held to emitting MSL byte-identical to `llama::rmsnorm`, because an
+*equivalent* program would not be evidence that the surface builds this
+IR.
+
+The linear discipline is visible in it, which is the point of having a
+surface at all:
+
+```text
+let sq = &x * &x     // borrowed twice, x lives on
+let ss = rowsum sq   // moved, sq is gone
+```
+
+A sigil rather than an inference. The checker's value is that using a
+consumed tile is a compile error; a surface that guessed which uses were
+moves would move that error from the reader's eye to the compiler's
+discretion. `a_moved_tile_cannot_be_used_again` writes `x * x` and
+requires the checker to reject it.
+
+What is not built: `schedule` blocks, loops, the grid, layouts and memory
+spaces in the type, the autotuner's `?`. Those are the interesting half,
+and the reason they waited was that "the parts worth arguing about are
+exactly the parts a second target would rewrite" — there are two targets
+now, and they disagree about real things, so those parts can finally be
+designed against evidence. The `bo` measurement is the first concrete
+case for `?`: two shapes, two optima, and no rule between them.
 
 ### Algorithm / schedule split
 

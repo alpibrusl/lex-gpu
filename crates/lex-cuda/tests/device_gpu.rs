@@ -18,7 +18,7 @@
 
 use half::f16;
 use lex_cuda::device::Gpu;
-use lex_front::llama::{QLayout, matvec_q, rmsnorm_rows, silu_mul};
+use lex_front::llama::{QLayout, matmul_q, matvec_q, rmsnorm_rows, silu_mul};
 use lex_front::{Program, Tensor, check, run};
 use lex_ir::{DType, Target};
 use lex_msl::dialect::Cuda;
@@ -149,4 +149,280 @@ fn nvfp4_matvec_matches_the_interpreter() {
         Tensor::zeros(DType::F32, &[1, n_out]),
     ];
     same(&g, &prog, tensors, 4, 1e-4);
+}
+
+/// The same at the shape and schedule the L4 runs: a 5120-wide row, 16
+/// lanes to a row (`bo` 16, two rows a warp). That is the wide-load path --
+/// one `uint2` of weights and four `float4` of input per run -- and a load
+/// that lands off its alignment faults here rather than in a model.
+#[test]
+fn nvfp4_matvec_loaded_wide_matches_the_interpreter() {
+    let Some(g) = gpu() else { return };
+    let (n_in, n_out) = (5120, 32);
+    let prog = matvec_q(n_in, n_out, 16, n_in, QLayout::NVFP4, false).expect("program");
+    let codes: Vec<f32> = (0..n_out * n_in / 2)
+        .map(|i| ((i.wrapping_mul(131).wrapping_add(17) & 0xFF) as i32 - 128) as f32)
+        .collect();
+    let scales: Vec<f32> = (0..n_out * n_in / 16)
+        .map(|i| (0x30i32 + (i % 11) as i32 - 128) as f32)
+        .collect();
+    let rows: Vec<f32> = (0..n_out).map(|i| 0.5 + (i % 3) as f32 * 0.25).collect();
+    let tensors = vec![
+        Tensor::new(DType::F32, &[1, n_in], &fill(n_in, 9)),
+        Tensor::new(DType::I8, &[n_out, n_in / 2], &codes),
+        Tensor::new(DType::I8, &[n_out, n_in / 16], &scales),
+        Tensor::new(DType::F32, &[n_out], &rows),
+        Tensor::zeros(DType::F32, &[1, n_out]),
+    ];
+    same(&g, &prog, tensors, 4, 1e-4);
+}
+
+/// The batched form -- a verify's three tokens, a prefill chunk's eight --
+/// loaded wide: each row's run as one `uint2`, each token's quarter-run as
+/// one `float4`. Eight is where the kernel holds the most registers.
+#[test]
+fn nvfp4_matmul_loaded_wide_matches_the_interpreter() {
+    let Some(g) = gpu() else { return };
+    for m in [3, 8] {
+        let (n_in, n_out) = (5120, 64);
+        let prog = matmul_q(m, n_in, n_out, 32, n_in, QLayout::NVFP4, false).expect("program");
+        let codes: Vec<f32> = (0..n_out * n_in / 2)
+            .map(|i| ((i.wrapping_mul(97).wrapping_add(3) & 0xFF) as i32 - 128) as f32)
+            .collect();
+        let scales: Vec<f32> = (0..n_out * n_in / 16)
+            .map(|i| (0x34i32 + (i % 7) as i32 - 128) as f32)
+            .collect();
+        let tensors = vec![
+            Tensor::new(DType::F32, &[m, n_in], &fill(m * n_in, 13)),
+            Tensor::new(DType::I8, &[n_out, n_in / 2], &codes),
+            Tensor::new(DType::I8, &[n_out, n_in / 16], &scales),
+            Tensor::new(DType::F32, &[n_out], &vec![0.75; n_out]),
+            Tensor::zeros(DType::F32, &[m, n_out]),
+        ];
+        same(&g, &prog, tensors, 4, 1e-4);
+    }
+}
+
+/// The hand-scheduled prefill GEMM (`lex_msl::gemm`) against the
+/// interpreter running the `matmul_q_x` it stands in for. Ragged tokens and
+/// rows, with and without the residual, half and f32 activations. The GEMM
+/// rounds weights to half for the tensor cores, so the bar is half's.
+#[test]
+fn the_gemm_matches_the_matmul_it_replaces() {
+    use lex_front::llama::matmul_q_x;
+    use lex_msl::gemm::{Backend, Gemm, gemm_nvfp4};
+    let Some(g) = gpu() else { return };
+    for c in [
+        Gemm {
+            m: 40,
+            n: 100,
+            k: 512,
+            residual: false,
+            x_half: true,
+        },
+        Gemm {
+            m: 40,
+            n: 100,
+            k: 512,
+            residual: true,
+            x_half: true,
+        },
+        Gemm {
+            m: 64,
+            n: 128,
+            k: 512,
+            residual: false,
+            x_half: false,
+        },
+        Gemm {
+            m: 17,
+            n: 48,
+            k: 256,
+            residual: true,
+            x_half: false,
+        },
+        Gemm {
+            m: 96,
+            n: 192,
+            k: 1024,
+            residual: false,
+            x_half: true,
+        },
+    ] {
+        let (m, n, k) = (c.m, c.n, c.k);
+        let xt = if c.x_half { DType::F16 } else { DType::F32 };
+        let prog = matmul_q_x(m, k, n, 4, k, QLayout::NVFP4, c.residual, xt).expect("program");
+        let codes: Vec<f32> = (0..n * k / 2)
+            .map(|i| ((i.wrapping_mul(97).wrapping_add(3) & 0xFF) as i32 - 128) as f32)
+            .collect();
+        let scales: Vec<f32> = (0..n * k / 16)
+            .map(|i| (0x34i32 + (i % 7) as i32 - 128) as f32)
+            .collect();
+        let rows: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32 * 0.125).collect();
+        let mut tensors = vec![
+            Tensor::new(xt, &[m, k], &fill(m * k, 3)),
+            Tensor::new(DType::I8, &[n, k / 2], &codes),
+            Tensor::new(DType::I8, &[n, k / 16], &scales),
+            Tensor::new(DType::F32, &[n], &rows),
+        ];
+        if c.residual {
+            tensors.push(Tensor::new(DType::F32, &[m, n], &fill(m * n, 11)));
+        }
+        tensors.push(Tensor::zeros(DType::F32, &[m, n]));
+        let out = tensors.len() - 1;
+
+        let pipe = g
+            .build_lowered(&gemm_nvfp4(&c, Backend::Cuda).expect("gemm"))
+            .unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        let bufs: Vec<_> = tensors
+            .iter()
+            .map(|t| match t.dtype {
+                DType::F32 => g.upload(&t.data),
+                DType::F16 => {
+                    g.upload(&t.data.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>())
+                }
+                DType::I8 => g.upload(&t.data.iter().map(|&x| x as i8).collect::<Vec<_>>()),
+            })
+            .collect();
+        let refs: Vec<_> = bufs.iter().collect();
+        g.run(&pipe, &refs).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        let mut got = vec![0.0f32; m * n];
+        g.download(&bufs[out], &mut got);
+
+        run(&prog, &mut tensors).expect("interpret");
+        let want = &tensors[out].data;
+        let scale = want.iter().fold(1e-6f32, |a, x| a.max(x.abs()));
+        assert!(scale > 1e-3, "{c:?}: the reference output is all but zero");
+        let err = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+            / scale;
+        eprintln!("{c:?}: {err:e} of scale");
+        assert!(err < 2e-3, "{c:?}: GEMM vs interpreter {err:e} of scale");
+    }
+}
+
+/// The int8 matmul (`lex_msl::int8`): the input quantised to int16 by
+/// `quant16`, E2M1 through `__byte_perm` tables, `__dp2a`. Against the
+/// interpreter running `matmul_q_x`: activations carry 16 bits, so the bar
+/// is the GEMM's, not the percent 8-bit activations needed.
+/// And a token's result must not depend on its batch: bit-identical alone
+/// and among others, which a speculative verify checked against plain
+/// decode relies on.
+#[test]
+fn the_int8_matmul_matches_the_matmul_and_ignores_its_batch() {
+    use lex_front::llama::matmul_q_x;
+    use lex_msl::int8::{matmul_int8, quant16};
+    let Some(g) = gpu() else { return };
+    let (n, k): (usize, usize) = (96, 1024);
+    let codes: Vec<f32> = (0..n * k / 2)
+        .map(|i| ((i.wrapping_mul(97).wrapping_add(3) & 0xFF) as i32 - 128) as f32)
+        .collect();
+    let scales: Vec<f32> = (0..n * k / 16)
+        .map(|i| (0x34i32 + (i % 7) as i32 - 128) as f32)
+        .collect();
+    let rows: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32 * 0.125).collect();
+    let as_i8 = |v: &[f32]| v.iter().map(|&x| x as i8).collect::<Vec<_>>();
+    let (qb, sb, gb) = (
+        g.upload(&as_i8(&codes)),
+        g.upload(&as_i8(&scales)),
+        g.upload(&rows),
+    );
+    let mut alone: Option<Vec<f32>> = None;
+    for (m, residual, x_half) in [
+        (1, false, false),
+        (3, false, true),
+        (3, true, false),
+        (8, true, true),
+    ] {
+        let xt = if x_half { DType::F16 } else { DType::F32 };
+        let x = fill(m * k, 3);
+        let r = fill(m * n, 11);
+        let xb = if x_half {
+            g.upload(&x.iter().map(|&v| f16::from_f32(v)).collect::<Vec<_>>())
+        } else {
+            g.upload(&x)
+        };
+        let xq = g.zeroed::<i16>(m * k);
+        let xs = g.zeroed::<f32>(m * k / 16);
+        let rb = g.upload(&r);
+        let yb = g.zeroed::<f32>(m * n);
+        let quant = g
+            .build_lowered(&quant16(m, k, x_half).expect("quant"))
+            .expect("build");
+        let mm = g
+            .build_lowered(&matmul_int8(m, n, k, residual).expect("mm"))
+            .expect("build");
+        g.run(&quant, &[&xb, &xq, &xs]).expect("quant");
+        let mut bufs = vec![&xq, &xs, &qb, &sb, &gb];
+        if residual {
+            bufs.push(&rb);
+        }
+        bufs.push(&yb);
+        g.run(&mm, &bufs).expect("mm");
+        let mut got = vec![0.0f32; m * n];
+        g.download(&yb, &mut got);
+
+        let prog = matmul_q_x(m, k, n, 4, k, QLayout::NVFP4, residual, xt).expect("program");
+        let mut t = vec![
+            Tensor::new(xt, &[m, k], &x),
+            Tensor::new(DType::I8, &[n, k / 2], &codes),
+            Tensor::new(DType::I8, &[n, k / 16], &scales),
+            Tensor::new(DType::F32, &[n], &rows),
+        ];
+        if residual {
+            t.push(Tensor::new(DType::F32, &[m, n], &r));
+        }
+        t.push(Tensor::zeros(DType::F32, &[m, n]));
+        let out = t.len() - 1;
+        run(&prog, &mut t).expect("interpret");
+        let want = &t[out].data;
+        let scale = want.iter().fold(1e-6f32, |a, v| a.max(v.abs()));
+        assert!(scale > 1e-3, "m={m}: the reference is all but zero");
+        let err = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+            / scale;
+        eprintln!("int8 m={m} residual={residual} x_half={x_half}: {err:e} of scale");
+        assert!(err < 2e-3, "m={m}: int8 vs interpreter {err:e} of scale");
+
+        // The first token of the f32, no-residual batches: alone (m=1) and
+        // first of three must agree to the bit -- same input, same order.
+        if !residual && !x_half {
+            match &alone {
+                None => alone = Some(got[..n].to_vec()),
+                Some(a) => assert_eq!(
+                    a,
+                    &got[..n].to_vec(),
+                    "a token's output depends on its batch"
+                ),
+            }
+        }
+    }
+    // The (3, false, true) case is half input, so run the batch-independence
+    // check explicitly on f32 at m=3 too.
+    let x = fill(3 * k, 3);
+    let xb = g.upload(&x);
+    let xq = g.zeroed::<i16>(3 * k);
+    let xs = g.zeroed::<f32>(3 * k / 16);
+    let yb = g.zeroed::<f32>(3 * n);
+    let quant = g
+        .build_lowered(&quant16(3, k, false).expect("quant"))
+        .expect("build");
+    let mm = g
+        .build_lowered(&matmul_int8(3, n, k, false).expect("mm"))
+        .expect("build");
+    g.run(&quant, &[&xb, &xq, &xs]).expect("quant");
+    g.run(&mm, &[&xq, &xs, &qb, &sb, &gb, &yb]).expect("mm");
+    let mut three = vec![0.0f32; 3 * n];
+    g.download(&yb, &mut three);
+    assert_eq!(
+        alone.expect("the m=1 case ran"),
+        three[..n].to_vec(),
+        "a token's output depends on its batch"
+    );
 }

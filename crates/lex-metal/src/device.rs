@@ -320,6 +320,18 @@ impl Gpu {
         self.run_launches(&with)
     }
 
+    /// Each step in its own command buffer, timed by the GPU's own clock,
+    /// in seconds. Serial: nothing overlaps as it does in one concurrent
+    /// encoder, so each time is an upper bound on that kernel's share of a
+    /// normal step. (CUDA's version queues them as normal; its stream is
+    /// in order anyway.)
+    pub fn run_each_timed(&self, steps: &[Step<'_>]) -> Vec<f64> {
+        steps
+            .iter()
+            .map(|s| self.run_launches(std::slice::from_ref(s)).1)
+            .collect()
+    }
+
     /// [`Gpu::run_all_timed`] where a step may launch fewer threadgroups
     /// than its plan along x and y: a kernel whose instances are
     /// independent (splits of a KV cache, say) run only as many as the

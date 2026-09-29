@@ -1,4 +1,4 @@
-//! What it costs Qwen3.5 to read a prompt.
+//! What it costs Qwen3.8 to read a prompt.
 //!
 //!     cargo run --release -p lex-rt --example prefill -- --tokens 512
 //!

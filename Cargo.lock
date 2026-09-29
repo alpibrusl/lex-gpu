@@ -124,6 +124,7 @@ version = "0.0.1"
 dependencies = [
  "half",
  "lex-ir",
+ "lex-msl",
 ]
 
 [[package]]
@@ -157,6 +158,7 @@ name = "lex-rt"
 version = "0.0.1"
 dependencies = [
  "half",
+ "lex-cuda",
  "lex-front",
  "lex-ir",
  "lex-metal",

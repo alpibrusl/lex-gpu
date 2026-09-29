@@ -15,7 +15,7 @@
 //! time prefill_s <s> decode_tok_s <tok/s> dispatches <n>
 //! ```
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn main() -> Result<(), String> {
     use std::time::Instant;
 
@@ -23,6 +23,11 @@ fn main() -> Result<(), String> {
     use lex_rt::llama::{Runner, Weights, log_softmax};
 
     let mut model = "llama3.2:1b".to_string();
+    // A GGUF straight off disk, skipping the Ollama manifest entirely.
+    // Ollama's store layout has moved between versions and each guess at
+    // it cost a rented GPU; `ollama show --modelfile` names the blob, so
+    // the caller can hand over the path and be right by construction.
+    let mut gguf: Option<String> = None;
     let mut ids: Vec<u32> = vec![];
     let (mut steps, mut top) = (16usize, 5usize);
     let mut args = std::env::args().skip(1);
@@ -30,6 +35,7 @@ fn main() -> Result<(), String> {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
             "--model" => model = val()?,
+            "--gguf" => gguf = Some(val()?),
             "--ids" => {
                 ids = val()?
                     .split(',')
@@ -44,7 +50,11 @@ fn main() -> Result<(), String> {
     if ids.is_empty() {
         return Err("--ids is required (comma-separated token ids)".into());
     }
-    let w = Weights::load(&ollama_model(&model)?, ids.len() + steps)?;
+    let path = match &gguf {
+        Some(p) => std::path::PathBuf::from(p),
+        None => ollama_model(&model)?,
+    };
+    let w = Weights::load(&path, ids.len() + steps)?;
     let mut rt = Runner::new(&w)?;
 
     let t0 = Instant::now();
@@ -75,7 +85,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn main() {
     eprintln!("generate needs a Metal device");
     std::process::exit(1);

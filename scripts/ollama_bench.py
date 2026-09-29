@@ -55,19 +55,38 @@ def main():
     ap.add_argument("--repeat", type=int, default=3, help="requests per context; the median is reported")
     ap.add_argument("--host", default="http://localhost:11434")
     ap.add_argument("--json", help="also write the results here")
+    # Random words are right for timing prefill -- they defeat the prompt
+    # cache -- and wrong for timing decode on a model that speculates.
+    # What the model writes after noise is more predictable than prose, so
+    # its draft head accepts more of it and the decode rate that comes
+    # back is of an easier text than anyone actually runs.
+    # `scripts/ollama_context.py --text-out` writes a matching passage.
+    ap.add_argument("--prompt-file", help="use this text as the prompt instead")
     a = ap.parse_args()
 
     rng = random.Random()
     # Load the model once so the first measurement is not a cold start.
     generate(a.host, a.model, "Hello", 4, 4096)
     rows = []
-    print(f"{a.model}: decode {a.steps} tokens after N tokens of prompt (median of {a.repeat})")
+    text, tokens_in_text = None, 1
+    if a.prompt_file:
+        text = open(a.prompt_file).read()
+        tokens_in_text = max(int(x) for x in a.contexts.split(","))
+    print(
+        f"{a.model}: decode {a.steps} tokens after N tokens of "
+        f"{'a real passage' if text else 'random words'} (median of {a.repeat})"
+    )
     print(f"  {'N (asked)':>9} {'N (real)':>9} {'decode tok/s':>13} {'prefill tok/s':>14}")
     for n in (int(x) for x in a.contexts.split(",")):
         runs = []
         for _ in range(a.repeat):
             # About 1.05 tokens per word (Llama 3); Ollama reports the real count.
-            prompt = " ".join(rng.choice(WORDS) for _ in range(max(1, int(n / 1.05))))
+            if text is not None:
+                # Characters in proportion to tokens; the real count comes
+                # back as `prompt_eval_count` and is what gets reported.
+                prompt = text[: max(1, int(n * len(text) / max(1, tokens_in_text)))]
+            else:
+                prompt = " ".join(rng.choice(WORDS) for _ in range(max(1, int(n / 1.05))))
             r = generate(a.host, a.model, prompt, a.steps, max(2048, n + a.steps + 64))
             runs.append(
                 (

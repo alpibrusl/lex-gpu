@@ -1,4 +1,4 @@
-"""Measure the acceptance rate of Qwen3.5's own multi-token-prediction head.
+"""Measure the acceptance rate of Qwen3.8's own multi-token-prediction head.
 
     cargo run --release -p lex-rt --example mtp_trace -- --steps 256
     python3 scripts/mtp_accept.py --trace mtp_trace.bin

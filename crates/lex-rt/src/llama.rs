@@ -24,7 +24,8 @@
 
 use std::path::Path;
 
-use lex_front::llama::{Split, split_q4_k, split_q6_k, split_q8_0};
+use lex_front::ir::Trits;
+use lex_front::llama::{Split, split_q4_k, split_q6_k, split_q8_0, split_ternary};
 
 use crate::gguf::{GgmlType, Gguf};
 
@@ -66,9 +67,11 @@ impl QMat {
             GgmlType::Q8_0 => split_q8_0(b),
             GgmlType::Q4_K => split_q4_k(b, t.dims[0]),
             GgmlType::Q6_K => split_q6_k(b),
+            GgmlType::PQ2_0 => split_ternary(b, Trits::Slots2),
+            GgmlType::PTQ1_0 => split_ternary(b, Trits::Dense),
             other => {
                 return Err(format!(
-                    "`{name}` is {other:?}; supported: Q8_0, Q4_K, Q6_K"
+                    "`{name}` is {other:?}; supported: Q8_0, Q4_K, Q6_K, PQ2_0, PTQ1_0"
                 ));
             }
         };
@@ -202,16 +205,17 @@ pub fn log_softmax(logits: &[f32]) -> Vec<f64> {
     logits.iter().map(|&x| x as f64 - lz).collect()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use gpu::{Attention, Runner};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gpu {
     use std::cell::RefCell;
     use std::collections::hash_map::Entry;
     use std::collections::{BTreeMap, HashMap};
     use std::time::Instant;
 
+    use crate::dev::{Buffer, Gpu, Pipeline, Step};
     use half::f16;
     use lex_front::flash::{COMBINE_CHUNK, FlashDecode};
     use lex_front::llama::{
@@ -220,8 +224,7 @@ mod gpu {
     };
     use lex_front::{Program, check};
     use lex_ir::{DType, Space, Target};
-    use lex_metal::{Buffer, Gpu, Pipeline, Step};
-    use lex_msl::program::lower;
+    use lex_msl::program::lower_with;
 
     use super::{Config, QMat, Weights};
 
@@ -286,7 +289,12 @@ mod gpu {
         Vec<&'a Buffer>,
         Option<[usize; 2]>,
     );
-    const BO: usize = 8;
+    /// Output rows a decode matvec gives one threadgroup, from the
+    /// target: Apple wants one row per simdgroup, Ada two. See
+    /// `Target::matvec_rows_per_simd` for the measurement.
+    fn bo(target: &Target) -> usize {
+        target.matvec_rows_per_simd * (THREADS / target.simd_width)
+    }
 
     fn compile(gpu: &Gpu, prog: &Program, threads: usize) -> Result<Pipeline, String> {
         let target: &Target = gpu.target();
@@ -294,7 +302,8 @@ mod gpu {
             let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
             format!("`{}` does not check:\n{}", prog.name, msgs.join("\n"))
         })?;
-        gpu.build_lowered(&lower(prog, target, threads)?)
+        crate::dev::dump_cuda(prog, threads);
+        gpu.build_lowered(&lower_with(prog, target, threads, crate::dev::dialect())?)
     }
 
     /// Which matvec pipeline a matrix needs: (cols, rows, layout, residual).
@@ -594,7 +603,10 @@ mod gpu {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(d)
             };
-            let (mv_bo, mv_threads) = (tune("LEX_MV_BO", BO), tune("LEX_MV_THREADS", THREADS));
+            let (mv_bo, mv_threads) = (
+                tune("LEX_MV_BO", bo(gpu.target())),
+                tune("LEX_MV_THREADS", THREADS),
+            );
             // Folding a norm into a matvec saves a dispatch the whole GPU
             // waits on, but costs every threadgroup a read of x and a
             // reduction. Measured on the M4 Max at 512 positions: the 8B
@@ -647,7 +659,7 @@ mod gpu {
                 rope_q: compile(&gpu, &rope(c.n_head, c.head_dim, DType::F16), THREADS)?,
                 rope_k: compile(&gpu, &rope(c.n_kv, c.head_dim, DType::F16), THREADS)?,
                 silu: compile(&gpu, &silu_mul(c.ffn, THREADS, DType::F32)?, THREADS)?,
-                glu: glu_pipelines(&gpu, w, 1, BO, fold.1.then_some(c.eps))?,
+                glu: glu_pipelines(&gpu, w, 1, bo(gpu.target()), fold.1.then_some(c.eps))?,
                 rms_mv: rms_mv_pipelines(&gpu, w, mv_bo, mv_threads)?,
                 fold,
             };

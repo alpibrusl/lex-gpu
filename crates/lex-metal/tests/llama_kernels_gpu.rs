@@ -46,6 +46,8 @@ fn download(gpu: &Gpu, b: &Buffer, t: &Tensor) -> Vec<f32> {
 }
 
 /// Run `prog` on the GPU and in the interpreter; compare output `out`.
+/// Returns what the GPU produced, for callers that have a second opinion
+/// to check it against.
 fn same(
     gpu: &Gpu,
     prog: &Program,
@@ -53,7 +55,7 @@ fn same(
     scalars: &[u32],
     out: usize,
     threads: usize,
-) {
+) -> Vec<f32> {
     check(prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{}: {e:#?}", prog.name));
     let pipe = gpu
         .build_lowered(&lower(prog, gpu.target(), threads).expect("lower"))
@@ -93,6 +95,7 @@ fn same(
         "{}: GPU vs interpreter max abs err {abs:e} on outputs up to {scale:e} (tolerance {tol:e})",
         prog.name
     );
+    got
 }
 
 #[test]
@@ -223,6 +226,53 @@ fn matvec_every_layout_matches_the_interpreter() {
                 }
             }
         }
+    }
+}
+
+/// A blockwise Hadamard, on the GPU, against the interpreter.
+///
+/// The butterfly reads its partner at `e ^ stride`, which on a GPU means
+/// an element another thread owns. The interpreter has no threads and
+/// cannot tell whether that read is wired up, so this is the test that
+/// says the emitted code does what the op means.
+///
+/// The shape is the one Bonsai 2 needs: 1024-wide blocks inside a wider
+/// row, which is also the case where `e ^ stride` has to stay inside its
+/// own block rather than wandering into the neighbour's.
+#[test]
+fn a_blockwise_hadamard_matches_the_interpreter() {
+    use lex_front::ir::{Arg, Builder, IdxExpr, Op, TileTy, View};
+    use lex_ir::Space;
+
+    let gpu = Gpu::open().expect("metal device");
+    for (cols, width) in [(1024usize, 1024usize), (2048, 1024), (256, 256)] {
+        let mut b = Builder::new(&format!("hadamard_{cols}_w{width}"));
+        let px = b.param("x", DType::F32, &[1, cols], false);
+        let py = b.param("y", DType::F32, &[1, cols], true);
+        let v = |p| View {
+            param: p,
+            offset: vec![IdxExpr::lit(0), IdxExpr::lit(0)],
+            shape: vec![1, cols],
+        };
+        let ty = TileTy::new(DType::F32, &[1, cols], Space::Reg);
+        let mut x = b.op("x", Op::Load(v(px), ty));
+        let mut stride = 1;
+        while stride < width {
+            x = b.op("h", Op::Butterfly(Arg::Move(x), stride));
+            stride *= 2;
+        }
+        b.effect(Op::Store(Arg::Move(x), v(py)));
+        same(
+            &gpu,
+            &b.finish(),
+            vec![
+                Tensor::new(DType::F32, &[1, cols], &pattern(cols, 5)),
+                Tensor::zeros(DType::F32, &[1, cols]),
+            ],
+            &[],
+            1,
+            256,
+        );
     }
 }
 
@@ -415,7 +465,7 @@ fn split_kv_attention_matches_the_interpreter() {
     }
 }
 
-/// Qwen3.5's attention prologue at the model's shape: 24 query heads of
+/// Qwen3.8's attention prologue at the model's shape: 24 query heads of
 /// 256, a rotated quarter, and f16 out for the attention kernel.
 #[test]
 fn qwen_qk_rope_matches_the_interpreter() {
@@ -459,7 +509,7 @@ fn qwen_qk_rope_matches_the_interpreter() {
     );
 }
 
-/// Qwen3.5's gates and its depthwise convolution, at the model's shapes.
+/// Qwen3.8's gates and its depthwise convolution, at the model's shapes.
 #[test]
 fn delta_gates_and_conv_match_the_interpreter() {
     use lex_front::qwen::{build_conv_silu, build_gates};
@@ -509,7 +559,7 @@ fn delta_gates_and_conv_match_the_interpreter() {
     }
 }
 
-/// Qwen3.5's gated-delta state update, at the model's own shape.
+/// Qwen3.8's gated-delta state update, at the model's own shape.
 #[test]
 fn delta_state_matches_the_interpreter() {
     use lex_front::qwen::DeltaNet;
@@ -575,7 +625,7 @@ fn delta_state_matches_the_interpreter() {
     }
 }
 
-/// NVFP4 (Qwen3.5's MLX weights): E2M1 codes two per byte, an FP8 E4M3
+/// NVFP4 (Qwen3.8's MLX weights): E2M1 codes two per byte, an FP8 E4M3
 /// scale per 16, one f32 scale per tensor held per row.
 #[test]
 fn nvfp4_matvec_matches_the_interpreter() {
@@ -703,5 +753,135 @@ fn batched_kernels_match_the_interpreter() {
         &[pos0 as u32, (pos0 + t).div_ceil(16) as u32],
         3,
         128,
+    );
+}
+
+/// Bonsai 2's ternary weights, on the GPU, from real blocks of the shipped
+/// file. `PTQ1_0`'s layout was derived rather than documented (see
+/// `docs/ternary.md`), so the emitted kernel is checked against the
+/// interpreter *and* against the other packing of the very same weights --
+/// the one whose layout is public.
+#[test]
+fn ternary_weights_match_the_interpreter_and_each_other() {
+    use lex_front::ir::{Arg, Builder, IdxExpr, Op, TileTy, Trits, View};
+    use lex_ir::Space;
+
+    const BLOCKS: usize = 64;
+    const GROUP: usize = 128;
+    const FIX: &[u8] = include_bytes!("../../lex-front/tests/data/bonsai_blocks.bin");
+
+    let gpu = Gpu::open().expect("metal device");
+    let cols = BLOCKS * GROUP;
+    let mut both = vec![];
+    for trits in [Trits::Dense, Trits::Slots2] {
+        let nb = BLOCKS * trits.bytes();
+        let mut b = Builder::new(&format!("ternary_{trits:?}"));
+        let pq = b.param("q", DType::I8, &[1, nb], false);
+        let ps = b.param("s", DType::F32, &[1, BLOCKS], false);
+        let py = b.param("y", DType::F32, &[1, cols], true);
+        let view = |p, n| View {
+            param: p,
+            offset: vec![IdxExpr::lit(0), IdxExpr::lit(0)],
+            shape: vec![1, n],
+        };
+        let q = b.op(
+            "q",
+            Op::Load(view(pq, nb), TileTy::new(DType::I8, &[1, nb], Space::Reg)),
+        );
+        let s = b.op(
+            "s",
+            Op::Load(
+                view(ps, BLOCKS),
+                TileTy::new(DType::F32, &[1, BLOCKS], Space::Reg),
+            ),
+        );
+        let w = b.op(
+            "w",
+            Op::DequantTernary(Arg::Move(q), Arg::Move(s), GROUP, trits),
+        );
+        b.effect(Op::Store(Arg::Move(w), view(py, cols)));
+
+        let (mut codes, mut scales) = (vec![], vec![]);
+        for i in 0..BLOCKS {
+            let (c, d) = match trits {
+                Trits::Dense => (
+                    &FIX[i * 28..i * 28 + 26],
+                    [FIX[i * 28 + 26], FIX[i * 28 + 27]],
+                ),
+                Trits::Slots2 => {
+                    let o = 28 * BLOCKS + i * 34;
+                    (&FIX[o + 2..o + 34], [FIX[o], FIX[o + 1]])
+                }
+            };
+            codes.extend(c.iter().map(|&x| x as i8 as f32));
+            scales.push(half::f16::from_le_bytes(d).to_f32());
+        }
+        let out = same(
+            &gpu,
+            &b.finish(),
+            vec![
+                Tensor::new(DType::I8, &[1, nb], &codes),
+                Tensor::new(DType::F32, &[1, BLOCKS], &scales),
+                Tensor::zeros(DType::F32, &[1, cols]),
+            ],
+            &[],
+            2,
+            256,
+        );
+        both.push(out);
+    }
+    assert_eq!(
+        both[0], both[1],
+        "the two packings of the same weights disagree on the GPU"
+    );
+    assert!(
+        both[0].iter().any(|&x| x != 0.0),
+        "all-zero weights would make the comparison vacuous"
+    );
+}
+
+/// A whole matvec against ternary weights, through the loader's own
+/// splitter: the fixture bytes go in exactly as the GGUF file holds them.
+/// This is the path a Bonsai 2 layer takes, and the last place a wrong
+/// stride would still be invisible.
+#[test]
+fn ternary_matvec_matches_the_interpreter_and_the_other_packing() {
+    use lex_front::ir::Trits;
+    use lex_front::llama::split_ternary;
+
+    const BLOCKS: usize = 64;
+    const FIX: &[u8] = include_bytes!("../../lex-front/tests/data/bonsai_blocks.bin");
+
+    let gpu = Gpu::open().expect("metal device");
+    // 64 blocks of 128 is exactly an 8 x 1024 matrix.
+    let (n_in, n_out) = (1024usize, 8usize);
+    let x = pattern(n_in, 21);
+    let mut outs = vec![];
+    for (trits, bytes) in [
+        (Trits::Dense, &FIX[..28 * BLOCKS]),
+        (Trits::Slots2, &FIX[28 * BLOCKS..]),
+    ] {
+        let sp = split_ternary(bytes, trits);
+        let layout = sp.layout;
+        let mut t = vec![Tensor::new(DType::F32, &[1, n_in], &x)];
+        t.extend(sp.weight_tensors(n_out));
+        t.push(Tensor::zeros(DType::F32, &[1, n_out]));
+        let out = t.len() - 1;
+        let p = matvec_q(n_in, n_out, n_out, n_in, layout, false).expect("build");
+        outs.push(same(&gpu, &p, t, &[], out, 256));
+    }
+    let worst = outs[0]
+        .iter()
+        .zip(&outs[1])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let scale = outs[0].iter().map(|v| v.abs()).fold(1e-6f32, f32::max);
+    assert!(
+        worst / scale < 1e-6,
+        "the two packings of one matrix give different products: {worst:e} on {scale:e}"
+    );
+    assert!(
+        scale > 1e-3,
+        "products all near zero; comparison is vacuous"
     );
 }

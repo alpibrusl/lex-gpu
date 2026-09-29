@@ -1,0 +1,27 @@
+// a = silu(g) * u, elementwise, where silu(g) = g * sigmoid(g).
+//
+// The second kernel in the surface, and the one that says whether the
+// first was a coincidence. It is here for the grid: the algorithm below
+// is written as though it saw the whole tensor, and the cut into pieces
+// is in the schedule, because "how many elements does one instance own"
+// is a fact about a machine and not about what silu means.
+//
+// The name is spelled out rather than built from constants, because the
+// Rust it is checked against appends the output dtype and this surface
+// has no way to say that yet. A fixture may be concrete; the generic
+// path is what rmsnorm.lx demonstrates.
+
+algo silu_mul_16384_f32
+  in  g: f32[1, 16384]
+  in  u: f32[1, 16384]
+  out y: f32[1, 16384]
+{
+  let g  = load g
+  let u  = load u
+  let sg = sigmoid &g
+  let a  = g * sg
+  store a * u -> y
+}
+
+schedule silu_mul_16384_f32 for apple-m-series { threads 256, chunk 256 }
+schedule silu_mul_16384_f32 for nvidia-ada     { threads 256, chunk 256 }

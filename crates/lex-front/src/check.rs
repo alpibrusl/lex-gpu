@@ -713,6 +713,32 @@ impl Checker<'_> {
                 }
                 Some(reg(t.dtype, &t.shape))
             }
+            Op::Butterfly(a, stride) => {
+                let ty = self.args(&[*a])?.remove(0);
+                let t = self.tile(ty, "butterfly operand")?;
+                let n = t.shape.last().copied().unwrap_or(0);
+                // A stage pairs `i` with `i + stride`, so the width must
+                // be a whole number of `2 * stride` blocks or the last
+                // block has partners that do not exist.
+                if *stride == 0 || !stride.is_power_of_two() {
+                    self.err(
+                        Kind::Shape,
+                        format!("butterfly stride {stride} is not a power of two"),
+                    );
+                    return None;
+                }
+                if !n.is_multiple_of(2 * stride) {
+                    self.err(
+                        Kind::Shape,
+                        format!(
+                            "butterfly at stride {stride} needs a multiple of {} , not {n}",
+                            2 * stride
+                        ),
+                    );
+                    return None;
+                }
+                Some(reg(t.dtype, &t.shape))
+            }
             Op::Dequant(q, s, m, group) | Op::Dequant4(q, s, m, group, _) => {
                 let pairs = matches!(op, Op::Dequant4(.., crate::ir::Nibbles::Pairs));
                 let mut ops = vec![*q, *s];
@@ -796,6 +822,34 @@ impl Checker<'_> {
                             "nvfp4 of {:?} values with scales {:?} and row scales {:?} in groups \
                              of {group}",
                             tq.shape, ts.shape, tg.shape
+                        ),
+                    );
+                    return None;
+                }
+                Some(reg(DType::F32, &[r, c]))
+            }
+            Op::DequantTernary(q, sc, group, trits) => {
+                let tys = self.args(&[*q, *sc])?;
+                let tq = self.tile(tys[0].clone(), "ternary codes")?;
+                let ts = self.tile(tys[1].clone(), "ternary scales")?;
+                if tq.dtype != DType::I8 {
+                    self.err(Kind::Type, "ternary codes must be I8".into());
+                    return None;
+                }
+                let r = tq.shape.first().copied().unwrap_or(0);
+                let bytes = tq.shape.get(1).copied().unwrap_or(0);
+                let groups = bytes / trits.bytes();
+                let c = groups * *group;
+                let ok = tq.shape.len() == 2
+                    && *group == 128
+                    && bytes.is_multiple_of(trits.bytes())
+                    && ts.shape == [r, groups];
+                if !ok {
+                    self.err(
+                        Kind::Shape,
+                        format!(
+                            "ternary of {:?} bytes with scales {:?} in groups of {group}",
+                            tq.shape, ts.shape
                         ),
                     );
                     return None;

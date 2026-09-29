@@ -26,7 +26,9 @@
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::ptr;
+use std::time::Instant;
 
+use lex_ir::{Kernel, Plan, Target};
 use lex_msl::program::Lowered;
 
 type CUresult = c_int;
@@ -36,6 +38,7 @@ type CUmodule = *mut c_void;
 type CUfunction = *mut c_void;
 type CUdeviceptr = u64;
 type CUstream = *mut c_void;
+type CUevent = *mut c_void;
 type NvrtcResult = c_int;
 type NvrtcProgram = *mut c_void;
 
@@ -106,6 +109,7 @@ api!(struct Driver {
     fn cuDeviceGetAttribute(*mut c_int, c_int, CUdevice) -> CUresult;
     fn cuCtxCreate_v2(*mut CUcontext, c_uint, CUdevice) -> CUresult;
     fn cuModuleLoadData(*mut CUmodule, *const c_void) -> CUresult;
+    fn cuModuleUnload(CUmodule) -> CUresult;
     fn cuModuleGetFunction(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
     fn cuMemAlloc_v2(*mut CUdeviceptr, usize) -> CUresult;
     fn cuMemFree_v2(CUdeviceptr) -> CUresult;
@@ -113,11 +117,16 @@ api!(struct Driver {
     fn cuMemcpyHtoD_v2(CUdeviceptr, *const c_void, usize) -> CUresult;
     fn cuMemcpyDtoH_v2(*mut c_void, CUdeviceptr, usize) -> CUresult;
     fn cuCtxSynchronize() -> CUresult;
+    fn cuDeviceTotalMem_v2(*mut usize, CUdevice) -> CUresult;
     fn cuGetErrorString(CUresult, *mut *const c_char) -> CUresult;
     fn cuLaunchKernel(
         CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint,
         c_uint, CUstream, *mut *mut c_void, *mut *mut c_void,
     ) -> CUresult;
+    fn cuEventCreate(*mut CUevent, c_uint) -> CUresult;
+    fn cuEventRecord(CUevent, CUstream) -> CUresult;
+    fn cuEventElapsedTime(*mut f32, CUevent, CUevent) -> CUresult;
+    fn cuEventDestroy_v2(CUevent) -> CUresult;
 });
 
 api!(pub struct Nvrtc {
@@ -135,6 +144,12 @@ api!(pub struct Nvrtc {
 /// Compute capability major/minor, as `-arch=compute_XY` wants it.
 const ATTR_CC_MAJOR: c_int = 75;
 const ATTR_CC_MINOR: c_int = 76;
+/// CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK. The static limit, not
+/// the opt-in one: the emitter declares `__shared__` arrays, and reaching
+/// past 48 KiB needs a dynamic allocation and a host-side opt-in it does
+/// not do. `Target::nvidia_ada` reports what the *machine* allows; this is
+/// what this backend can currently ask for.
+const ATTR_MAX_SHARED_PER_BLOCK: c_int = 8;
 
 fn check(d: &Driver, r: CUresult, what: &str) -> Result<(), String> {
     if r == 0 {
@@ -265,9 +280,34 @@ pub struct Pipeline {
     grid: (c_uint, c_uint),
     threads: c_uint,
     shared: c_uint,
-    /// Kept alive: the function borrows the module.
-    _module: CUmodule,
+    /// Kept alive while the pipeline is, and unloaded with it: the
+    /// function borrows the module. Without the unload every compiled
+    /// kernel stayed resident for the life of the process, and a test suite
+    /// that loads the model once per test ran the device out of memory.
+    module: CUmodule,
+    unload: unsafe extern "C" fn(CUmodule) -> CUresult,
 }
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (self.unload)(self.module);
+        }
+    }
+}
+
+/// What `lex-metal` reports under the same name, so a runtime written
+/// against one reads the other without knowing which it has.
+pub struct DeviceInfo {
+    pub name: String,
+    pub unified_memory: bool,
+    pub max_threadgroup_bytes: usize,
+    pub recommended_working_set_bytes: u64,
+}
+
+/// One dispatch of a batch: pipeline, buffers, and optionally fewer blocks
+/// (x, y) than the pipeline was lowered for.
+pub type Step<'a> = (&'a Pipeline, &'a [&'a Buffer], Option<[usize; 2]>);
 
 pub struct Gpu {
     cu: Driver,
@@ -276,6 +316,7 @@ pub struct Gpu {
     _ctx: CUcontext,
     name: String,
     arch: String,
+    target: Target,
 }
 
 impl Gpu {
@@ -318,6 +359,14 @@ impl Gpu {
                 _ctx: ctx,
                 name,
                 arch: format!("compute_{major}{minor}"),
+                // Hopper's split barriers and TMA are a different lowering
+                // from Ada's `cp.async`, so this picks by what the device
+                // reports rather than defaulting to the newer one.
+                target: if major >= 9 {
+                    Target::nvidia_hopper()
+                } else {
+                    Target::nvidia_ada()
+                },
             })
         }
     }
@@ -335,6 +384,57 @@ impl Gpu {
         self.dev
     }
 
+    /// The target the emitter lowers for on this machine.
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    pub fn info(&self) -> DeviceInfo {
+        let attr = |a: c_int| -> usize {
+            let mut v: c_int = 0;
+            unsafe {
+                check(
+                    &self.cu,
+                    (self.cu.cuDeviceGetAttribute)(&mut v, a, self.dev),
+                    "attr",
+                )
+                .expect("device attribute");
+            }
+            v as usize
+        };
+        let mut total: usize = 0;
+        unsafe {
+            check(
+                &self.cu,
+                (self.cu.cuDeviceTotalMem_v2)(&mut total, self.dev),
+                "cuDeviceTotalMem",
+            )
+            .expect("total memory");
+        }
+        DeviceInfo {
+            name: self.name.clone(),
+            // Discrete: the weights are staged across PCIe, which is the
+            // one assumption a Mac-shaped runtime is most likely to have
+            // baked in without noticing.
+            unified_memory: false,
+            max_threadgroup_bytes: attr(ATTR_MAX_SHARED_PER_BLOCK),
+            // No "recommended" figure exists here as it does on Metal, so
+            // this is the whole device. Anything sizing a cache off it is
+            // budgeting against a number with no headroom in it.
+            recommended_working_set_bytes: total as u64,
+        }
+    }
+
+    /// Emit CUDA for `kernel` under `plan`, compile it, and return the
+    /// pipeline -- [`lex_metal::Gpu::build`]'s counterpart.
+    pub fn build(&self, kernel: &Kernel, plan: &Plan) -> Result<Pipeline, String> {
+        let source = crate::emit(kernel, plan, &self.target);
+        let ptx = compile_ptx(&self.rtc, &source, &kernel.name, &self.arch)?;
+        let [gx, gy, _] = plan.launch.threadgroups;
+        let [tx, _, _] = plan.launch.threads_per_threadgroup;
+        self.module(&ptx, &kernel.name, (gx, gy), tx)
+    }
+
     /// Compile emitted CUDA for *this* device and take its entry point.
     ///
     /// NVRTC targets the device actually present rather than a fixed
@@ -342,6 +442,30 @@ impl Gpu {
     /// emitted source runs on whatever the machine has.
     pub fn build_lowered(&self, lowered: &Lowered) -> Result<Pipeline, String> {
         let ptx = compile_ptx(&self.rtc, &lowered.source, &lowered.entry, &self.arch)?;
+        self.module(
+            &ptx,
+            &lowered.entry,
+            (lowered.grid, lowered.grid2.max(1)),
+            lowered.threads,
+        )
+    }
+
+    /// Load PTX and take its entry point.
+    ///
+    /// No dynamic shared memory. Both emitters declare every threadgroup
+    /// array statically (`__shared__ float scratch[..]`), so a byte count
+    /// passed at launch as well was reserved *on top* of those arrays and
+    /// never used: each kernel held its shared memory twice, which for the
+    /// ones with real tiles -- attention, the GEMM -- halves how many of
+    /// them fit on an SM.
+    fn module(
+        &self,
+        ptx: &[u8],
+        entry: &str,
+        grid: (usize, usize),
+        threads: usize,
+    ) -> Result<Pipeline, String> {
+        let shared = 0usize;
         unsafe {
             let mut module: CUmodule = ptr::null_mut();
             check(
@@ -349,19 +473,20 @@ impl Gpu {
                 (self.cu.cuModuleLoadData)(&mut module, ptx.as_ptr().cast()),
                 "cuModuleLoadData",
             )?;
-            let entry = CString::new(lowered.entry.as_str()).map_err(|e| e.to_string())?;
+            let name = CString::new(entry).map_err(|e| e.to_string())?;
             let mut f: CUfunction = ptr::null_mut();
             check(
                 &self.cu,
-                (self.cu.cuModuleGetFunction)(&mut f, module, entry.as_ptr()),
+                (self.cu.cuModuleGetFunction)(&mut f, module, name.as_ptr()),
                 "cuModuleGetFunction",
             )?;
             Ok(Pipeline {
                 f,
-                grid: (lowered.grid as c_uint, lowered.grid2.max(1) as c_uint),
-                threads: lowered.threads as c_uint,
-                shared: lowered.threadgroup_bytes as c_uint,
-                _module: module,
+                grid: (grid.0 as c_uint, grid.1.max(1) as c_uint),
+                threads: threads as c_uint,
+                shared: shared as c_uint,
+                module,
+                unload: self.cu.cuModuleUnload,
             })
         }
     }
@@ -440,6 +565,176 @@ impl Gpu {
                 "cuMemcpyDtoH",
             )
             .expect("download");
+        }
+    }
+
+    pub fn download_at<T: Copy>(&self, buf: &Buffer, offset: usize, out: &mut [T]) {
+        let sz = std::mem::size_of::<T>();
+        let bytes = std::mem::size_of_val(out);
+        assert!(
+            offset * sz + bytes <= buf.bytes,
+            "read of {bytes} B at {} B from {} B",
+            offset * sz,
+            buf.bytes
+        );
+        unsafe {
+            check(&self.cu, (self.cu.cuCtxSynchronize)(), "cuCtxSynchronize").expect("sync");
+            check(
+                &self.cu,
+                (self.cu.cuMemcpyDtoH_v2)(
+                    out.as_mut_ptr().cast(),
+                    buf.ptr + (offset * sz) as u64,
+                    bytes,
+                ),
+                "cuMemcpyDtoH",
+            )
+            .expect("download");
+        }
+    }
+
+    /// Run a sequence of dispatches and wait once.
+    ///
+    /// Metal needs an explicit barrier between a write and a dependent
+    /// read because its encoder is concurrent. The default CUDA stream
+    /// orders its launches, so correctness here is free and the
+    /// *overlap* is what is missing: independent kernels that share the
+    /// GPU on Metal run one after another here. Fixing that means several
+    /// streams and events, and it should be done against a measurement
+    /// rather than on principle.
+    pub fn run_all(&self, steps: &[(&Pipeline, &[&Buffer])]) {
+        let with: Vec<Step<'_>> = steps.iter().map(|&(p, b)| (p, b, None)).collect();
+        self.run_launches(&with);
+    }
+
+    /// [`Gpu::run_all`] where a step may launch fewer blocks than it was
+    /// lowered for. Launching more than planned is refused, as on Metal.
+    ///
+    /// Returns (CPU seconds spent launching, wall seconds to the sync).
+    /// The second is *not* Metal's device-timed figure: it is the wall
+    /// clock around one `cuCtxSynchronize`, so it includes the launch
+    /// overhead and is only comparable to itself.
+    pub fn run_launches(&self, steps: &[Step<'_>]) -> (f64, f64) {
+        let t0 = Instant::now();
+        for &(p, buffers, groups) in steps {
+            let (gx, gy) = match groups {
+                None => (p.grid.0, p.grid.1),
+                Some([x, y]) => {
+                    assert!(
+                        x as c_uint <= p.grid.0 && y as c_uint <= p.grid.1,
+                        "launch of {x}x{y} over a plan of {}x{}",
+                        p.grid.0,
+                        p.grid.1
+                    );
+                    (x as c_uint, y as c_uint)
+                }
+            };
+            self.launch(p, buffers, gx, gy).expect("cuLaunchKernel");
+        }
+        let cpu = t0.elapsed().as_secs_f64();
+        unsafe {
+            check(&self.cu, (self.cu.cuCtxSynchronize)(), "cuCtxSynchronize").expect("sync");
+        }
+        (cpu, t0.elapsed().as_secs_f64())
+    }
+
+    /// Run `steps` in order and return each one's GPU time, in seconds.
+    ///
+    /// An event goes on the stream before the first launch and after each
+    /// one, and nothing waits until the end, so the launches queue exactly
+    /// as in [`Gpu::run_launches`] -- unlike synchronising after each,
+    /// which idles the GPU for a host round trip per kernel and was
+    /// measured to make per-kernel times sum to twice the real step. On one
+    /// in-order stream the interval between two events is the kernel
+    /// between them plus any time the GPU waited for the host to launch it,
+    /// and that wait is a real cost of the normal path too.
+    pub fn run_each_timed(&self, steps: &[Step<'_>]) -> Vec<f64> {
+        let d = &self.cu;
+        let mut ev: Vec<CUevent> = vec![ptr::null_mut(); steps.len() + 1];
+        unsafe {
+            for e in &mut ev {
+                check(d, (d.cuEventCreate)(e, 0), "cuEventCreate").expect("event");
+            }
+            check(
+                d,
+                (d.cuEventRecord)(ev[0], ptr::null_mut()),
+                "cuEventRecord",
+            )
+            .expect("record");
+        }
+        for (i, &(p, buffers, groups)) in steps.iter().enumerate() {
+            let (gx, gy) = match groups {
+                None => (p.grid.0, p.grid.1),
+                Some([x, y]) => {
+                    assert!(
+                        x as c_uint <= p.grid.0 && y as c_uint <= p.grid.1,
+                        "launch of {x}x{y} over a plan of {}x{}",
+                        p.grid.0,
+                        p.grid.1
+                    );
+                    (x as c_uint, y as c_uint)
+                }
+            };
+            self.launch(p, buffers, gx, gy).expect("cuLaunchKernel");
+            unsafe {
+                check(
+                    d,
+                    (d.cuEventRecord)(ev[i + 1], ptr::null_mut()),
+                    "cuEventRecord",
+                )
+                .expect("record");
+            }
+        }
+        let mut out = Vec::with_capacity(steps.len());
+        unsafe {
+            check(d, (d.cuCtxSynchronize)(), "cuCtxSynchronize").expect("sync");
+            for w in ev.windows(2) {
+                let mut ms = 0f32;
+                check(
+                    d,
+                    (d.cuEventElapsedTime)(&mut ms, w[0], w[1]),
+                    "cuEventElapsedTime",
+                )
+                .expect("elapsed");
+                out.push(ms as f64 / 1e3);
+            }
+            for e in ev {
+                (d.cuEventDestroy_v2)(e);
+            }
+        }
+        out
+    }
+
+    /// One launch, no synchronise.
+    fn launch(
+        &self,
+        p: &Pipeline,
+        buffers: &[&Buffer],
+        gx: c_uint,
+        gy: c_uint,
+    ) -> Result<(), String> {
+        let mut ptrs: Vec<CUdeviceptr> = buffers.iter().map(|b| b.ptr).collect();
+        let mut params: Vec<*mut c_void> = ptrs
+            .iter_mut()
+            .map(|p| (p as *mut CUdeviceptr).cast())
+            .collect();
+        unsafe {
+            check(
+                &self.cu,
+                (self.cu.cuLaunchKernel)(
+                    p.f,
+                    gx,
+                    gy,
+                    1,
+                    p.threads,
+                    1,
+                    1,
+                    p.shared,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "cuLaunchKernel",
+            )
         }
     }
 

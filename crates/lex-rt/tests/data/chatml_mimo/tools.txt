@@ -1,0 +1,8 @@
+<|im_start|>system
+You are provided with the following tools:
+
+<tools>
+{"type": "function", "function": {"name": "add", "description": "Add two numbers.", "parameters": {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}, "required": ["a", "b"]}}}
+</tools><|im_end|><|im_start|>user
+What is 17 + 25?<|im_end|><|im_start|>assistant
+<think>

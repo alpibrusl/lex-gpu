@@ -123,6 +123,16 @@ fn op(p: &Program, o: &Op) -> String {
             arg(p, *s)
         ),
         Op::SwapPairs(a) => format!("swap_pairs {}", arg(p, *a)),
+        Op::Butterfly(a, s) => format!("butterfly.{s} {}", arg(p, *a)),
+        Op::DequantTernary(q, s, g, t) => format!(
+            "dequant_ternary.{} {}, {} group {g}",
+            match t {
+                crate::ir::Trits::Slots2 => "slots2",
+                crate::ir::Trits::Dense => "dense",
+            },
+            arg(p, *q),
+            arg(p, *s)
+        ),
         Op::DequantFp4(q, s, gs, g) => format!(
             "dequant_fp4 {}, {}, row {} group {g}",
             arg(p, *q),

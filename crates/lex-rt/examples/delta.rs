@@ -1,4 +1,4 @@
-//! Throughput of Qwen3.5's gated-delta state update.
+//! Throughput of Qwen3.8's gated-delta state update.
 //!
 //! Each of the model's 48 linear-attention layers reads and writes a
 //! 3 MB state once per token, so a step moves ~288 MB through this kernel
@@ -17,7 +17,7 @@ fn main() -> Result<(), String> {
     let (hv, dk, dv) = (48usize, 128usize, 128usize);
     let layers = 48;
     println!(
-        "{}: Qwen3.5 gated delta, {hv} heads of {dv}x{dk}",
+        "{}: Qwen3.8 gated delta, {hv} heads of {dv}x{dk}",
         gpu.info().name
     );
     println!(

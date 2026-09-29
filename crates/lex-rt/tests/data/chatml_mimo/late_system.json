@@ -1,0 +1,16 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "hi"
+    },
+    {
+      "role": "system",
+      "content": "Now be brief."
+    },
+    {
+      "role": "user",
+      "content": "again"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "one "
+        },
+        {
+          "type": "text",
+          "text": "two"
+        }
+      ]
+    }
+  ]
+}

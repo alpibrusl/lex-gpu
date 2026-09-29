@@ -41,9 +41,15 @@ impl Value {
 pub enum GgmlType {
     F32,
     F16,
+    BF16,
     Q8_0,
     Q4_K,
     Q6_K,
+    /// Prism's ternary types, which are not in ggml: 128 values per block
+    /// against one f16 scale, codes in 2-bit slots or densely packed.
+    /// See `docs/ternary.md`.
+    PQ2_0,
+    PTQ1_0,
     Other(u32),
 }
 
@@ -52,9 +58,12 @@ impl GgmlType {
         match id {
             0 => GgmlType::F32,
             1 => GgmlType::F16,
+            30 => GgmlType::BF16,
             8 => GgmlType::Q8_0,
             12 => GgmlType::Q4_K,
             14 => GgmlType::Q6_K,
+            142 => GgmlType::PQ2_0,
+            143 => GgmlType::PTQ1_0,
             x => GgmlType::Other(x),
         }
     }
@@ -64,9 +73,12 @@ impl GgmlType {
         match self {
             GgmlType::F32 => Some((1, 4)),
             GgmlType::F16 => Some((1, 2)),
+            GgmlType::BF16 => Some((1, 2)),
             GgmlType::Q8_0 => Some((32, 34)),
             GgmlType::Q4_K => Some((256, 144)),
             GgmlType::Q6_K => Some((256, 210)),
+            GgmlType::PQ2_0 => Some((128, 34)),
+            GgmlType::PTQ1_0 => Some((128, 28)),
             GgmlType::Other(_) => None,
         }
     }
@@ -94,6 +106,10 @@ pub struct Gguf {
     data: usize,
 }
 
+/// What running off the end of the bytes reads as; `open_header` grows
+/// its prefix on exactly this and on nothing else.
+const TRUNCATED: &str = "truncated GGUF file";
+
 struct Cursor<'a> {
     b: &'a [u8],
     pos: usize,
@@ -101,10 +117,7 @@ struct Cursor<'a> {
 
 impl Cursor<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8], String> {
-        let s = self
-            .b
-            .get(self.pos..self.pos + n)
-            .ok_or("truncated GGUF file")?;
+        let s = self.b.get(self.pos..self.pos + n).ok_or(TRUNCATED)?;
         self.pos += n;
         Ok(s)
     }
@@ -158,6 +171,35 @@ impl Cursor<'_> {
 impl Gguf {
     pub fn open(path: &Path) -> Result<Gguf, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Gguf::parse(path, bytes)
+    }
+
+    /// The metadata and the tensor directory, without the tensors.
+    ///
+    /// A tokenizer needs only the header -- tens of megabytes of vocabulary
+    /// and merges -- and `open` reads the whole file, 5.6 GB for MiMo, on
+    /// top of the runtime reading it again. This reads a prefix and grows
+    /// it until the header fits. `raw` then fails for every tensor, which
+    /// is the honest answer for a file that was not read.
+    pub fn open_header(path: &Path) -> Result<Gguf, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let io = |e: std::io::Error| format!("{}: {e}", path.display());
+        let mut f = std::fs::File::open(path).map_err(io)?;
+        let len = f.metadata().map_err(io)?.len() as usize;
+        let mut want = 32usize << 20;
+        loop {
+            let n = want.min(len);
+            let mut bytes = vec![0u8; n];
+            f.seek(SeekFrom::Start(0)).map_err(io)?;
+            f.read_exact(&mut bytes).map_err(io)?;
+            match Gguf::parse(path, bytes) {
+                Err(e) if e == TRUNCATED && n < len => want *= 2,
+                other => return other,
+            }
+        }
+    }
+
+    fn parse(path: &Path, bytes: Vec<u8>) -> Result<Gguf, String> {
         let mut c = Cursor { b: &bytes, pos: 0 };
         if c.take(4)? != b"GGUF" {
             return Err(format!("{} is not a GGUF file", path.display()));
@@ -245,22 +287,79 @@ impl Gguf {
     }
 }
 
+/// What `ollama_model` says about a tag it found that is not a GGUF.
+const NO_GGUF_LAYER: &str = "has no GGUF model layer";
+
+/// `ollama_model`, telling "not a GGUF" apart from "not found": `Ok(None)`
+/// is a manifest with no GGUF layer -- an MLX checkpoint, say -- which the
+/// caller should read some other way, not an error to report.
+pub fn gguf_path(tag: &str) -> Result<Option<PathBuf>, String> {
+    match ollama_model(tag) {
+        Ok(p) => Ok(Some(p)),
+        Err(e) if e.ends_with(NO_GGUF_LAYER) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The GGUF blob behind an Ollama model tag such as `llama3.2:1b`, found
 /// through Ollama's manifest (`$OLLAMA_MODELS`, else `~/.ollama/models`).
 pub fn ollama_model(tag: &str) -> Result<PathBuf, String> {
-    let root = std::env::var_os("OLLAMA_MODELS")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".ollama/models")))
-        .ok_or("cannot locate the Ollama model store")?;
+    // Where a store might be, in the order worth trying. On Linux the
+    // installer creates an `ollama` system user and the service keeps its
+    // blobs under that user's home, so `ollama pull` as yourself leaves
+    // nothing in *your* `~/.ollama` -- the models are there, just not
+    // where a Mac-shaped guess looks. That cost a cloud run.
+    let mut roots: Vec<PathBuf> = vec![];
+    if let Some(r) = std::env::var_os("OLLAMA_MODELS") {
+        roots.push(PathBuf::from(r));
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(h).join(".ollama/models"));
+    }
+    roots.push(PathBuf::from("/usr/share/ollama/.ollama/models"));
+    if roots.is_empty() {
+        return Err("cannot locate the Ollama model store".into());
+    }
+
     let (repo, t) = tag.split_once(':').unwrap_or((tag, "latest"));
-    let manifest = root
-        .join("manifests/registry.ollama.ai/library")
-        .join(repo)
-        .join(t);
-    let text = std::fs::read_to_string(&manifest).map_err(|e| {
+    // `llama3.2` is shorthand for `library/llama3.2`; a tag that names its
+    // own namespace, like `maternion/mimo-v2.6`, lives beside `library`
+    // rather than inside it. Joining `library/` onto every tag sent those
+    // looking for `library/maternion/mimo-v2.6`, which does not exist.
+    let rel = if repo.contains('/') {
+        format!("manifests/registry.ollama.ai/{repo}")
+    } else {
+        format!("manifests/registry.ollama.ai/library/{repo}")
+    };
+    let path_in = |r: &PathBuf| r.join(&rel).join(t);
+    // "Not there" and "there but unreadable" are different problems with
+    // the same symptom, and telling them apart matters more than it
+    // sounds: on a Linux box the store belongs to the `ollama` service
+    // user, the installer adds you to its group, and your *running shell*
+    // does not get that membership because its groups were fixed at
+    // login. The path then exists, `sudo` can read it, and you cannot --
+    // which reads exactly like a layout change if the error only says
+    // "no manifest". It cost several rented GPUs to see.
+    let mut tried: Vec<String> = vec![];
+    let mut found = None;
+    for r in &roots {
+        let m = path_in(r);
+        match std::fs::read_to_string(&m) {
+            Ok(s) => {
+                found = Some((r.clone(), s));
+                break;
+            }
+            Err(e) => tried.push(format!("{} ({})", m.display(), e.kind())),
+        }
+    }
+    // The store is the root the manifest was found under. It used to be
+    // worked out by counting five components up from the manifest, which
+    // holds only for `library/` tags and would have silently counted wrong
+    // for any other depth.
+    let (root, text) = found.ok_or_else(|| {
         format!(
-            "no Ollama manifest for {tag} at {}: {e}",
-            manifest.display()
+            "no readable Ollama manifest for {tag}; tried {}",
+            tried.join(", ")
         )
     })?;
     // The manifest is small JSON; find the model layer's digest without a
@@ -268,7 +367,7 @@ pub fn ollama_model(tag: &str) -> Result<PathBuf, String> {
     let key = "application/vnd.ollama.image.model";
     let at = text
         .find(key)
-        .ok_or_else(|| format!("{tag} has no GGUF model layer"))?;
+        .ok_or_else(|| format!("{tag} {NO_GGUF_LAYER}"))?;
     let rest = &text[at..];
     let d = rest.find("sha256:").ok_or("manifest layer has no digest")?;
     let digest: String = rest[d..]

@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use lex_front::ir::{
-    Arg, BinOp, Block, IdxExpr, Nibbles, Op, Program, Reduce, Stmt, TileTy, UnOp, Var, View,
+    Arg, BinOp, Block, IdxExpr, Nibbles, Op, Program, Reduce, Stmt, TileTy, Trits, UnOp, Var, View,
 };
 use lex_ir::{DType, Space, Target};
 
@@ -85,6 +85,44 @@ fn at_index(template: &str, idx: &str) -> String {
     template.replace(AT, &format!("({idx})"))
 }
 
+/// A lazy read's element as an lvalue template, `pN_name[..@I@..]`, when
+/// the read is one parameter element under nothing but conversions
+/// (`float(p0_x[..])`, `char(p1_wq[..])`). Only an element can start a wide
+/// load; anything computed is `None`.
+fn lvalue(template: &str) -> Option<&str> {
+    let mut t = template.trim();
+    // Peel `name( ... )` while it wraps the whole expression.
+    while let Some(open) = t.find('(') {
+        let head = &t[..open];
+        let ident = !head.is_empty() && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !ident || !closes_at_end(t, open, '(', ')') {
+            break;
+        }
+        t = &t[open + 1..t.len() - 1];
+    }
+    let open = t.find('[')?;
+    let (index, _) = t[..open].strip_prefix('p')?.split_once('_')?;
+    let digits = !index.is_empty() && index.chars().all(|c| c.is_ascii_digit());
+    (digits && closes_at_end(t, open, '[', ']')).then_some(t)
+}
+
+/// Whether the bracket opened at byte `open` is closed by the last
+/// character of `t`, and by nothing earlier.
+fn closes_at_end(t: &str, open: usize, o: char, c: char) -> bool {
+    let mut depth = 0i32;
+    for (i, ch) in t[open..].char_indices() {
+        if ch == o {
+            depth += 1;
+        } else if ch == c {
+            depth -= 1;
+            if depth == 0 {
+                return open + i == t.len() - 1;
+            }
+        }
+    }
+    false
+}
+
 /// How an op reads one operand at a flat element index.
 enum Access {
     /// This thread's own element: `expr[k]`.
@@ -115,6 +153,8 @@ struct Gen<'a> {
     dq: HashMap<Var, Dq>,
     /// The kernel decodes NVFP4, so the source needs the decode tables.
     fp4: bool,
+    /// A dense-ternary decode needs its helper in the preamble.
+    tern: bool,
 }
 
 /// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
@@ -191,6 +231,7 @@ pub fn lower_with(
         barriers: 0,
         dq: HashMap::new(),
         fp4: false,
+        tern: false,
     };
     if let Some(pid) = prog.pid {
         g.locs.insert(pid, Loc::Index("gid".into()));
@@ -245,6 +286,9 @@ pub fn lower_with(
         target.max_threadgroup_bytes
     );
     s.push_str(&g.d.includes());
+    if g.tern {
+        s.push_str(&g.d.tern_preamble());
+    }
     if g.fp4 {
         s.push_str(&g.d.fp4_preamble());
     }
@@ -366,6 +410,47 @@ fn lit(x: f32) -> String {
 }
 
 impl Gen<'_> {
+    /// Whether an NVFP4 run can be loaded wide, and from what: the weight
+    /// bytes' and the input's lvalue templates.
+    ///
+    /// Only when the dialect asks (`Dialect::wide_loads`), and only when
+    /// the alignment is a consequence of the shape rather than luck. A run
+    /// is 16 values, so 8 weight bytes starting at `p0 / 2` with `p0` a
+    /// multiple of 16; every other term of either index is a multiple of a
+    /// row -- `qc` bytes or `kd` inputs -- or of a chunk of the same size.
+    /// So `qc % 8 == 0` and `kd % 16 == 0` make every run's bytes 8-aligned
+    /// and its inputs 64-aligned, given buffers the driver aligns to 256.
+    /// The input has to be an f32 *parameter*: a half one converted where
+    /// it is read looks like f32 at the tile, and reinterpreting its
+    /// pointer as `float4` would read garbage.
+    fn wide_fp4(
+        &self,
+        qe: &str,
+        qc: usize,
+        kd: usize,
+        vec: usize,
+        x: &Access,
+    ) -> Option<(String, String)> {
+        // `LEX_NARROW=1` keeps the narrow loads: the same binary both ways,
+        // so what the wide ones are worth is measured and not assumed.
+        if !self.d.wide_loads()
+            || std::env::var_os("LEX_NARROW").is_some()
+            || vec != 16
+            || !qc.is_multiple_of(8)
+            || !kd.is_multiple_of(16)
+        {
+            return None;
+        }
+        let Access::Lazy(xt) = x else { return None };
+        let (wq, xa) = (lvalue(qe)?, lvalue(xt)?);
+        let dtype = |lv: &str| -> Option<DType> {
+            let i: usize = lv[1..].split_once('_')?.0.parse().ok()?;
+            self.prog.params.get(i).map(|p| p.dtype)
+        };
+        (dtype(wq)? == DType::I8 && dtype(xa)? == DType::F32)
+            .then(|| (wq.to_string(), xa.to_string()))
+    }
+
     fn line(&mut self, text: &str) {
         for _ in 0..self.depth {
             self.body.push_str("    ");
@@ -677,8 +762,8 @@ impl Gen<'_> {
                 for (&p, (name, t)) in params.iter().zip(&ins) {
                     let pname = v(p);
                     self.line(&format!(
-                        "thread {}* {pname} = {name}[{iname}];",
-                        self.d.scalar(t.dtype)
+                        "{} {pname} = {name}[{iname}];",
+                        self.d.private_ptr(self.d.scalar(t.dtype))
                     ));
                     self.locs.insert(p, Loc::Reg(pname, t.clone()));
                 }
@@ -1025,6 +1110,120 @@ impl Gen<'_> {
                 self.locs
                     .insert(x, Loc::Lazy(e, reg(DType::F32, &[tl.shape[0], c])));
             }
+            Op::DequantTernary(q, sc, group, trits)
+                if [*q, *sc].iter().all(|a| self.lazy(*a).is_some()) =>
+            {
+                // Streaming, so a chunk of ternary weights never has to be
+                // staged: the owned form below would want a whole `[bo, kc]`
+                // f32 tile in threadgroup memory, which is the opposite of
+                // what a 1.75-bit format is for.
+                let x = dst.ok_or("op without a result")?;
+                let (qe, tq) = self.lazy(*q).expect("checked");
+                let (se, _) = self.lazy(*sc).expect("checked");
+                let per = trits.bytes();
+                let (r, groups) = (tq.shape[0], tq.shape[1] / per);
+                let c = groups * group;
+                // The element's block, and its column inside it.
+                let blk = format!(
+                    "(({AT} / {c}u) * {}u + (({AT} % {c}u) / {group}u) * {per}u)",
+                    groups * per
+                );
+                let cb = format!("(({AT} % {c}u) % {group}u)");
+                let byte = |off: &str| {
+                    format!(
+                        "((uint)(int)(0.0f + {}) & 0xFFu)",
+                        at_index(&qe, &format!("{blk} + {off}"))
+                    )
+                };
+                let qv = match trits {
+                    Trits::Slots2 => format!(
+                        "float(int(({} >> (({cb} % 4u) * 2u)) & 3u) - 1)",
+                        byte(&format!("{cb} / 4u"))
+                    ),
+                    Trits::Dense => {
+                        self.tern = true;
+                        // Which lane group the column falls in. Constant
+                        // per column, so it folds away in the unrolled loop.
+                        let off = format!(
+                            "({cb} < 80u ? {cb} % 16u : ({cb} < 120u ? 16u + ({cb} - 80u) % 8u                              : 24u + ({cb} - 120u) % 2u))"
+                        );
+                        let step = format!(
+                            "({cb} < 80u ? {cb} / 16u : ({cb} < 120u ? ({cb} - 80u) / 8u                              : ({cb} - 120u) / 2u))"
+                        );
+                        format!("float(int(tern_code({}, {step})) - 1)", byte(&off))
+                    }
+                };
+                let gidx = format!("({AT} / {c}u) * {groups}u + ({AT} % {c}u) / {group}u");
+                let e = format!("({qv} * float({}))", at_index(&se, &gidx));
+                self.dq.insert(
+                    x,
+                    Dq {
+                        v: qv,
+                        s: format!("float({se})"),
+                        m: None,
+                        cols: c,
+                        group: *group,
+                        row: None,
+                        pack: Pack::None,
+                    },
+                );
+                self.locs.insert(x, Loc::Lazy(e, reg(DType::F32, &[r, c])));
+            }
+            Op::DequantTernary(q, sc, group, trits) => {
+                let x = dst.ok_or("op without a result")?;
+                let tq = self.arg_ty(*q)?;
+                let per = trits.bytes();
+                let (r, groups) = (tq.shape[0], tq.shape[1] / per);
+                let (c, n) = (groups * group, r * groups * group);
+                let ops = self.operands(&[*q, *sc], &[false, false], n)?;
+                let sv = Self::read(
+                    &ops[1].0,
+                    &format!("(e / {c}u) * {groups}u + (e % {c}u) / {group}u"),
+                );
+                let name = self.declare_reg(x, &reg(DType::F32, &[r, c]));
+                // First byte of this element's block, and its column in it.
+                let mut body = vec![
+                    format!(
+                        "const uint tq_g = (e / {c}u) * {}u + ((e % {c}u) / {group}u) * {per}u;",
+                        groups * per
+                    ),
+                    format!("const uint tq_c = e % {group}u;"),
+                ];
+                // A byte is signed in the tile, so mask rather than cast:
+                // a negative i8 must come back as its unsigned value. The
+                // leading `0.0f +` is not arithmetic -- it forces expression
+                // context, or the reader's own `char(p)` cast parses as a
+                // declaration of `p` and the kernel will not compile.
+                let byte = |at: &str| {
+                    format!(
+                        "((uint)(int)(0.0f + {}) & 0xFFu)",
+                        Self::read(&ops[0].0, at)
+                    )
+                };
+                match trits {
+                    Trits::Slots2 => body.push(format!(
+                        "{name}[k] = float(int(({} >> ((tq_c % 4u) * 2u)) & 3u) - 1) * {sv};",
+                        byte("tq_g + tq_c / 4u")
+                    )),
+                    Trits::Dense => {
+                        body.extend([
+                            "uint tq_l; uint tq_s; uint tq_b;".into(),
+                            "if (tq_c < 80u) { tq_l = tq_c % 16u; tq_s = tq_c / 16u; tq_b = 0u; }"
+                                .into(),
+                            "else if (tq_c < 120u) { tq_l = (tq_c - 80u) % 8u;                              tq_s = (tq_c - 80u) / 8u; tq_b = 16u; }"
+                                .into(),
+                            "else { tq_l = (tq_c - 120u) % 2u; tq_s = (tq_c - 120u) / 2u;                              tq_b = 24u; }"
+                                .into(),
+                            format!("uint tq_v = {};", byte("tq_g + tq_b + tq_l")),
+                            "uint tq_t = 0u;".into(),
+                            "for (uint s = 0u; s <= tq_s; ++s)                              { tq_v *= 3u; tq_t = tq_v >> 8u; tq_v &= 0xFFu; }"
+                                .into(),
+                            format!("{name}[k] = float(int(tq_t) - 1) * {sv};"),
+                        ]);
+                    }
+                }
+                self.owned(n, &body);
+            }
             Op::Dequant6(lo, hi, sc, group) => {
                 let x = dst.ok_or("op without a result")?;
                 let tl = self.arg_ty(*lo)?;
@@ -1139,6 +1338,38 @@ impl Gen<'_> {
                 self.owned(
                     n,
                     &[format!("{name}[k] = {}({src});", self.d.scalar(ty.dtype))],
+                );
+            }
+            Op::Butterfly(a, stride) => {
+                let x = dst.ok_or("op without a result")?;
+                let ty = self.arg_ty(*a)?;
+                let n = ty.elems();
+                let ops = self.operands(&[*a], &[false], n)?;
+                // `e ^ stride` is the partner. That stays inside the row
+                // and inside the transform's block because the checker
+                // requires the last dimension to be a multiple of
+                // `2 * stride` and the stride to be a power of two: the
+                // row base then has no bits below the stride to disturb.
+                let mine = Self::read(&ops[0].0, "e");
+                let theirs = Self::read(&ops[0].0, &format!("e ^ {stride}u"));
+                let sc = self.d.scalar(ty.dtype);
+                let name = self.declare_reg(x, &reg(ty.dtype, &ty.shape));
+                // Low partner adds, high partner subtracts, which is what
+                // makes the pair of outputs the sum and the difference.
+                // Through temporaries, not one nested expression. A
+                // direct read is `float(p0_x[...])`, and wrapping that in
+                // another `float(...)` is the most vexing parse: the
+                // compiler reads the inner one as declaring `p0_x` an
+                // array and says the size is not constant. Only the first
+                // stage hits it, because later ones read from scratch and
+                // `float((scratch + 0)[...])` cannot be a declarator.
+                self.owned(
+                    n,
+                    &[
+                        format!("const {sc} bfly_a = {mine};"),
+                        format!("const {sc} bfly_b = {theirs};"),
+                        format!("{name}[k] = (e & {stride}u) ? bfly_b - bfly_a : bfly_a + bfly_b;"),
+                    ],
                 );
             }
             Op::Dequant(q, s, m, group) => {
@@ -1340,6 +1571,43 @@ impl Gen<'_> {
                                      + {a2} * (float(int((l1 & 0xFu) | (((hh >> 4u) & 3u) << 4u)) - 32) * sg) \
                                      + {a3} * (float(int((l1 >> 4u) | (((hh >> 6u) & 3u) << 4u)) - 32) * sg); }}"
                                 ));
+                            }
+                            Pack::Fp4(qe, qc)
+                                if self.wide_fp4(qe, *qc, kd, vec, &ops[0].0).is_some() =>
+                            {
+                                // The same run as below, loaded wide: its
+                                // eight bytes as one `uint2` and its sixteen
+                                // inputs as four `float4`. Aligned by
+                                // construction -- `wide_fp4` says why.
+                                let (wq, xa) =
+                                    self.wide_fp4(qe, *qc, kd, vec, &ops[0].0).expect("checked");
+                                let w = at_index(&wq, &format!("j * {qc}u + p0 / 2u"));
+                                self.line(&format!(
+                                    "    const uint2 wq = *reinterpret_cast<const uint2*>(&{w});"
+                                ));
+                                for q in 0..4 {
+                                    let xq = at_index(&xa, &format!("i * {kd}u + p0 + {}u", 4 * q));
+                                    self.line(&format!(
+                                        "    const float4 x{q} = *reinterpret_cast<const float4*>(&{xq});"
+                                    ));
+                                }
+                                self.line("    float run = 0.0f;");
+                                // Byte b holds values 2b (low nibble) and
+                                // 2b + 1; little-endian, so `wq.x` is bytes
+                                // 0-3 from the bottom.
+                                for b in 0..8 {
+                                    let word = if b < 4 { "wq.x" } else { "wq.y" };
+                                    let (q, c) = ((2 * b) / 4, (2 * b) % 4);
+                                    let lanes = ["x", "y", "z", "w"];
+                                    self.line(&format!(
+                                        "    {{ const float2 w = fp4_pair(({word} >> {}u) & 0xFFu); \
+                                         run += x{q}.{} * w.x + x{q}.{} * w.y; }}",
+                                        8 * (b % 4),
+                                        lanes[c],
+                                        lanes[c + 1]
+                                    ));
+                                }
+                                self.line("    s += run * (sg * 16384.0f);");
                             }
                             Pack::Fp4(qe, qc) => {
                                 // One byte, two E2M1 codes: p and p + 1.
@@ -1661,6 +1929,24 @@ impl Gen<'_> {
         // so every touch below is emitted with a literal. `r`, `m` and `step`
         // are all known here.
         let unroll = r * m * step <= 128;
+        // NVFP4 whose run shares one scale: sum the run unscaled, per (row,
+        // token), and pay one multiply at its end rather than one per
+        // weight -- what the single-row reduction does, for the reason its
+        // comment gives: on Metal this loop is short of ALU, not bandwidth.
+        // A verify of three read gate/up in 138 us against a step's 109 while
+        // multiplying every weight by its scale. Only while `r * m` run
+        // accumulators fit beside the sums (verify batches, not a prefill's
+        // eight-token tail).
+        let defer =
+            unroll && r * m <= 16 && matches!(dq.as_ref().map(|d| &d.pack), Some(Pack::Fp4(..)));
+        let weights: Vec<String> = if defer {
+            weights
+                .iter()
+                .map(|w| w.replace(" * sgr[rr]", ""))
+                .collect()
+        } else {
+            weights
+        };
         self.line(&format!("float s[{r}][{m}];"));
         if unroll {
             for rr in 0..r {
@@ -1720,81 +2006,156 @@ impl Gen<'_> {
                 ));
             }
         }
-        self.line(&format!("for (uint u = 0; u < {v}u; u += {step}u) {{"));
-        self.depth += 1;
-        self.line("const uint p = p0 + u;");
-        let names: Vec<String> = (0..weights.len()).map(|k| format!("w{k}")).collect();
-        let decl: Vec<String> = weights
-            .iter()
-            .zip(&names)
-            .map(|(w, nm)| format!("const float {nm} = {w};"))
-            .collect();
-        // Each token's activations for this step, loaded once and reused by
-        // every weight row below: that reuse is the whole point of a batch.
-        self.line(&format!("float xa[{m}][{step}];"));
-        for k in 0..step {
-            if unroll {
-                for i in 0..m {
-                    self.line(&format!(
-                        "xa[{i}][{k}] = {};",
-                        Self::read(&ops[0].0, &format!("p + {}u", i * kd + k))
-                    ));
-                }
-            } else {
+        // Loaded wide where the dialect wants it and the shape proves the
+        // alignment (see `wide_fp4`): each row's run of 8 bytes as one
+        // `uint2`, then the run a quarter at a time -- one `float4` per
+        // token, applied to every row -- so `m` of them are live at once
+        // rather than all sixteen inputs of every token.
+        let wide = match dq.as_ref().map(|d| &d.pack) {
+            Some(Pack::Fp4(qe, qc)) if unroll => self
+                .wide_fp4(qe, *qc, kd, vec, &ops[0].0)
+                .map(|(w, xa)| (w, xa, *qc)),
+            _ => None,
+        };
+        if let Some((wq, xa, qc)) = wide {
+            self.line(&format!("uint2 wq[{r}];"));
+            for rr in 0..r {
                 self.line(&format!(
-                    "for (uint i = 0; i < {m}u; ++i) xa[i][{k}] = {};",
-                    Self::read(&ops[0].0, &format!("i * {kd}u + p + {k}u"))
+                    "{{ const uint j = min(sgid * {r}u + {rr}u, {}u); \
+                     wq[{rr}] = *reinterpret_cast<const uint2*>(&{}); }}",
+                    n - 1,
+                    at_index(&wq, &format!("j * {qc}u + p0 / 2u"))
                 ));
             }
-        }
-        let terms = |i: &str| -> String {
-            names
-                .iter()
-                .enumerate()
-                .map(|(k, nm)| format!("xa[{i}][{k}] * {nm}"))
-                .collect::<Vec<_>>()
-                .join(" + ")
-        };
-        if unroll {
-            for rr in 0..r {
-                // Braces per row: `pre` declares names of its own.
+            for q in 0..4 {
                 self.line("{");
                 self.depth += 1;
-                self.line(&format!(
-                    "const uint j = min(sgid * {r}u + {rr}u, {}u);",
-                    n - 1
-                ));
-                // `sgr`/`mgr` are register tiles too, so their row index has
-                // to be a literal for the same reason.
-                let lit = |s: &str| s.replace("[rr]", &format!("[{rr}]"));
-                self.line(&format!(
-                    "{}{}",
-                    lit(&pre),
-                    decl.iter().map(|d| lit(d)).collect::<Vec<_>>().join(" ")
-                ));
                 for i in 0..m {
-                    self.line(&format!("s[{rr}][{i}] += {};", terms(&i.to_string())));
+                    self.line(&format!(
+                        "const float4 x{i} = *reinterpret_cast<const float4*>(&{});",
+                        at_index(&xa, &format!("{}u + p0 + {}u", i * kd, 4 * q))
+                    ));
+                }
+                for rr in 0..r {
+                    for half in 0..2 {
+                        // Byte `2q + half` of the run: values 4q + 2 half
+                        // and the one after, low nibble first.
+                        let byte = 2 * q + half;
+                        let word = if byte < 4 { "x" } else { "y" };
+                        let (c0, c1) = if half == 0 { ("x", "y") } else { ("z", "w") };
+                        let sums: Vec<String> = (0..m)
+                            .map(|i| format!("s[{rr}][{i}] += x{i}.{c0} * w0 + x{i}.{c1} * w1;"))
+                            .collect();
+                        self.line(&format!(
+                            "{{ const float2 w = fp4_pair((wq[{rr}].{word} >> {}u) & 0xFFu); \
+                             const float w0 = w.x * sgr[{rr}], w1 = w.y * sgr[{rr}]; {} }}",
+                            8 * (byte % 4),
+                            sums.join(" ")
+                        ));
+                    }
                 }
                 self.depth -= 1;
                 self.line("}");
             }
         } else {
-            self.line(&format!("for (uint rr = 0; rr < {r}u; ++rr) {{"));
+            if defer {
+                self.line(&format!("float run[{r}][{m}];"));
+                for rr in 0..r {
+                    self.line(
+                        &(0..m)
+                            .map(|i| format!("run[{rr}][{i}] = 0.0f;"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+            }
+            self.line(&format!("for (uint u = 0; u < {v}u; u += {step}u) {{"));
             self.depth += 1;
-            self.line(&format!(
-                "const uint j = min(sgid * {r}u + rr, {}u);",
-                n - 1
-            ));
-            self.line(&format!("{pre}{}", decl.join(" ")));
-            self.line(&format!(
-                "for (uint i = 0; i < {m}u; ++i) s[rr][i] += {};",
-                terms("i")
-            ));
+            self.line("const uint p = p0 + u;");
+            let names: Vec<String> = (0..weights.len()).map(|k| format!("w{k}")).collect();
+            let decl: Vec<String> = weights
+                .iter()
+                .zip(&names)
+                .map(|(w, nm)| format!("const float {nm} = {w};"))
+                .collect();
+            // Each token's activations for this step, loaded once and reused by
+            // every weight row below: that reuse is the whole point of a batch.
+            self.line(&format!("float xa[{m}][{step}];"));
+            for k in 0..step {
+                if unroll {
+                    for i in 0..m {
+                        self.line(&format!(
+                            "xa[{i}][{k}] = {};",
+                            Self::read(&ops[0].0, &format!("p + {}u", i * kd + k))
+                        ));
+                    }
+                } else {
+                    self.line(&format!(
+                        "for (uint i = 0; i < {m}u; ++i) xa[i][{k}] = {};",
+                        Self::read(&ops[0].0, &format!("i * {kd}u + p + {k}u"))
+                    ));
+                }
+            }
+            let terms = |i: &str| -> String {
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(k, nm)| format!("xa[{i}][{k}] * {nm}"))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            };
+            if unroll {
+                for rr in 0..r {
+                    // Braces per row: `pre` declares names of its own.
+                    self.line("{");
+                    self.depth += 1;
+                    self.line(&format!(
+                        "const uint j = min(sgid * {r}u + {rr}u, {}u);",
+                        n - 1
+                    ));
+                    // `sgr`/`mgr` are register tiles too, so their row index has
+                    // to be a literal for the same reason.
+                    let lit = |s: &str| s.replace("[rr]", &format!("[{rr}]"));
+                    self.line(&format!(
+                        "{}{}",
+                        lit(&pre),
+                        decl.iter().map(|d| lit(d)).collect::<Vec<_>>().join(" ")
+                    ));
+                    let acc = if defer { "run" } else { "s" };
+                    for i in 0..m {
+                        self.line(&format!("{acc}[{rr}][{i}] += {};", terms(&i.to_string())));
+                    }
+                    self.depth -= 1;
+                    self.line("}");
+                }
+            } else {
+                self.line(&format!("for (uint rr = 0; rr < {r}u; ++rr) {{"));
+                self.depth += 1;
+                self.line(&format!(
+                    "const uint j = min(sgid * {r}u + rr, {}u);",
+                    n - 1
+                ));
+                self.line(&format!("{pre}{}", decl.join(" ")));
+                self.line(&format!(
+                    "for (uint i = 0; i < {m}u; ++i) s[rr][i] += {};",
+                    terms("i")
+                ));
+                self.depth -= 1;
+                self.line("}");
+            }
             self.depth -= 1;
             self.line("}");
+            if defer {
+                for rr in 0..r {
+                    self.line(
+                        &(0..m)
+                            .map(|i| format!("s[{rr}][{i}] += run[{rr}][{i}] * sgr[{rr}];"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+            }
         }
-        self.depth -= 1;
-        self.line("}");
         self.depth -= 1;
         self.line("}");
         // The reduction and the store index `s` too, and one loop-variable
@@ -1872,5 +2233,30 @@ impl Gen<'_> {
             },
             Arg::BorrowPart(..) => return Err("pipe shares have no Metal lowering".into()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lvalue;
+
+    /// A wide load starts at an element, so only a read of one parameter
+    /// element -- under conversions and nothing else -- may give one up.
+    #[test]
+    fn only_a_plain_parameter_element_is_an_lvalue() {
+        let x = "float(p0_x[(uint)(0) * 5120u + ((@I@))])";
+        assert_eq!(lvalue(x), Some("p0_x[(uint)(0) * 5120u + ((@I@))]"));
+        assert_eq!(lvalue("char(p1_wq[a[(@I@)]])"), Some("p1_wq[a[(@I@)]]"));
+        assert_eq!(lvalue("float(float(p3_s[@I@]))"), Some("p3_s[@I@]"));
+        assert_eq!(lvalue("p2_y[@I@]"), Some("p2_y[@I@]"));
+        // Computed, not loaded.
+        assert_eq!(lvalue("float(p0_x[@I@]) * 2.0f"), None);
+        assert_eq!(lvalue("fp8_e4m3(p2_ws[@I@]) * float(p3_g[0])"), None);
+        assert_eq!(lvalue("(p0_x[@I@])+(p1_y[@I@])"), None);
+        // Not a parameter.
+        assert_eq!(lvalue("scratch[@I@]"), None);
+        assert_eq!(lvalue("v3[@I@]"), None);
+        // An index that closes early is two things, not one.
+        assert_eq!(lvalue("p0_x[1] + p1_y[@I@]"), None);
     }
 }

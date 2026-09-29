@@ -1,0 +1,11 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "hi"
+    }
+  ],
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  }
+}

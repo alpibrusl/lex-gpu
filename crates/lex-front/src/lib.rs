@@ -20,6 +20,7 @@ pub mod ir;
 pub mod llama;
 pub mod print;
 pub mod qwen;
+pub mod syntax;
 
 pub use check::{Diag, Kind, Report, check};
 pub use interp::{Tensor, run, run_dyn};

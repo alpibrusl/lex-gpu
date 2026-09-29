@@ -1,0 +1,12 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "  padded \n"
+    },
+    {
+      "role": "user",
+      "content": "\n hi  "
+    }
+  ]
+}

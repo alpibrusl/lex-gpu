@@ -63,6 +63,18 @@ pub trait Dialect {
     /// that, but the lowering should not have to know which world it is in.
     fn shared_ptr(&self, ty: &str) -> String;
 
+    /// A pointer into a thread's *private* memory: a row of a register
+    /// tile handed to the body of a `map_each`.
+    ///
+    /// The same split as [`Dialect::shared_ptr`], one level down. Metal
+    /// spells the address space in the type here too, and a plain `float*`
+    /// is rejected; CUDA has no qualifier for it and `thread float*` is a
+    /// syntax error. This is the one that got away: every attention kernel
+    /// emitted `thread` unconditionally and so could not be compiled for
+    /// CUDA at all, which `scripts/cuda_check.sh` says in seconds and a
+    /// rented GPU would have said in twenty minutes.
+    fn private_ptr(&self, ty: &str) -> String;
+
     /// Declare an array in threadgroup / shared memory.
     fn shared_array(&self, ty: &str, name: &str, len: usize) -> String;
 
@@ -114,6 +126,22 @@ pub trait Dialect {
         usize::MAX
     }
 
+    /// Whether a lane's run of consecutive loads is spelled as explicit
+    /// wide loads (`uint2`, `float4`) rather than left for the compiler to
+    /// merge.
+    ///
+    /// Metal's compiler merges them: a run of byte loads from one row
+    /// becomes one wide load, which is why the loop is written as runs.
+    /// NVRTC does not -- it cannot prove the alignment of a `char*` behind
+    /// a long index expression -- so on an L4 a run of 16 NVFP4 values was
+    /// eight one-byte loads and sixteen four-byte ones, three load
+    /// instructions per weight byte, and the matvec read at half the
+    /// card's bandwidth. The emitter proves the alignment instead and says
+    /// so in the type.
+    fn wide_loads(&self) -> bool {
+        false
+    }
+
     /// The NVFP4 decode helpers, when a kernel dequantises four-bit
     /// weights.
     ///
@@ -124,6 +152,17 @@ pub trait Dialect {
     /// coincide there. That is a property of IEEE half, not of Metal. Only
     /// the spelling of the reinterpretation differs.
     fn fp4_preamble(&self) -> String;
+
+    /// One dense-ternary byte's digits (see `docs/ternary.md`). Base 3
+    /// scaled across the byte range, so the digits come out by repeated
+    /// multiply-and-carry: no division, no table. Only the qualifier on a
+    /// device function differs between the two languages.
+    fn tern_preamble(&self) -> String {
+        TERN_FN.replace("$Q", self.device_fn())
+    }
+
+    /// How a non-entry function is declared.
+    fn device_fn(&self) -> &'static str;
 
     /// The entry point, from its name through the opening brace and the
     /// declarations that tell the body where this thread is.
@@ -166,6 +205,10 @@ impl Dialect for Msl {
         format!("threadgroup {ty}*")
     }
 
+    fn private_ptr(&self, ty: &str) -> String {
+        format!("thread {ty}*")
+    }
+
     fn shared_array(&self, ty: &str, name: &str, len: usize) -> String {
         format!("threadgroup {ty} {name}[{len}];")
     }
@@ -200,6 +243,10 @@ impl Dialect for Msl {
 
     fn fp4_preamble(&self) -> String {
         FP4_TABLES_MSL.to_string()
+    }
+
+    fn device_fn(&self) -> &'static str {
+        "inline"
     }
 
     fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool, gid2: bool) -> String {
@@ -244,6 +291,10 @@ impl Dialect for Cuda {
         "__syncthreads();".to_string()
     }
 
+    fn wide_loads(&self) -> bool {
+        true
+    }
+
     fn shuffle(&self, value: &str, src: &str) -> String {
         format!("__shfl_sync(0xffffffffu, {value}, {src})")
     }
@@ -261,6 +312,10 @@ impl Dialect for Cuda {
     }
 
     fn shared_ptr(&self, ty: &str) -> String {
+        format!("{ty}*")
+    }
+
+    fn private_ptr(&self, ty: &str) -> String {
         format!("{ty}*")
     }
 
@@ -301,8 +356,22 @@ impl Dialect for Cuda {
     /// several hundred body sites, and they keep the emitted CUDA readable
     /// next to the emitted MSL when the two are diffed.
     fn includes(&self) -> String {
-        "\n#include <cuda_fp16.h>\n\ntypedef unsigned int uint;\ntypedef unsigned char uchar;\n\n"
-            .to_string()
+        // `INFINITY` the emitter writes for an online softmax's running
+        // max comes from MSL's `metal_math`, and CUDA has it in `math.h`
+        // -- which NVRTC does not give you, because it compiles without
+        // system headers. `nvcc` has them, so the emitted text compiles
+        // perfectly well under the check and then fails at load time in
+        // the runtime, which is NVRTC. Defining it here costs nothing and
+        // keeps the emitter free of a dialect split for one token.
+        concat!(
+            "\n#include <cuda_fp16.h>\n\n",
+            "typedef unsigned int uint;\n",
+            "typedef unsigned char uchar;\n",
+            "#ifndef INFINITY\n",
+            "#define INFINITY __int_as_float(0x7f800000)\n",
+            "#endif\n\n",
+        )
+        .to_string()
     }
 
     fn max_static_shared(&self) -> usize {
@@ -311,6 +380,10 @@ impl Dialect for Cuda {
 
     fn fp4_preamble(&self) -> String {
         FP4_TABLES_CUDA.to_string()
+    }
+
+    fn device_fn(&self) -> &'static str {
+        "__device__ __forceinline__"
     }
 
     fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool, gid2: bool) -> String {
@@ -390,6 +463,15 @@ const FP4_TABLES_CUDA: &str = concat!(
     "    float r;\n",
     "    memcpy(&r, &out, sizeof(r));\n",
     "    return r;\n",
+    "}\n\n"
+);
+
+/// The dense-ternary digit extraction, shared by both dialects.
+const TERN_FN: &str = concat!(
+    "$Q uint tern_code(uint b, uint step) {\n",
+    "    uint t = 0u;\n",
+    "    for (uint s = 0u; s <= step; ++s) { b *= 3u; t = b >> 8u; b &= 0xFFu; }\n",
+    "    return t;\n",
     "}\n\n"
 );
 

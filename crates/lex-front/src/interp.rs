@@ -542,6 +542,24 @@ impl Interp<'_> {
                 let out = (0..t.data.len()).map(|i| t.data[i ^ 1]).collect();
                 Some(Val::Tile(self.fresh(t.ty.dtype, &t.ty.shape, out)))
             }
+            Op::Butterfly(a, stride) => {
+                let t = self.arg(*a)?;
+                let n = *t.ty.shape.last().expect("checked");
+                let mut out = t.data.clone();
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let j = i % n;
+                    let base = i - j;
+                    // The low partner adds, the high one subtracts. Read
+                    // from `t.data` rather than from `out`, or the second
+                    // half of a pair sees the first half's new value.
+                    *slot = if j & stride == 0 {
+                        t.data[base + j] + t.data[base + j + stride]
+                    } else {
+                        t.data[base + j - stride] - t.data[base + j]
+                    };
+                }
+                Some(Val::Tile(self.fresh(t.ty.dtype, &t.ty.shape, out)))
+            }
             Op::Dequant(q, s, m, group) => {
                 let (tq, ts) = (self.arg(*q)?, self.arg(*s)?);
                 let tm = m.map(|m| self.arg(m)).transpose()?;
@@ -591,6 +609,25 @@ impl Interp<'_> {
                         let g = row * (c / group) + col / group;
                         let scale = e4m3(ts.data[g] as i32 as u8);
                         e2m1(code as u8) * scale * tg.data[row]
+                    })
+                    .collect();
+                Some(Val::Tile(self.fresh(DType::F32, &[r, c], out)))
+            }
+            Op::DequantTernary(q, sc, group, trits) => {
+                let (tq, ts) = (self.arg(*q)?, self.arg(*sc)?);
+                let r = tq.ty.shape[0];
+                let per = trits.bytes();
+                let groups = tq.ty.shape[1] / per;
+                let c = groups * group;
+                let out = (0..r * c)
+                    .map(|i| {
+                        let (row, col) = (i / c, i % c);
+                        let g = col / group;
+                        let blk: Vec<u8> = (0..per)
+                            .map(|k| tq.data[row * groups * per + g * per + k] as i32 as u8)
+                            .collect();
+                        let code = trits.code(&blk, col % group);
+                        (code as f32 - 1.0) * ts.data[row * groups + g]
                     })
                     .collect();
                 Some(Val::Tile(self.fresh(DType::F32, &[r, c], out)))

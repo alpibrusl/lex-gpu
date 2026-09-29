@@ -4,8 +4,10 @@
 //! runtime otherwise has no dependencies. Numbers are `f64` (a safetensors
 //! offset fits exactly up to 2^53, far past any tensor we load), strings
 //! are unescaped, and anything malformed is an error rather than a panic.
-
-use std::collections::BTreeMap;
+//!
+//! Objects keep their keys in the order they were written. A chat template
+//! prints a client's tool schemas back to the model, and the order it
+//! prints them in is part of the prompt the model was trained on.
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Json {
@@ -14,7 +16,57 @@ pub enum Json {
     Num(f64),
     Str(String),
     Arr(Vec<Json>),
-    Obj(BTreeMap<String, Json>),
+    Obj(Map),
+}
+
+/// An object's members, in the order they were written. A repeated key
+/// keeps its first position and its last value, as Python's `json` does.
+/// Lookup is linear: the objects here are manifests, headers and requests,
+/// and none is large enough for that to show.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Map(Vec<(String, Json)>);
+
+impl Map {
+    pub fn new() -> Map {
+        Map::default()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Json> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    pub fn insert(&mut self, key: String, value: Json) {
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => *v = value,
+            None => self.0.push((key, value)),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Json)> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().map(|(k, _)| k)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<K: Into<String>> FromIterator<(K, Json)> for Map {
+    fn from_iter<I: IntoIterator<Item = (K, Json)>>(it: I) -> Map {
+        let mut m = Map::new();
+        for (k, v) in it {
+            m.insert(k.into(), v);
+        }
+        m
+    }
 }
 
 impl Json {
@@ -119,7 +171,7 @@ impl Parser<'_> {
 
     fn object(&mut self) -> Result<Json, String> {
         self.eat(b'{')?;
-        let mut m = BTreeMap::new();
+        let mut m = Map::new();
         self.ws();
         if self.b.get(self.i) == Some(&b'}') {
             self.i += 1;
@@ -194,12 +246,22 @@ impl Parser<'_> {
                                 .ok_or("short \\u escape")?
                                 .to_vec();
                             self.i += 4;
-                            let n = u32::from_str_radix(
-                                std::str::from_utf8(&h).map_err(|e| e.to_string())?,
-                                16,
-                            )
-                            .map_err(|e| e.to_string())?;
-                            s.push(char::from_u32(n).unwrap_or('\u{fffd}'));
+                            let n = hex4(&h)?;
+                            // Outside the BMP, `json.dumps` writes a
+                            // surrogate pair -- every emoji a Python client
+                            // sends. Each half alone is not a character.
+                            let low = self
+                                .b
+                                .get(self.i..self.i + 6)
+                                .filter(|t| (0xd800..0xdc00).contains(&n) && t.starts_with(b"\\u"));
+                            match low.map(|t| hex4(&t[2..])).transpose()? {
+                                Some(lo) if (0xdc00..0xe000).contains(&lo) => {
+                                    self.i += 6;
+                                    let c = 0x10000 + ((n - 0xd800) << 10) + (lo - 0xdc00);
+                                    s.push(char::from_u32(c).unwrap_or('\u{fffd}'));
+                                }
+                                _ => s.push(char::from_u32(n).unwrap_or('\u{fffd}')),
+                            }
                         }
                         _ => return Err(format!("bad escape `\\{}`", e as char)),
                     }
@@ -240,6 +302,11 @@ impl Parser<'_> {
     }
 }
 
+fn hex4(h: &[u8]) -> Result<u32, String> {
+    u32::from_str_radix(std::str::from_utf8(h).map_err(|e| e.to_string())?, 16)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::Json;
@@ -271,6 +338,20 @@ mod tests {
             .collect();
         assert_eq!(shape, vec![17408, 640]);
         assert_eq!(h.keys(), vec!["__metadata__", "w"]);
+    }
+
+    #[test]
+    fn keeps_key_order_and_the_last_of_a_repeated_key() {
+        let j = Json::parse(r#"{"type":"function","name":"x","a":1,"type":"f"}"#).expect("parse");
+        assert_eq!(j.keys(), vec!["type", "name", "a"]);
+        assert_eq!(j.get("type").and_then(Json::str), Some("f"));
+    }
+
+    #[test]
+    fn joins_surrogate_pairs() {
+        let j = Json::parse(r#"["😀", "\ud83d", "aé"]"#).expect("parse");
+        let v: Vec<&str> = j.arr().expect("arr").iter().filter_map(Json::str).collect();
+        assert_eq!(v, vec!["😀", "\u{fffd}", "aé"]);
     }
 
     #[test]

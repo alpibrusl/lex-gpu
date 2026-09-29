@@ -8,6 +8,9 @@
 
 typedef unsigned int uint;
 typedef unsigned char uchar;
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
 
 extern "C" __global__ void rmsnorm_4x4096_f16(
     const float* __restrict__ p0_x,
