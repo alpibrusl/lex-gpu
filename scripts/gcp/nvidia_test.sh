@@ -38,6 +38,9 @@
 #                when it expires, even if this script is killed.
 #   KEEP=1       leave the VM running afterwards (debugging); you delete it.
 #
+# Exit status: the remote run's, or 75 when Google preempted the Spot VM
+# (retry: `for i in 1 2 3; do ...nvidia_test.sh; [ $? = 75 ] || break; done`).
+#
 # Cost guard rails: the VM is deleted on exit (success, failure or Ctrl-C),
 # and independently by GCE after MAX_RUN via --max-run-duration.
 set -euo pipefail
@@ -157,4 +160,14 @@ gc compute ssh "$NAME" --zone "$ZONE" --command \
 status=${PIPESTATUS[0]}
 gc compute scp --zone "$ZONE" --recurse "$NAME:~/results/*" "$OUT/" || true
 echo "results in $OUT (remote exit $status)"
+# A Spot VM Google took back is not a failed run: it is no run, and says
+# nothing about the code. Exit 75 (EX_TEMPFAIL) so a caller can try again
+# -- three runs on 2026-09-29 were preempted seven minutes in, and each sat
+# out its SSH timeout before exiting like any other failure.
+if [ "$status" != 0 ] && [ -n "$(gc compute operations list \
+    --filter="operationType=compute.instances.preempted AND targetLink~/$NAME\$" \
+    --format='value(name)' 2>/dev/null)" ]; then
+  echo "$NAME was preempted: no result, exit 75 to retry"
+  exit 75
+fi
 exit "$status"
