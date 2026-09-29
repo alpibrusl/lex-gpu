@@ -154,7 +154,7 @@ if [ -n "${QWEN:-}" ]; then
   # first attempt fetched 18 GB into one place and looked in another.
   export OLLAMA_MODELS="$HOME/.ollama/models"
   python3 scripts/ollama_fetch.py qwen3.8:27b-mlx \
-    --root "$OLLAMA_MODELS" 2>&1 | tail -4 | tee -a "$R/qwen-cuda.log"
+    --root "$OLLAMA_MODELS" 2>&1 | tail -12 | tee -a "$R/qwen-cuda.log"
   [ "${PIPESTATUS[0]}" = 0 ] || fail=1
   # Ollama holds the baseline models on the GPU -- 6.6 GB of a 23 GB
   # card after llama3.1:8b -- and this one needs about 15.5.
@@ -184,6 +184,12 @@ if [ -n "${QWEN:-}" ]; then
     [ "${PIPESTATUS[0]}" = 0 ] || fail=1
     grep -q "test result: ok. [1-9]" "$R/qwen-prefill-golden.log" \
       || { echo "no prefill golden ran"; fail=1; }
+    # A golden that skips reports "ok" and checked nothing: when the model
+    # did not arrive, all four did, and the line above passed.
+    if grep -q SKIPPED "$R/qwen-prefill-golden.log"; then
+      echo "a prefill golden skipped -- the model is not there"
+      fail=1
+    fi
   fi
 
   if [ -z "${SPEED:-}" ]; then

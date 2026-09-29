@@ -24,12 +24,36 @@ import hashlib
 import json
 import pathlib
 import sys
+import time
+import urllib.error
 import urllib.request
 
 REGISTRY = "https://registry.ollama.ai/v2/library"
 
 
 def get(url, out=None):
+    """`fetch`, retried with backoff on network errors.
+
+    A fresh VM's first lookups can fail: on 2026-09-29 two L4 runs in a row
+    lost the whole Qwen block to "Temporary failure in name resolution" on
+    this download, while runs in the same region the day before had not.
+    An HTTP error from the registry itself (a 404 for a tag that does not
+    exist) is an answer, not a hiccup, and is not retried.
+    """
+    delays = [5, 10, 20, 40, 60]
+    for attempt in range(len(delays) + 1):
+        try:
+            return fetch(url, out)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+            if attempt == len(delays):
+                raise
+            print(f"  {url}: {e}; retrying in {delays[attempt]} s", file=sys.stderr, flush=True)
+            time.sleep(delays[attempt])
+
+
+def fetch(url, out=None):
     req = urllib.request.Request(url, headers={"Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=1800) as r:
         if out is None:
