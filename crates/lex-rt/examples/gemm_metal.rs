@@ -7,8 +7,12 @@
 //! `lex_msl::gemm`'s Metal kernel is measured before the whole model is.
 //! Each shape runs over several copies of its weights in one command
 //! buffer, so the weights stream from memory as they do in the model
-//! rather than sitting in the system cache between repeats; every dispatch
-//! writes the same output, which keeps them in order. Correctness is
+//! rather than sitting in the system cache between repeats. By default
+//! every dispatch writes the same output, which keeps them in order and
+//! times each whole, its last wave included. `--overlap` gives each its own
+//! output so the concurrent encoder may run them side by side, which is how
+//! MLX's benchmark (independent matmuls) times -- and why the two must be
+//! compared in the same mode. Correctness is
 //! `crates/lex-metal/tests/gemm_gpu.rs`, against the interpreter.
 
 #[cfg(target_os = "macos")]
@@ -26,6 +30,7 @@ fn main() -> Result<(), String> {
             .ok_or("--tokens takes a count")?,
         None => 128,
     };
+    let overlap = args.iter().any(|a| a == "--overlap");
     let copies = 4;
     let reps = 5;
     // (label, tokens, rows, inputs, residual, f16 activations): the
@@ -80,21 +85,23 @@ fn main() -> Result<(), String> {
             })
             .collect();
         let r = gpu.zeroed::<f32>(m * n);
-        let y = gpu.zeroed::<f32>(m * n);
-        let bufs: Vec<Vec<&Buffer>> = sets
-            .iter()
-            .map(|[q, s, gs]| {
+        let steps_n = copies * 4;
+        let ys: Vec<Buffer> = (0..if overlap { steps_n } else { 1 })
+            .map(|_| gpu.zeroed::<f32>(m * n))
+            .collect();
+        let bufs: Vec<Vec<&Buffer>> = (0..steps_n)
+            .map(|i| {
+                let [q, s, gs] = &sets[i % copies];
                 let mut b = vec![&x, q, s, gs];
                 if residual {
                     b.push(&r);
                 }
-                b.push(&y);
+                b.push(&ys[if overlap { i } else { 0 }]);
                 b
             })
             .collect();
-        let steps: Vec<(&lex_metal::Pipeline, &[&Buffer])> = (0..copies * 4)
-            .map(|i| (&pipe, bufs[i % copies].as_slice()))
-            .collect();
+        let steps: Vec<(&lex_metal::Pipeline, &[&Buffer])> =
+            bufs.iter().map(|b| (&pipe, b.as_slice())).collect();
         gpu.run_all(&steps);
         let mut best = f64::INFINITY;
         for _ in 0..reps {
