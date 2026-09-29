@@ -1929,6 +1929,24 @@ impl Gen<'_> {
         // so every touch below is emitted with a literal. `r`, `m` and `step`
         // are all known here.
         let unroll = r * m * step <= 128;
+        // NVFP4 whose run shares one scale: sum the run unscaled, per (row,
+        // token), and pay one multiply at its end rather than one per
+        // weight -- what the single-row reduction does, for the reason its
+        // comment gives: on Metal this loop is short of ALU, not bandwidth.
+        // A verify of three read gate/up in 138 us against a step's 109 while
+        // multiplying every weight by its scale. Only while `r * m` run
+        // accumulators fit beside the sums (verify batches, not a prefill's
+        // eight-token tail).
+        let defer =
+            unroll && r * m <= 16 && matches!(dq.as_ref().map(|d| &d.pack), Some(Pack::Fp4(..)));
+        let weights: Vec<String> = if defer {
+            weights
+                .iter()
+                .map(|w| w.replace(" * sgr[rr]", ""))
+                .collect()
+        } else {
+            weights
+        };
         self.line(&format!("float s[{r}][{m}];"));
         if unroll {
             for rr in 0..r {
@@ -2040,6 +2058,17 @@ impl Gen<'_> {
                 self.line("}");
             }
         } else {
+            if defer {
+                self.line(&format!("float run[{r}][{m}];"));
+                for rr in 0..r {
+                    self.line(
+                        &(0..m)
+                            .map(|i| format!("run[{rr}][{i}] = 0.0f;"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+            }
             self.line(&format!("for (uint u = 0; u < {v}u; u += {step}u) {{"));
             self.depth += 1;
             self.line("const uint p = p0 + u;");
@@ -2092,8 +2121,9 @@ impl Gen<'_> {
                         lit(&pre),
                         decl.iter().map(|d| lit(d)).collect::<Vec<_>>().join(" ")
                     ));
+                    let acc = if defer { "run" } else { "s" };
                     for i in 0..m {
-                        self.line(&format!("s[{rr}][{i}] += {};", terms(&i.to_string())));
+                        self.line(&format!("{acc}[{rr}][{i}] += {};", terms(&i.to_string())));
                     }
                     self.depth -= 1;
                     self.line("}");
@@ -2115,6 +2145,16 @@ impl Gen<'_> {
             }
             self.depth -= 1;
             self.line("}");
+            if defer {
+                for rr in 0..r {
+                    self.line(
+                        &(0..m)
+                            .map(|i| format!("s[{rr}][{i}] += run[{rr}][{i}] * sgr[{rr}];"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+            }
         }
         self.depth -= 1;
         self.line("}");
