@@ -548,7 +548,8 @@ mod gpu {
     /// On an L4 the float matvec is clock-bound under the 72 W cap -- its
     /// cost is instructions per weight byte -- and this spends about a fifth
     /// as many. It changes the arithmetic (8-bit activations, a scale per 16
-    /// values), so it is CUDA-only, NVFP4-only, off with `LEX_INT8=0`, and
+    /// values), so it is CUDA-only, NVFP4-only, opt-in with `LEX_INT8=1`
+    /// (8-bit activations fail the golden tolerance; see where it is set), and
     /// covers decode and verify batches (up to `SPEC_MAX` tokens): prefill
     /// chunks go through the GEMM, and every shape here is an NVRTC compile
     /// at load.
@@ -1015,7 +1016,11 @@ mod gpu {
             let keys = mv_keys(&layers, &lm_head, mtp.as_ref());
             let int8_on = crate::dev::gemm_backend() == lex_msl::gemm::Backend::Cuda
                 && gemm_ok
-                && std::env::var("LEX_INT8").map_or(true, |v| v != "0")
+                // Opt-in: 66% faster decode on an L4 (112 -> 67 ms a token),
+                // but 8-bit activations moved a golden log-prob by 0.027
+                // against a 0.02 tolerance (2026-09-29). Off until the
+                // arithmetic passes.
+                && std::env::var("LEX_INT8").is_ok_and(|v| v == "1")
                 && keys.iter().all(|&(n_in, ..)| lex_msl::int8::fits(n_in));
             let int8 = if int8_on {
                 let widest = keys.iter().map(|&(n_in, ..)| n_in).max().unwrap_or(0);
