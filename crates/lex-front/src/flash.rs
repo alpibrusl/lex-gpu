@@ -147,7 +147,15 @@ impl FlashDecode {
             return Ok(b.finish());
         }
 
-        let (qs, [ms, ls, accs]) = setup(&mut b, &c, pid, pq, 0, c.n_qb(), (c.bq, c.q_rows));
+        let (qs, [ms, ls, accs]) = setup(
+            &mut b,
+            &c,
+            pid,
+            pq,
+            IdxExpr::lit(0),
+            c.n_qb(),
+            (c.bq, c.q_rows),
+        );
 
         if c.kv_space != Space::Threadgroup {
             // Synchronous loads straight into registers: nothing to rotate.
@@ -184,7 +192,7 @@ impl FlashDecode {
                 &c,
                 pid,
                 po,
-                0,
+                IdxExpr::lit(0),
                 qs,
                 [out[0], out[1], out[2]],
                 (c.bq, c.q_rows),
@@ -296,7 +304,16 @@ impl FlashDecode {
         }
         b.drop(kfree);
         b.drop(vfree);
-        finish(&mut b, &c, pid, po, 0, qs, [ms, ls, accs], (c.bq, c.q_rows));
+        finish(
+            &mut b,
+            &c,
+            pid,
+            po,
+            IdxExpr::lit(0),
+            qs,
+            [ms, ls, accs],
+            (c.bq, c.q_rows),
+        );
         Ok(b.finish())
     }
 
@@ -335,7 +352,15 @@ impl FlashDecode {
         let len = b.dyn_index("len", cap);
         let nkb = b.dyn_index("nkb", cap / c.bk);
 
-        let (qs, [ms, ls, accs]) = setup(&mut b, &c, pid, pq, 0, c.n_qb(), (c.bq, c.q_rows));
+        let (qs, [ms, ls, accs]) = setup(
+            &mut b,
+            &c,
+            pid,
+            pq,
+            IdxExpr::lit(0),
+            c.n_qb(),
+            (c.bq, c.q_rows),
+        );
         let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
         let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
         let carry = vec![
@@ -366,7 +391,7 @@ impl FlashDecode {
             &c,
             pid,
             po,
-            0,
+            IdxExpr::lit(0),
             qs,
             [out[0], out[1], out[2]],
             (c.bq, c.q_rows),
@@ -385,6 +410,20 @@ impl FlashDecode {
     /// masked at its own position (`limit = pos0 + t + 1`). Runtime scalars:
     /// `pos0`, and `nkb`, the blocks covering `pos0 + tokens`.
     pub fn build_causal(&self, tokens: usize) -> Result<Program, String> {
+        self.build_causal_blocks(tokens, tokens)
+    }
+
+    /// [`Self::build_causal`] with the tokens cut into blocks of `tq`: one
+    /// instance per KV head and block, on a second grid dimension.
+    ///
+    /// In one block, a 128-token prefill chunk is four threadgroups -- one
+    /// per KV head -- each walking the cache for 768 query rows, on a GPU
+    /// with forty cores: 2.6 ms a layer on an M4 Max, a tenth of the
+    /// prefill. Each query still meets the same KV blocks in the same order
+    /// with the same online-softmax update, so its output is the same to
+    /// the bit; what changes is that the blocks run side by side, each
+    /// loading the cache for itself.
+    pub fn build_causal_blocks(&self, tokens: usize, tq: usize) -> Result<Program, String> {
         let c = *self;
         let cap = c.kv_rows();
         if c.bq != c.q_rows || c.bq == 0 || c.bk == 0 || c.heads == 0 || c.consumers != 0 {
@@ -396,10 +435,18 @@ impl FlashDecode {
                 c.bk
             ));
         }
+        if tq == 0 || !tokens.is_multiple_of(tq) {
+            return Err(format!("{tokens} tokens are not whole blocks of {tq}"));
+        }
         let group = c.q_rows;
         let hg = c.heads * group;
+        let blocked = if tq == tokens {
+            String::new()
+        } else {
+            format!("_tq{tq}")
+        };
         let mut b = Builder::new(&format!(
-            "flash_causal_{}_t{tokens}_g{group}_bk{}_cap{cap}",
+            "flash_causal_{}_t{tokens}{blocked}_g{group}_bk{}_cap{cap}",
             c.dtype.suffix(),
             c.bk
         ));
@@ -408,20 +455,24 @@ impl FlashDecode {
         let pv = b.param("v", c.dtype, &[c.heads * cap, c.d], false);
         let po = b.param("o", DType::F32, &[tokens * hg, c.d], true);
         let pid = b.grid(c.heads);
+        let blk = (tq < tokens).then(|| b.grid2(tokens / tq));
         let pos0 = b.dyn_index("pos0", cap - tokens);
         let nkb = b.dyn_index("nkb", cap / c.bk);
+        // The block's first query row, and its first token's position.
+        let q0 = blk.map_or(IdxExpr::lit(0), |g| IdxExpr::scaled(g, tq * hg, 0));
+        let t0 = blk.map_or(IdxExpr::lit(0), |g| IdxExpr::scaled(g, tq, 0));
 
         let strides = (hg, group);
-        let (qs, [ms, ls, accs]) = setup(&mut b, &c, pid, pq, 0, tokens, strides);
+        let (qs, [ms, ls, accs]) = setup(&mut b, &c, pid, pq, q0.clone(), tq, strides);
         let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
         let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
         let carry = vec![
-            Ty::Array(m_ty.clone(), tokens),
-            Ty::Array(m_ty, tokens),
-            Ty::Array(acc_ty, tokens),
+            Ty::Array(m_ty.clone(), tq),
+            Ty::Array(m_ty, tq),
+            Ty::Array(acc_ty, tq),
         ];
         let kv = TileTy::new(c.dtype, &[c.bk, c.d], c.kv_space);
-        let limit = move |qb: Var| IdxExpr::lit(1).plus(pos0, 1).plus(qb, 1);
+        let limit = move |qb: Var| t0.clone().shift(1).plus(pos0, 1).plus(qb, 1);
         let out = b.for_range_dyn(0, cap / c.bk, nkb, vec![ms, ls, accs], carry, |b, i, p| {
             let at = IdxExpr::scaled(i, c.bk, 0).plus(pid, cap);
             let k = b.op("k", Op::Load(rows(pk, at.clone(), c.bk, c.d), kv.clone()));
@@ -444,7 +495,7 @@ impl FlashDecode {
             &c,
             pid,
             po,
-            0,
+            q0,
             qs,
             [out[0], out[1], out[2]],
             strides,
@@ -494,7 +545,16 @@ impl FlashDecode {
         let split = b.grid2(splits);
         let len = b.dyn_index("len", cap);
 
-        let (qs, [ms, ls, accs]) = setup_from(&mut b, &c, pid, pq, 0, 1, (c.bq, group), -1e30);
+        let (qs, [ms, ls, accs]) = setup_from(
+            &mut b,
+            &c,
+            pid,
+            pq,
+            IdxExpr::lit(0),
+            1,
+            (c.bq, group),
+            -1e30,
+        );
         let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
         let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
         let carry = vec![
@@ -603,7 +663,8 @@ impl FlashDecode {
         let strides = (hg, group);
         // A large finite negative, not -inf: a split that sees no position
         // must produce a zero-weight partial rather than a NaN.
-        let (qs, [ms, ls, accs]) = setup_from(&mut b, &c, pid, pq, 0, tokens, strides, -1e30);
+        let (qs, [ms, ls, accs]) =
+            setup_from(&mut b, &c, pid, pq, IdxExpr::lit(0), tokens, strides, -1e30);
         let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
         let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
         let carry = vec![
@@ -804,7 +865,8 @@ impl FlashDecode {
                 body: Box::new(move |b: &mut Builder, p: &[Var]| {
                     let h = p[0];
                     let q0 = k * per * c.bq;
-                    let (qs, state) = setup(b, &c, pid, pq, q0, per, (c.bq, c.q_rows));
+                    let (qs, state) =
+                        setup(b, &c, pid, pq, IdxExpr::lit(q0), per, (c.bq, c.q_rows));
                     let m_ty = TileTy::new(DType::F32, &[c.bq], Space::Reg);
                     let acc_ty = TileTy::new(DType::F32, &[c.bq, c.d], Space::Reg);
                     let carry = vec![
@@ -831,7 +893,7 @@ impl FlashDecode {
                         &c,
                         pid,
                         po,
-                        q0,
+                        IdxExpr::lit(q0),
                         qs,
                         [out[0], out[1], out[2]],
                         (c.bq, c.q_rows),
@@ -854,7 +916,7 @@ fn setup(
     c: &FlashDecode,
     pid: Var,
     pq: usize,
-    q0: usize,
+    q0: IdxExpr,
     n: usize,
     strides: (usize, usize),
 ) -> (Var, [Var; 3]) {
@@ -870,7 +932,7 @@ fn setup_from(
     c: &FlashDecode,
     pid: Var,
     pq: usize,
-    q0: usize,
+    q0: IdxExpr,
     n: usize,
     strides: (usize, usize),
     m0: f32,
@@ -880,7 +942,7 @@ fn setup_from(
         .map(|qb| {
             let view = rows(
                 pq,
-                (IdxExpr::lit(q0 + qb * strides.0)).plus(pid, strides.1),
+                q0.clone().shift(qb * strides.0).plus(pid, strides.1),
                 c.bq,
                 c.d,
             );
@@ -907,7 +969,7 @@ fn finish(
     c: &FlashDecode,
     pid: Var,
     po: usize,
-    q0: usize,
+    q0: IdxExpr,
     qs: Var,
     [ms, ls, accs]: [Var; 3],
     strides: (usize, usize),
@@ -930,7 +992,7 @@ fn finish(
             b.drop(p[0]);
             let view = rows(
                 po,
-                (IdxExpr::scaled(qb, strides.0, q0)).plus(pid, strides.1),
+                q0.clone().plus(qb, strides.0).plus(pid, strides.1),
                 c.bq,
                 c.d,
             );

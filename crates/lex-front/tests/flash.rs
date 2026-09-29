@@ -172,7 +172,8 @@ fn dynamic_length_attention_matches_the_reference_at_every_length() {
 
 /// Prefill / speculative verify: `tokens` new queries at `pos0..`, each
 /// seeing only the positions up to its own. Queries and outputs in the
-/// natural [token, kv head, group, d] order.
+/// natural [token, kv head, group, d] order. Cut into blocks of `tq` tokens
+/// on a second grid dimension, every output is the same to the bit.
 #[test]
 fn causal_attention_sees_exactly_its_own_prefix() {
     use lex_front::run_dyn;
@@ -191,8 +192,18 @@ fn causal_attention_sees_exactly_its_own_prefix() {
         heads,
         kv_cap: cap,
     };
-    for (tokens, pos0) in [(1usize, 0usize), (5, 20), (4, 12), (8, 56)] {
-        let prog = cfg.build_causal(tokens).unwrap();
+    let mut whole: Vec<f32> = vec![];
+    for (tokens, pos0, tq) in [
+        (1usize, 0usize, 1usize),
+        (5, 20, 5),
+        (4, 12, 4),
+        (8, 56, 8),
+        (8, 20, 8),
+        (8, 20, 4),
+        (8, 20, 2),
+        (8, 20, 1),
+    ] {
+        let prog = cfg.build_causal_blocks(tokens, tq).unwrap();
         check(&prog, &Target::apple_m_series()).expect("check");
         let mk = |rows: usize, seed: u32| {
             let mut x = vec![0.0; rows * D];
@@ -219,11 +230,20 @@ fn causal_attention_sees_exactly_its_own_prefix() {
                 let err = max_rel_err(got, &want);
                 assert!(
                     err < TOL,
-                    "tokens {tokens} pos0 {pos0} token {tok} head {h}: {err:e}"
+                    "tokens {tokens} pos0 {pos0} tq {tq} token {tok} head {h}: {err:e}"
                 );
             }
         }
+        if tq == tokens {
+            whole = t[3].data.clone();
+        } else {
+            assert_eq!(t[3].data, whole, "tq {tq} differs from one block");
+        }
     }
+    assert!(
+        cfg.build_causal_blocks(8, 3).is_err(),
+        "8 tokens in blocks of 3"
+    );
 }
 
 /// Split-KV decode attention: partial softmaxes per cache split, merged by

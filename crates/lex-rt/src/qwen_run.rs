@@ -278,8 +278,39 @@ mod gpu {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2)
     }
+    /// Tokens per instance of the batched causal attention: one, or the
+    /// largest block up to `LEX_ATTN_TQ` that divides the batch. At a
+    /// 128-token prefill chunk on an M4 Max, a layer's attention cost 1.09
+    /// ms in blocks of one token, 1.27 in two, 1.46 in four, 4.24 in
+    /// sixteen: the finest cut fills the GPU and each block still stops
+    /// masking where its token does.
+    fn attn_tq(t: usize) -> usize {
+        let want = std::env::var("LEX_ATTN_TQ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1usize);
+        (1..=want.min(t))
+            .rev()
+            .find(|q| t.is_multiple_of(*q))
+            .unwrap_or(1)
+    }
+    /// Whether a batch of `t` attends through the split-KV kernels.
+    ///
+    /// Splitting the cache is what keeps a verify's few tokens from being
+    /// one threadgroup per KV head scanning a long cache. A prefill chunk
+    /// is already spread across the GPU by its tokens ([`attn_tq`]), and
+    /// splitting it as well made every split carry all of the chunk's query
+    /// rows: 512-token prefill spent 329 ms in attention split against 70
+    /// in token blocks, and 2048 tokens 3.1 s against 0.92.
+    fn split_attn(t: usize, nsplit: usize) -> bool {
+        t <= MAX_BATCH && nsplit >= attn_min_splits()
+    }
     /// State rows per instance of the delta step.
     const DELTA_ROWS: usize = 8;
+    /// The same for a prefill chunk, whose instances each walk 128 tokens
+    /// in sequence. Per call at a 128-token chunk on an M4 Max: 4 rows
+    /// 2.15 ms, 8 rows 1.70, 16 rows 1.53, 32 rows 2.17.
+    const DELTA_ROWS_PREFILL: usize = 16;
     /// The dtype the *batched* path keeps normalised activations in.
     ///
     /// A batched matmul re-reads every token's activations once per
@@ -1719,7 +1750,7 @@ mod gpu {
             // The head's cache is its own and shorter than the model's, so
             // it crosses the split threshold later -- but it crosses it.
             let nsplit = self.nsplit(self.mtp_pos + t);
-            if nsplit >= attn_min_splits() {
+            if split_attn(t, nsplit) {
                 d.push((
                     "mtp attention",
                     &k.attn_split,
@@ -2200,7 +2231,11 @@ mod gpu {
                 k_heads: c.k_heads,
                 k_dim: dk,
                 v_dim: dv,
-                rows: DELTA_ROWS,
+                rows: if t > MAX_BATCH {
+                    DELTA_ROWS_PREFILL
+                } else {
+                    DELTA_ROWS
+                },
                 v_base: c.v_base(),
                 v_width: ch,
             };
@@ -2317,7 +2352,7 @@ mod gpu {
                     &kv_append_rows(t, c.kv_heads, c.head_dim, self.cap, DType::F32),
                     64,
                 )?,
-                attn: compile(gpu, &attn.build_causal(t)?, 128)?,
+                attn: compile(gpu, &attn.build_causal_blocks(t, attn_tq(t))?, 128)?,
                 attn_split: compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128)?,
                 attn_combine: compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128)?,
                 mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
@@ -2603,7 +2638,7 @@ mod gpu {
                         // masked to its own position, and a second kernel
                         // merges the partials per query row.
                         let nsplit = self.nsplit(self.pos + t);
-                        if nsplit >= attn_min_splits() {
+                        if split_attn(t, nsplit) {
                             d.push((
                                 "attention",
                                 &k.attn_split,

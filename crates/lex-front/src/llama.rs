@@ -819,27 +819,37 @@ pub fn kv_append_rows(
     let px = b.param("x", x_dtype, &[tokens * heads, hd], false);
     let pc = b.param("cache", DType::F16, &[heads * cap, hd], true);
     let pos0 = b.dyn_index("pos0", cap - tokens);
-    for t in 0..tokens {
-        for h in 0..heads {
-            let r = b.op(
-                "row",
-                Op::Load(
-                    at(px, [IdxExpr::lit(t * heads + h), IdxExpr::lit(0)], [1, hd]),
-                    reg(x_dtype, &[1, hd]),
+    // One grid instance per token. Written as one instance with every row
+    // unrolled, a 128-token prefill chunk appended its 512 rows one after
+    // another in a single threadgroup: 0.58 ms a layer on an M4 Max, 2.4%
+    // of the prefill, for 256 KB.
+    let tok = b.grid(tokens);
+    for h in 0..heads {
+        let r = b.op(
+            "row",
+            Op::Load(
+                at(
+                    px,
+                    [IdxExpr::scaled(tok, heads, h), IdxExpr::lit(0)],
+                    [1, hd],
                 ),
-            );
-            let r = if x_dtype == DType::F16 {
-                r
-            } else {
-                b.op("row16", Op::Convert(Move(r), DType::F16))
-            };
-            let dst = at(
-                pc,
-                [IdxExpr::lit(h * cap + t).plus(pos0, 1), IdxExpr::lit(0)],
-                [1, hd],
-            );
-            b.effect(Op::Store(Move(r), dst));
-        }
+                reg(x_dtype, &[1, hd]),
+            ),
+        );
+        let r = if x_dtype == DType::F16 {
+            r
+        } else {
+            b.op("row16", Op::Convert(Move(r), DType::F16))
+        };
+        let dst = at(
+            pc,
+            [
+                IdxExpr::scaled(tok, 1, h * cap).plus(pos0, 1),
+                IdxExpr::lit(0),
+            ],
+            [1, hd],
+        );
+        b.effect(Op::Store(Move(r), dst));
     }
     b.finish()
 }
