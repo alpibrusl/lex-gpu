@@ -21,7 +21,7 @@
 
 use lex_ir::{DType, Space};
 
-use crate::ir::{Arg, BinOp, Builder, IdxExpr, Op, Program, Reduce, TileTy, Ty, UnOp, View};
+use crate::ir::{Arg, BinOp, Builder, IdxExpr, Op, Program, Reduce, TileTy, Ty, UnOp, Var, View};
 
 fn reg(shape: &[usize]) -> TileTy {
     TileTy::new(DType::F32, shape, Space::Reg)
@@ -260,7 +260,7 @@ pub fn build_gates_rows(tokens: usize, v_heads: usize, v_dim: usize) -> Program 
 
     let one = reg(&[1]);
     let row = TileTy::new(DType::F32, &[1, v_dim], Space::Reg);
-    b.for_range(0, tokens, vec![], vec![], |b, tok, _| {
+    let body = |b: &mut Builder, tok: Var, _: &[Var]| -> Vec<Var> {
         // This token's `a` and `b`; `A` and the bias are weights.
         let per_token = |param| View {
             param,
@@ -302,7 +302,16 @@ pub fn build_gates_rows(tokens: usize, v_heads: usize, v_dim: usize) -> Program 
         spread(b, g, pg);
         spread(b, beta, pbeta);
         vec![]
-    });
+    };
+    if tokens == 1 {
+        b.for_range(0, tokens, vec![], vec![], body);
+    } else {
+        // A batch's tokens on the second grid dimension. A loop over them
+        // inside each head's instance was 48 instances walking a 128-token
+        // prefill chunk: 105 us a call on an M4 Max, for 12 KB of output.
+        let tok = b.grid2(tokens);
+        body(&mut b, tok, &[]);
+    }
     b.finish()
 }
 
@@ -670,22 +679,15 @@ pub fn build_delta_qk_rows_in(
     ));
     let px = b.param("x", DType::F32, &[tokens, width], false);
     let py = b.param("y", DType::F32, &[tokens * k_heads * per, k_dim], true);
-    // Instance `(copy, head)`: the head's row read once, written `per`
-    // times. Both indices stay affine this way.
-    let copy = b.grid(per);
-    let head = b.grid2(k_heads);
-
     let tile = TileTy::new(DType::F32, &[1, k_dim], Space::Reg);
-    b.for_range(0, tokens, vec![], vec![], |b, tok, _| {
+    // One head of one token: normalise its row, scale it.
+    let normed = |b: &mut Builder, tok: IdxExpr, head: Var| {
         let x = b.op(
             "x",
             Op::Load(
                 View {
                     param: px,
-                    offset: vec![
-                        IdxExpr::scaled(tok, 1, 0),
-                        IdxExpr::scaled(head, k_dim, 0).shift(first),
-                    ],
+                    offset: vec![tok, IdxExpr::scaled(head, k_dim, 0).shift(first)],
                     shape: vec![1, k_dim],
                 },
                 tile.clone(),
@@ -701,28 +703,45 @@ pub fn build_delta_qk_rows_in(
         let t = b.op("t", Op::Binary(BinOp::Add, Move(ms), Move(e)));
         let r = b.op("r", Op::Unary(UnOp::Rsqrt, Move(t)));
         let y = b.op("y", Op::Binary(BinOp::Mul, Move(x), Move(r)));
-        let y = b.op("y", Op::Scale(Move(y), scale));
+        b.op("y", Op::Scale(Move(y), scale))
+    };
+    // Where copy `c` of head `head` of token `tok` goes.
+    let dst = |tok: IdxExpr, c: IdxExpr, head: Var| View {
+        param: py,
+        offset: vec![
+            if tiled {
+                tok.plus_expr(c, k_heads).plus(head, 1)
+            } else {
+                tok.plus(head, per).plus_expr(c, 1)
+            },
+            IdxExpr::lit(0),
+        ],
+        shape: vec![1, k_dim],
+    };
+    if tokens == 1 {
+        // Instance `(copy, head)`: the head's row read once, written `per`
+        // times. Both indices stay affine this way.
+        let copy = b.grid(per);
+        let head = b.grid2(k_heads);
+        let y = normed(&mut b, IdxExpr::lit(0), head);
         b.effect(Op::Store(
             Move(y),
-            View {
-                param: py,
-                offset: vec![
-                    if tiled {
-                        IdxExpr::scaled(tok, k_heads * per, 0)
-                            .plus(copy, k_heads)
-                            .plus(head, 1)
-                    } else {
-                        IdxExpr::scaled(tok, k_heads * per, 0)
-                            .plus(head, per)
-                            .plus(copy, 1)
-                    },
-                    IdxExpr::lit(0),
-                ],
-                shape: vec![1, k_dim],
-            },
+            dst(IdxExpr::lit(0), IdxExpr::scaled(copy, 1, 0), head),
         ));
-        vec![]
-    });
+    } else {
+        // A batch spreads over its tokens instead: `(token, head)`, the
+        // copies written in turn. Instances over copies and heads with a
+        // loop over tokens inside was 48 instances each walking a 128-token
+        // prefill chunk, a reduction a token: 68 us a call on an M4 Max.
+        let tok = b.grid(tokens);
+        let head = b.grid2(k_heads);
+        let row = IdxExpr::scaled(tok, k_heads * per, 0);
+        let y = normed(&mut b, IdxExpr::scaled(tok, 1, 0), head);
+        for c in 0..per {
+            let arg = if c + 1 == per { Move(y) } else { Borrow(y) };
+            b.effect(Op::Store(arg, dst(row.clone(), IdxExpr::lit(c), head)));
+        }
+    }
     Ok(b.finish())
 }
 
@@ -760,15 +779,23 @@ pub fn build_matvec_dense_rows(
     let pw = b.param("w", w, &[n_out, n_in], false);
     let py = b.param("y", DType::F32, &[tokens, n_out], true);
     let row = b.grid(n_out / bo);
+    // A batch's tokens on the second grid dimension, one row of `x` each.
+    // Every instance loading all of them was 48 instances each reading a
+    // 128-token chunk's 1.3 MB: 100 us a call on an M4 Max.
+    let first = if tokens == 1 {
+        IdxExpr::lit(0)
+    } else {
+        IdxExpr::scaled(b.grid2(tokens), 1, 0)
+    };
     let x = b.op(
         "x",
         Op::Load(
             View {
                 param: px,
-                offset: vec![IdxExpr::lit(0), IdxExpr::lit(0)],
-                shape: vec![tokens, n_in],
+                offset: vec![first.clone(), IdxExpr::lit(0)],
+                shape: vec![1, n_in],
             },
-            TileTy::new(DType::F32, &[tokens, n_in], Space::Reg),
+            TileTy::new(DType::F32, &[1, n_in], Space::Reg),
         ),
     );
     let wt = b.op(
@@ -787,8 +814,8 @@ pub fn build_matvec_dense_rows(
         Move(y),
         View {
             param: py,
-            offset: vec![IdxExpr::lit(0), IdxExpr::scaled(row, bo, 0)],
-            shape: vec![tokens, bo],
+            offset: vec![first, IdxExpr::scaled(row, bo, 0)],
+            shape: vec![1, bo],
         },
     ));
     Ok(b.finish())

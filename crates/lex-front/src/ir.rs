@@ -150,6 +150,15 @@ impl IdxExpr {
         self.constant += c as i64;
         self
     }
+
+    /// `self + coeff * e`
+    pub fn plus_expr(mut self, e: IdxExpr, coeff: usize) -> IdxExpr {
+        let k = coeff as i64;
+        self.constant += e.constant * k;
+        self.terms
+            .extend(e.terms.into_iter().map(|(v, c)| (v, c * k)));
+        self
+    }
 }
 
 /// A rectangular window into a global tensor.
