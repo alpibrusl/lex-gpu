@@ -542,6 +542,37 @@ mod gpu {
         norm: Buffer,
     }
 
+    /// The int8 matvec path (`lex_msl::int8`): its kernels by batch size and
+    /// shape, and the quantised input they share.
+    ///
+    /// On an L4 the float matvec is clock-bound under the 72 W cap -- its
+    /// cost is instructions per weight byte -- and this spends about a fifth
+    /// as many. It changes the arithmetic (8-bit activations, a scale per 16
+    /// values), so it is CUDA-only, NVFP4-only, off with `LEX_INT8=0`, and
+    /// covers decode and verify batches (up to `SPEC_MAX` tokens): prefill
+    /// chunks go through the GEMM, and every shape here is an NVRTC compile
+    /// at load.
+    struct Int8 {
+        /// `(tokens, n_out, n_in, residual)`.
+        mm: HashMap<(usize, usize, usize, bool), Pipeline>,
+        /// `(tokens, n_in, x is f16)`.
+        quant: HashMap<(usize, usize, bool), Pipeline>,
+        xq: Buffer,
+        xs: Buffer,
+    }
+
+    /// Whether the batched matmul for this shape reads f16 activations.
+    ///
+    /// `res` marks the matmuls that accumulate into the residual -- down and
+    /// o_proj -- which read `ffn_a` and `gated`, not `h`. Every batched
+    /// matmul reads a narrowed buffer except o_proj, which reads `gated`,
+    /// and the draft head's `fc`, which reads a fused input built on the
+    /// host: the decode path's `fc` reads it in f32, the two write the same
+    /// cache, and handed f16 it reads the f32 bytes as half pairs.
+    fn batch_x_half(c: &Config, n_in: usize, res: bool) -> bool {
+        !(n_in == 2 * c.hidden || (res && n_in == c.heads * c.head_dim)) && X_DTYPE == DType::F16
+    }
+
     /// Every pipeline a step dispatches.
     struct Kernels {
         rms: Pipeline,
@@ -699,6 +730,7 @@ mod gpu {
         /// Every matrix is NVFP4, which is what the prefill GEMM reads.
         /// Otherwise prefill stays at `MAX_BATCH`.
         gemm_ok: bool,
+        int8: Option<Int8>,
         prof: std::cell::RefCell<std::collections::BTreeMap<&'static str, (usize, f64)>>,
     }
 
@@ -980,6 +1012,35 @@ mod gpu {
             let gemm_ok = mv_keys(&layers, &lm_head, mtp.as_ref())
                 .iter()
                 .all(|&(_, _, _, layout)| layout == QLayout::NVFP4);
+            let keys = mv_keys(&layers, &lm_head, mtp.as_ref());
+            let int8_on = crate::dev::gemm_backend() == lex_msl::gemm::Backend::Cuda
+                && gemm_ok
+                && std::env::var("LEX_INT8").map_or(true, |v| v != "0")
+                && keys.iter().all(|&(n_in, ..)| lex_msl::int8::fits(n_in));
+            let int8 = if int8_on {
+                let widest = keys.iter().map(|&(n_in, ..)| n_in).max().unwrap_or(0);
+                let mut i8k = Int8 {
+                    mm: HashMap::new(),
+                    quant: HashMap::new(),
+                    xq: gpu.zeroed::<i8>(SPEC_MAX * widest),
+                    xs: gpu.zeroed::<f32>(SPEC_MAX * widest / 16),
+                };
+                // Decode's: one token, f32 activations.
+                for &(n_in, n_out, res, _) in &keys {
+                    let mm = lex_msl::int8::matmul_int8(1, n_out, n_in, res)?;
+                    i8k.mm
+                        .entry((1, n_out, n_in, res))
+                        .or_insert(gpu.build_lowered(&mm)?);
+                    if let std::collections::hash_map::Entry::Vacant(v) =
+                        i8k.quant.entry((1, n_in, false))
+                    {
+                        v.insert(gpu.build_lowered(&lex_msl::int8::quant16(1, n_in, false)?)?);
+                    }
+                }
+                Some(i8k)
+            } else {
+                None
+            };
             for key in mv_keys(&layers, &lm_head, mtp.as_ref()) {
                 if let std::collections::hash_map::Entry::Vacant(slot) = k.mv.entry(key) {
                     let (n_in, n_out, res, layout) = key;
@@ -1050,6 +1111,7 @@ mod gpu {
                 pos: 0,
                 sync: std::env::var_os("LEX_SYNC").is_some(),
                 gemm_ok,
+                int8,
                 prof: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             })
         }
@@ -1346,9 +1408,16 @@ mod gpu {
                     &[len as u32, len.div_ceil(ATTN_BK) as u32],
                 );
 
-                let plan = self.mtp_plan();
-                let steps: Vec<Step<'_>> =
-                    plan.iter().map(|(p, b)| (*p, b.as_slice(), None)).collect();
+                let plan: Vec<Dispatch<'_>> = self
+                    .mtp_plan()
+                    .into_iter()
+                    .map(|(p, b)| ("draft", p, b, None))
+                    .collect();
+                let plan = self.int8_plan(plan, 1, false);
+                let steps: Vec<Step<'_>> = plan
+                    .iter()
+                    .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
+                    .collect();
                 self.gpu.run_launches(&steps);
                 drop(plan);
                 self.mtp_pos += 1;
@@ -1495,7 +1564,7 @@ mod gpu {
                 &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
             );
 
-            let plan = self.mtp_batch_plan(t);
+            let plan = self.int8_plan(self.mtp_batch_plan(t), t, true);
             let steps: Vec<Step<'_>> = plan
                 .iter()
                 .map(|(_, p, b, g)| (*p, b.as_slice(), *g))
@@ -1826,6 +1895,7 @@ mod gpu {
             if !self.skip.is_empty() {
                 plan.retain(|d| !self.skip.iter().any(|s| d.0 == s));
             }
+            let plan = self.int8_plan(plan, 1, false);
             self.dispatch(&plan);
             drop(plan);
             self.pos += 1;
@@ -1905,6 +1975,7 @@ mod gpu {
                 // feed-forward's.
                 plan.retain(|d| !self.skip.iter().any(|s| d.0 == s));
             }
+            let plan = self.int8_plan(plan, t, true);
             // Same as `step`: with LEX_SYNC, dispatch one at a time and
             // record where the time went. Without it prefill can only be
             // measured in total, which is enough to see a chunk size cost
@@ -2030,10 +2101,10 @@ mod gpu {
                     // so they have to agree. Handed f16 it reads the f32
                     // bytes as half pairs, and the head answers with one
                     // constant token whatever it is asked.
-                    let xt = if n_in == 2 * c.hidden || (res && n_in == c.heads * c.head_dim) {
-                        DType::F32
+                    let xt = if batch_x_half(&c, n_in, res) {
+                        DType::F16
                     } else {
-                        X_DTYPE
+                        DType::F32
                     };
                     if t > MAX_BATCH {
                         // Past the batched matvec's reach: the GEMM, bound
@@ -2081,6 +2152,27 @@ mod gpu {
                 kv_cap: self.cap,
             };
             let want_snap = t <= SPEC_MAX && self.snap.is_some();
+            if t <= SPEC_MAX
+                && let Some(i8k) = self.int8.as_mut()
+            {
+                for &(n_in, n_out, res, _) in
+                    &mv_keys(&self.layers, &self.lm_head, self.mtp.as_ref())
+                {
+                    let xh = batch_x_half(&c, n_in, res);
+                    if let std::collections::hash_map::Entry::Vacant(v) =
+                        i8k.mm.entry((t, n_out, n_in, res))
+                    {
+                        v.insert(
+                            gpu.build_lowered(&lex_msl::int8::matmul_int8(t, n_out, n_in, res)?)?,
+                        );
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(v) =
+                        i8k.quant.entry((t, n_in, xh))
+                    {
+                        v.insert(gpu.build_lowered(&lex_msl::int8::quant16(t, n_in, xh)?)?);
+                    }
+                }
+            }
             let b = Batch {
                 rms: compile(
                     gpu,
@@ -2190,6 +2282,64 @@ mod gpu {
 
         fn mv(&self, w: &QBuf, res: bool) -> &Pipeline {
             &self.k.mv[&w.key(res)]
+        }
+
+        /// A plan with its NVFP4 matvecs through the int8 path, where that is
+        /// on and has kernels for `t` tokens; otherwise the plan as it was.
+        ///
+        /// Each matvec becomes a quantisation of its input and an int8
+        /// matmul reading the quantised copy -- except that consecutive
+        /// matvecs reading the same buffer (the q/k/v, z and a/b projections
+        /// of one `h`) share one quantisation. `batch` says whose pipelines
+        /// the plan used: the decode step's, or the batch of `t`'s.
+        fn int8_plan<'a>(
+            &'a self,
+            plan: Vec<Dispatch<'a>>,
+            t: usize,
+            batch: bool,
+        ) -> Vec<Dispatch<'a>> {
+            let Some(i8k) = &self.int8 else { return plan };
+            let mv = if batch {
+                match self.batches.get(&t) {
+                    Some(b) => &b.mv,
+                    None => return plan,
+                }
+            } else {
+                &self.k.mv
+            };
+            let c = &self.cfg;
+            let mut out: Vec<Dispatch<'a>> = Vec::with_capacity(plan.len() + 32);
+            // The input last quantised, and where its matmul went in `out`.
+            let mut last: Option<(*const Buffer, usize)> = None;
+            for (label, p, bufs, g) in plan {
+                let key = mv
+                    .iter()
+                    .find(|(_, q)| std::ptr::eq(*q, p))
+                    .map(|(k, _)| *k);
+                let Some((n_in, n_out, res, _)) = key else {
+                    out.push((label, p, bufs, g));
+                    continue;
+                };
+                let xh = batch && batch_x_half(c, n_in, res);
+                let (Some(mm), Some(quant)) = (
+                    i8k.mm.get(&(t, n_out, n_in, res)),
+                    i8k.quant.get(&(t, n_in, xh)),
+                ) else {
+                    out.push((label, p, bufs, g));
+                    continue;
+                };
+                let x: &'a Buffer = bufs[0];
+                let fresh = last.is_some_and(|(px, at)| std::ptr::eq(px, x) && at + 1 == out.len());
+                if !fresh {
+                    out.push(("quant", quant, vec![x, &i8k.xq, &i8k.xs], None));
+                }
+                // [x, q, s, gs, (r), y] becomes [xq, xs, q, s, gs, (r), y].
+                let mut b: Vec<&'a Buffer> = vec![&i8k.xq, &i8k.xs];
+                b.extend_from_slice(&bufs[1..]);
+                out.push((label, mm, b, None));
+                last = Some((x as *const Buffer, out.len() - 1));
+            }
+            out
         }
 
         /// Run a plan in one go -- or, with `sync`, timed per dispatch

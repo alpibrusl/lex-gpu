@@ -12,6 +12,7 @@
 
 pub mod dialect;
 pub mod gemm;
+pub mod int8;
 pub mod program;
 
 use std::fmt::Write as _;
