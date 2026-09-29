@@ -759,9 +759,11 @@ fn copy_block_takes_the_block_it_names() {
     for which in 0..blocks {
         let prog = copy_block(blocks, rows, cols, which).unwrap();
         check(&prog, &Target::apple_m_series()).unwrap_or_else(|e| panic!("{e:#?}"));
+        // The buffers are flat; the program declares whatever 2-d view of
+        // them it copies in, so take the shapes from it.
         let mut t = vec![
-            Tensor::new(DType::F32, &[blocks * rows, cols], &src),
-            Tensor::zeros(DType::F32, &[rows, cols]),
+            Tensor::new(DType::F32, &prog.params[0].shape, &src),
+            Tensor::zeros(DType::F32, &prog.params[1].shape),
         ];
         run(&prog, &mut t).expect("copy");
         let want = &src[which * rows * cols..(which + 1) * rows * cols];

@@ -941,21 +941,26 @@ pub fn copy_block(
     if which >= blocks || rows == 0 || cols == 0 {
         return Err(format!("block {which} of {blocks} x [{rows}, {cols}]"));
     }
-    let chunk = gcd(cols, 256).max(1);
+    // A block is `rows * cols` contiguous floats, so it is copied as that:
+    // pieces of up to 4096 (16 KB), one per grid instance. Split by row,
+    // as it once was, the delta state's 6144 rows of 128 made 6144
+    // instances of 512 bytes each, and the copy ran at 69 GB/s -- 2.2 ms of
+    // GPU time for 151 MB, on every rejected speculation round.
+    let total = rows * cols;
+    let chunk = gcd(total, 4096).max(1);
+    let pieces = total / chunk;
     let mut b = Builder::new(&format!("copy_block{which}of{blocks}_{rows}x{cols}"));
-    let src = b.param("src", DType::F32, &[blocks * rows, cols], false);
-    let dst = b.param("dst", DType::F32, &[rows, cols], true);
-    let row = b.grid(rows);
+    let src = b.param("src", DType::F32, &[blocks * pieces, chunk], false);
+    let dst = b.param("dst", DType::F32, &[pieces, chunk], true);
+    let piece = b.grid(pieces);
     let tile = TileTy::new(DType::F32, &[1, chunk], Space::Reg);
-    for c in 0..cols / chunk {
-        let at = |param, base: usize| View {
-            param,
-            offset: vec![IdxExpr::scaled(row, 1, base), IdxExpr::lit(c * chunk)],
-            shape: vec![1, chunk],
-        };
-        let v = b.op("v", Op::Load(at(src, which * rows), tile.clone()));
-        b.effect(Op::Store(Arg::Move(v), at(dst, 0)));
-    }
+    let at = |param, base: usize| View {
+        param,
+        offset: vec![IdxExpr::scaled(piece, 1, base), IdxExpr::lit(0)],
+        shape: vec![1, chunk],
+    };
+    let v = b.op("v", Op::Load(at(src, which * pieces), tile));
+    b.effect(Op::Store(Arg::Move(v), at(dst, 0)));
     Ok(b.finish())
 }
 

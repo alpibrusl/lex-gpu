@@ -1223,7 +1223,17 @@ mod gpu {
                 .iter()
                 .map(|(p, b)| (*p, b.as_slice(), None))
                 .collect();
-            self.gpu.run_launches(&launches);
+            let wall = std::time::Instant::now();
+            let (enc, gpu_s) = self.gpu.run_launches(&launches);
+            if std::env::var_os("LEX_SPEC_TRACE").is_some() {
+                eprintln!(
+                    "rollback: {} dispatches, encode {:.2} ms, gpu {:.2} ms, wall {:.2} ms",
+                    launches.len(),
+                    1e3 * enc,
+                    1e3 * gpu_s,
+                    1e3 * wall.elapsed().as_secs_f64()
+                );
+            }
             drop(launches);
             drop(steps);
             // The batch advanced the position by `t`; only `kept + 1` of
@@ -1322,6 +1332,7 @@ mod gpu {
                 }
             }
             let next = instead.unwrap_or_else(|| sampler.pick(&logits[kept]));
+            let t_judge = mark.elapsed().as_secs_f64() * 1e3 - t_verify;
             let committed = fed[..=kept].to_vec();
             // Row `kept` of the verify is the state after exactly the tokens
             // being committed, so it is the right input for the next draft
@@ -1329,6 +1340,7 @@ mod gpu {
             // next draft reads whatever the last single step left behind, and
             // guesses from a state the model was never in.
             let carry = self.batch_hidden(kept);
+            let t_carry = mark.elapsed().as_secs_f64() * 1e3 - t_verify - t_judge;
 
             if kept < drafts.len() {
                 // The pass ran further than the model agreed with, so the
@@ -1346,10 +1358,14 @@ mod gpu {
             }
             self.spec_h = Some(carry);
             if trace {
+                // `undo` is everything after the verify, split: judging the
+                // drafts on the host, fetching the hidden state the next
+                // draft starts from, and rolling rejected rows back.
+                let after = mark.elapsed().as_secs_f64() * 1e3 - t_verify;
                 eprintln!(
                     "draft {t_draft:.1}  save {t_save:.1}  verify {t_verify:.1}  \
-                     undo {:.1}  kept {kept}",
-                    mark.elapsed().as_secs_f64() * 1e3 - t_verify
+                     undo {after:.1}  kept {kept}  (judge {t_judge:.2} carry {t_carry:.2} rollback {:.2})",
+                    after - t_judge - t_carry
                 );
             }
             Ok((committed, next))
