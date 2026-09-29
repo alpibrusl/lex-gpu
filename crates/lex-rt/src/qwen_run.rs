@@ -1339,7 +1339,11 @@ mod gpu {
             // whether or not the rest of the pass is undone. Without this the
             // next draft reads whatever the last single step left behind, and
             // guesses from a state the model was never in.
-            let carry = self.batch_hidden(kept);
+            // Every row's hidden state: row `kept` starts the next draft, and
+            // rows `0..kept` rewrite the head's cache below.
+            let h = self.cfg.hidden;
+            let rows = self.batch_hidden_all(fed.len());
+            let carry = rows[kept * h..(kept + 1) * h].to_vec();
             let t_carry = mark.elapsed().as_secs_f64() * 1e3 - t_verify - t_judge;
 
             if kept < drafts.len() {
@@ -1356,12 +1360,33 @@ mod gpu {
                     }
                 }
             }
+            // Keep the head's cache in step with the model's, as prefill
+            // does. Drafting advanced it one position per *draft*, accepted
+            // or not, and wrote every draft after the first from the head's
+            // own guessed hidden state; left alone it drifted from one
+            // position behind the model to twenty over 300 tokens, the head
+            // drafting from a history the text never had. Cut it back to
+            // the first draft's pair -- built from the model's own hidden
+            // state, so right -- and rewrite the accepted drafts' pairs from
+            // the model's hidden states: row i of the verify with the token
+            // after it.
+            if self.mtp.is_some() {
+                // The round's first token sat at `pos - kept - 1`; its pair
+                // is at the position before that, so the head resumes here.
+                self.mtp_pos = self.pos - kept - 1;
+                if kept > 0 {
+                    self.mtp_warm(&rows[..kept * h], &fed[1..=kept])?;
+                }
+            }
             self.spec_h = Some(carry);
             if trace {
                 // `undo` is everything after the verify, split: judging the
                 // drafts on the host, fetching the hidden state the next
                 // draft starts from, and rolling rejected rows back.
                 let after = mark.elapsed().as_secs_f64() * 1e3 - t_verify;
+                // The head's cache should end one short of the model's: the
+                // pair for the next token is written by the next draft.
+                eprintln!("head gap {}", self.pos as i64 - self.mtp_pos as i64);
                 eprintln!(
                     "draft {t_draft:.1}  save {t_save:.1}  verify {t_verify:.1}  \
                      undo {after:.1}  kept {kept}  (judge {t_judge:.2} carry {t_carry:.2} rollback {:.2})",
@@ -1790,14 +1815,6 @@ mod gpu {
                     self.lm_head.bind(&a.h, None, &a.logits),
                 ),
             ]
-        }
-
-        /// The hidden state a batched pass left for its `i`-th token.
-        fn batch_hidden(&self, i: usize) -> Vec<f32> {
-            let n = self.cfg.hidden;
-            let mut all = vec![0.0f32; (i + 1) * n];
-            self.gpu.download(&self.bacts.x, &mut all);
-            all[i * n..(i + 1) * n].to_vec()
         }
 
         pub fn hidden(&self) -> Vec<f32> {
