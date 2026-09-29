@@ -14,6 +14,17 @@
 //! - `warp_row`  one warp a row, 16 bytes (32 values) a lane a step.
 //! - `warp_row_smem` the same with the input staged in shared memory.
 //! - `warp_4rows` one warp for four rows, each input loaded once for all.
+//! - `quant16`   the input to int8, one scale per 16 values -- what the
+//!   int8 path adds, once per matvec input.
+//! - `int8_row`  one warp a row in integer arithmetic: E2M1 codes to int8
+//!   through `__byte_perm` tables, four products a `__dp4a`, against the
+//!   quantised input. About 20 instructions per 16 weights where the float
+//!   path spends about 100, which is what matters on a card whose clock the
+//!   power cap sets.
+//!
+//! `--reps N` repeats each variant N times over the matrices (default 12).
+//! A short burst runs at full clock; a long one reaches the L4's 72 W cap,
+//! which is where the model runs and where the float path slows by 1.5x.
 //!
 //! Four different matrices are cycled so the 48 MB L2 cannot hold the
 //! 50 MB one being read -- repeating one matrix flattered an earlier sweep.
@@ -29,7 +40,6 @@ fn main() -> Result<(), String> {
 
     const K: usize = 5120;
     const N: usize = 17408;
-    const REPS: usize = 12;
     // What one call moves: codes, scales, row scales, the input.
     let bytes = (N * K / 2 + N * K / 16 + 4 * N + 4 * K) as f64;
 
@@ -167,6 +177,81 @@ extern "C" __global__ void read{sig} {{
 "#,
         n16 = N * K / 2 / 16,
     );
+    // Four E2M1 codes (the low 16 bits) to four int8 values, twice the
+    // true value so they are integers: magnitudes {0,1,2,3,4,6,8,12}. One
+    // `__byte_perm` looks the magnitudes up in a positive table, one in a
+    // negative one -- a selector nibble's low three bits index eight bytes
+    // -- and a third picks, per byte, whichever the code's sign bit says.
+    let int8 = r#"
+__device__ __forceinline__ int e2m1x4(uint codes) {
+    const uint idx = codes & 0x7777u;
+    const uint pos = __byte_perm(0x03020100u, 0x0C080604u, idx);
+    const uint neg = __byte_perm(0xFDFEFF00u, 0xF4F8FAFCu, idx);
+    return (int)__byte_perm(pos, neg, 0x3210u | ((codes & 0x8888u) >> 1u));
+}
+"#;
+    // The input to int8 with one scale per 16 values: one thread a group.
+    let quant16 = format!(
+        r#"{pre}
+extern "C" __global__ void quant16(const float* __restrict__ x, char* __restrict__ xq,
+                                   float* __restrict__ xs) {{
+    const uint g = blockIdx.x * 256u + threadIdx.x;
+    if (g >= {groups}u) return;
+    const float4* xp = reinterpret_cast<const float4*>(x) + g * 4u;
+    const float4 v[4] = {{xp[0], xp[1], xp[2], xp[3]}};
+    float m = 0.0f;
+    for (int i = 0; i < 4; ++i)
+        m = fmaxf(m, fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w))));
+    const float inv = m > 0.0f ? 127.0f / m : 0.0f;
+    uint w[4];
+    for (int i = 0; i < 4; ++i)
+        w[i] = ((uint)__float2int_rn(v[i].x * inv) & 0xFFu)
+             | (((uint)__float2int_rn(v[i].y * inv) & 0xFFu) << 8u)
+             | (((uint)__float2int_rn(v[i].z * inv) & 0xFFu) << 16u)
+             | (((uint)__float2int_rn(v[i].w * inv) & 0xFFu) << 24u);
+    reinterpret_cast<uint4*>(xq)[g] = make_uint4(w[0], w[1], w[2], w[3]);
+    xs[g] = m / 127.0f;
+}}
+"#,
+        groups = K / 16
+    );
+    let int8_row = format!(
+        r#"{pre}{helpers}{int8}
+extern "C" __global__ void int8_row(const char* __restrict__ xq, const float* __restrict__ xs,
+                                    const char* __restrict__ q, const char* __restrict__ s,
+                                    const float* __restrict__ gs, float* __restrict__ y) {{
+    const uint warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+    const uint row = blockIdx.x * 8u + warp;
+    const uint4* qr = reinterpret_cast<const uint4*>(q + (size_t)row * {kb}u);
+    const uchar* sr = reinterpret_cast<const uchar*>(s) + (size_t)row * {ks}u;
+    const uint4* xv = reinterpret_cast<const uint4*>(xq);
+    float acc = 0.0f;
+    #pragma unroll
+    for (uint it = 0; it < {iters}u; ++it) {{
+        const uint c = it * 32u + lane;          // 16 bytes of the row: 32 values
+        const uint4 w = qr[c];
+        const uint g = c * 2u;                   // their two groups of 16
+        const uint4 a = xv[g], b = xv[g + 1u];   // 16 int8 inputs each
+        int d0 = 0, d1 = 0;
+        d0 = __dp4a(e2m1x4(w.x), (int)a.x, d0);
+        d0 = __dp4a(e2m1x4(w.x >> 16u), (int)a.y, d0);
+        d0 = __dp4a(e2m1x4(w.y), (int)a.z, d0);
+        d0 = __dp4a(e2m1x4(w.y >> 16u), (int)a.w, d0);
+        d1 = __dp4a(e2m1x4(w.z), (int)b.x, d1);
+        d1 = __dp4a(e2m1x4(w.z >> 16u), (int)b.y, d1);
+        d1 = __dp4a(e2m1x4(w.w), (int)b.z, d1);
+        d1 = __dp4a(e2m1x4(w.w >> 16u), (int)b.w, d1);
+        acc += (float)d0 * (fp8_e4m3(sr[g]) * xs[g]) + (float)d1 * (fp8_e4m3(sr[g + 1u]) * xs[g + 1u]);
+    }}
+    acc = warp_sum(acc);
+    // Halved: the table holds twice each E2M1 value.
+    if (lane == 0u) y[row] = acc * gs[row] * 0.5f;
+}}
+"#,
+        kb = K / 2,
+        ks = K / 16,
+        iters = K / 1024,
+    );
     let hand = |entry: &str, source: String, grid: usize| Lowered {
         entry: entry.into(),
         source,
@@ -179,13 +264,26 @@ extern "C" __global__ void read{sig} {{
         barriers: 0,
         writes: vec![false, false, false, false, true],
     };
-    let variants: Vec<(&str, Lowered, f64)> = vec![
-        ("read", hand("read", read, 58 * 16), (N * K / 2) as f64),
-        ("emitted", emitted, bytes),
-        ("unroll4", unroll4, bytes),
-        ("warp_row", hand("warp_row", warp_row("warp_row", false), N / 8), bytes),
-        ("warp_row_smem", hand("warp_row_smem", warp_row("warp_row_smem", true), N / 8), bytes),
-        ("warp_4rows", hand("warp_4rows", warp_4rows, N / 32), bytes),
+    // What each variant binds: the f32 input; the quantiser's in and out;
+    // or the quantised input and its scales in place of `x`.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Float,
+        Quant,
+        Int8,
+    }
+    // The int8 path moves the quantised input (1 B a value, and a scale per
+    // 16) where the float path moves 4 B a value.
+    let bytes8 = bytes - (4 * K) as f64 + (K + 4 * K / 16) as f64;
+    let variants: Vec<(&str, Lowered, f64, Kind)> = vec![
+        ("read", hand("read", read, 58 * 16), (N * K / 2) as f64, Kind::Float),
+        ("emitted", emitted, bytes, Kind::Float),
+        ("unroll4", unroll4, bytes, Kind::Float),
+        ("warp_row", hand("warp_row", warp_row("warp_row", false), N / 8), bytes, Kind::Float),
+        ("warp_row_smem", hand("warp_row_smem", warp_row("warp_row_smem", true), N / 8), bytes, Kind::Float),
+        ("warp_4rows", hand("warp_4rows", warp_4rows, N / 32), bytes, Kind::Float),
+        ("quant16", hand("quant16", quant16, (K / 16).div_ceil(256)), (4 * K + K + 4 * K / 16) as f64, Kind::Quant),
+        ("int8_row", hand("int8_row", int8_row, N / 8), bytes8, Kind::Int8),
     ];
 
     // `--emit DIR`: write the sources for scripts/cuda_check.sh and stop,
@@ -201,10 +299,16 @@ extern "C" __global__ void read{sig} {{
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
+    let reps: usize = args
+        .iter()
+        .position(|a| a == "--reps")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
     if let Some(i) = args.iter().position(|a| a == "--emit") {
         let dir = args.get(i + 1).ok_or("--emit needs a directory")?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        for (name, l, _) in &variants {
+        for (name, l, _, _) in &variants {
             std::fs::write(format!("{dir}/mv_{name}.cu"), &l.source).map_err(|e| e.to_string())?;
         }
         return Ok(());
@@ -233,18 +337,26 @@ extern "C" __global__ void read{sig} {{
         mats.push((gpu.upload(&q), gpu.upload(&s), gpu.upload(&gs)));
     }
     let y = gpu.zeroed::<f32>(N);
+    let xq = gpu.zeroed::<i8>(K);
+    let xs = gpu.zeroed::<f32>(K / 16);
 
     let mut reference: Option<Vec<f32>> = None;
     println!("{:<14} {:>9} {:>8}  check", "variant", "us/call", "GB/s");
-    for (name, lowered, moved) in &variants {
+    for (name, lowered, moved, kind) in &variants {
         let pipe = gpu.build_lowered(lowered).map_err(|e| format!("{name}: {e}"))?;
-        // Once on matrix 0 for the answer, then timed over all four.
+        // Once on matrix 0 for the answer, then timed over all of them.
         let (q0, s0, g0) = &mats[0];
-        gpu.run(&pipe, &[&xb, q0, s0, g0, &y])?;
+        match kind {
+            Kind::Float => gpu.run(&pipe, &[&xb, q0, s0, g0, &y])?,
+            // Leaves the quantised input in place for `int8_row`, which
+            // comes after it in the list.
+            Kind::Quant => gpu.run(&pipe, &[&xb, &xq, &xs])?,
+            Kind::Int8 => gpu.run(&pipe, &[&xq, &xs, q0, s0, g0, &y])?,
+        }
         let mut got = vec![0.0f32; N];
         gpu.download(&y, &mut got);
         let check = match (&reference, *name) {
-            (_, "read") => "-".to_string(),
+            (_, "read") | (_, "quant16") => "-".to_string(),
             (None, _) => {
                 reference = Some(got);
                 "reference".to_string()
@@ -255,9 +367,15 @@ extern "C" __global__ void read{sig} {{
                 format!("{:.1e} of scale", err / scale)
             }
         };
-        let bufs: Vec<[&lex_cuda::device::Buffer; 5]> =
-            mats.iter().map(|(q, s, g)| [&xb, q, s, g, &y]).collect();
-        let steps: Vec<Step<'_>> = (0..REPS * mats_n)
+        let bufs: Vec<Vec<&lex_cuda::device::Buffer>> = mats
+            .iter()
+            .map(|(q, s, g)| match kind {
+                Kind::Float => vec![&xb, q, s, g, &y],
+                Kind::Quant => vec![&xb, &xq, &xs],
+                Kind::Int8 => vec![&xq, &xs, q, s, g, &y],
+            })
+            .collect();
+        let steps: Vec<Step<'_>> = (0..reps * mats_n)
             .map(|i| (&pipe, &bufs[i % mats_n][..], None))
             .collect();
         let times = gpu.run_each_timed(&steps);

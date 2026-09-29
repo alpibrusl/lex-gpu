@@ -163,11 +163,14 @@ if [ -n "${QWEN:-}" ]; then
 
   # The matvec structures, timed against the emitted one on this card
   # (no model needed; synthetic weights, four matrices to defeat the L2).
-  for mats in 4 64; do
-    cargo run --release -p lex-cuda --example mv_variants -- --mats $mats 2>&1 \
-      | tee "$R/mv-variants-$mats.log" | grep -E "matrices|variant|GB/s|read|emitted|unroll|warp"
+  # A burst at full clock, a model-sized working set, and a sustained run
+  # long enough to reach the 72 W cap -- where the model decodes.
+  for args in "--mats 4" "--mats 64" "--mats 4 --reps 400"; do
+    tag=$(echo "$args" | tr -d ' -')
+    cargo run --release -p lex-cuda --example mv_variants -- $args 2>&1 \
+      | tee "$R/mv-variants-$tag.log" | grep -E "matrices|variant|GB/s|read|emitted|unroll|warp|quant|int8"
     [ "${PIPESTATUS[0]}" = 0 ] || fail=1
-    grep -q "warp_4rows" "$R/mv-variants-$mats.log" || { echo "mv_variants printed no table"; fail=1; }
+    grep -q "int8_row" "$R/mv-variants-$tag.log" || { echo "mv_variants ($args) printed no table"; fail=1; }
   done
 
   if [ -n "${SPEED:-}" ]; then
