@@ -70,16 +70,17 @@ fn main() -> Result<(), String> {
     // (8 bytes, one group, one scale) a step, loads their 16 inputs once, and
     // runs them against each of its R rows, summing a run unscaled and
     // scaling once, as the emitted kernel does per row.
-    let rows = |r: usize, sg: usize, xh: bool, lut: bool, t: usize| -> Lowered {
+    let rows = |r: usize, sg: usize, xh: bool, lut: bool, t: usize, ep: bool| -> Lowered {
         let entry = format!(
-            "rows_{r}_sg{sg}{}{}{}",
+            "rows_{r}_sg{sg}{}{}{}{}",
             if xh { "_xh" } else { "" },
             if lut { "_lut" } else { "" },
             if t > 1 {
                 format!("_t{t}")
             } else {
                 String::new()
-            }
+            },
+            if ep { "_scratch" } else { "" }
         );
         let (xt, x4) = if xh {
             ("half", "half4")
@@ -139,12 +140,30 @@ kernel void {entry}(
             acc[i] += run * fp8_e4m3(s[row * (K / 16u) + p0 / 16u]);
         }}
     }}
-    for (uint i = 0; i < {r}u; ++i) {{
-        const float v = simd_sum(acc[i]);
-        if (lane == 0u) y[row0 + i] = v * gs[row0 + i] * {unit};
-    }}
+    {epilogue}
 }}
 "#,
+            epilogue = if ep {
+                // The emitted kernel's ending: a shuffle-down tree, a trip
+                // through threadgroup memory, a barrier, one thread a row
+                // storing.
+                format!(
+                    "threadgroup float red[{rt}];\n    \
+                     for (uint i = 0; i < {r}u; ++i) {{ float v = acc[i]; \
+                     for (uint d = 16u; d > 0; d /= 2) v += simd_shuffle_down(v, d); \
+                     if (lane == 0u) red[sgid * {r}u + i] = v; }}\n    \
+                     threadgroup_barrier(mem_flags::mem_threadgroup);\n    \
+                     const uint t = sgid * 32u + lane;\n    \
+                     if (t < {rt}u) {{ const uint row = tg.y * {rt}u + t; \
+                     y[row] = red[t] * gs[row] * {unit}; }}",
+                    rt = r * sg
+                )
+            } else {
+                format!(
+                    "for (uint i = 0; i < {r}u; ++i) {{ const float v = simd_sum(acc[i]); \
+                     if (lane == 0u) y[row0 + i] = v * gs[row0 + i] * {unit}; }}"
+                )
+            },
             d0 = d("w.x & 0xFFu"),
             d1 = d("(w.x >> 8u) & 0xFFu"),
             d2 = d("(w.x >> 16u) & 0xFFu"),
@@ -179,9 +198,11 @@ kernel void {entry}(
         (2, 2, true, true),
         (4, 2, true, true),
     ] {
-        let l = rows(r, sg, xh, lut, 1);
+        let l = rows(r, sg, xh, lut, 1, false);
         variants.push((l.entry.clone(), l, xh));
     }
+    let l = rows(1, 8, false, false, 1, true);
+    variants.push((l.entry.clone(), l, false));
     // Tokens 2..4 through the best one-token structure, one grid row a token,
     // against the batched kernel the verify uses now. x is f16, as a batch's is.
     let tok: usize = std::env::args()
@@ -208,7 +229,7 @@ kernel void {entry}(
         )?;
         variants.push((format!("batched_t{tok}"), batched, true));
         for (r, sg) in [(1, 8), (2, 2)] {
-            let l = rows(r, sg, true, false, tok);
+            let l = rows(r, sg, true, false, tok, false);
             variants.push((l.entry.clone(), l, true));
         }
     }
