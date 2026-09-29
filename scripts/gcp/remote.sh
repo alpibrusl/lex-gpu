@@ -37,6 +37,10 @@ if ! command -v cc >/dev/null; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential
 fi
 cc --version | head -1 | tee -a "$R/machine.txt"
+# A non-interactive shell does not read the profile that puts cargo on the
+# PATH, so without this the pre-built image's toolchain looked absent and
+# the installer ran again on every run.
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 if ! command -v cargo >/dev/null; then
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
 fi
@@ -63,7 +67,17 @@ fi
 # whether the numbers it times are right -- run without it for that.
 if [ -z "${SPEED:-}" ]; then
 step "workspace tests (frontend, interpreter, emitters)"
-cargo test --release --workspace 2>&1 | tee "$R/cargo-test.log" | grep -E "test result|FAILED|panicked"
+# The Qwen goldens take 17-25 minutes on an L4, and with QWEN=1 the step
+# below runs them anyway. They used to skip here for want of the model;
+# the pre-built image carries it, and one run paid for them twice.
+skip=()
+if [ -n "${QWEN:-}" ]; then
+  for t in $(cargo test --release -p lex-rt --test qwen_golden -- --list 2>/dev/null | sed -n 's/: test$//p'); do
+    skip+=(--skip "$t")
+  done
+  echo "the Qwen goldens (${#skip[@]} args) run in the QWEN step, not here"
+fi
+cargo test --release --workspace -- --exact "${skip[@]}" 2>&1 | tee "$R/cargo-test.log" | grep -E "test result|FAILED|panicked"
 [ "${PIPESTATUS[0]}" = 0 ] || fail=1
 
 step "CUDA backend"
