@@ -12,8 +12,8 @@
 fn main() -> Result<(), String> {
     use lex_front::llama::{QLayout, matmul_q, matmul_q_x, matvec_q};
     use lex_ir::DType;
-    use lex_rt::dev::{Buffer, Gpu, Step};
     use lex_msl::program::lower_with;
+    use lex_rt::dev::{Buffer, Gpu, Step};
 
     let env = |k: &str, d: usize| {
         std::env::var(k)
@@ -68,7 +68,12 @@ fn main() -> Result<(), String> {
     for (label, n_in, n_out, layout) in shapes {
         let prog = matvec_q(n_in, n_out, bo, n_in, layout, false)?;
         lex_front::check(&prog, gpu.target()).map_err(|e| format!("{e:?}"))?;
-        let pipe = gpu.build_lowered(&lower_with(&prog, gpu.target(), threads, lex_rt::dev::dialect())?)?;
+        let pipe = gpu.build_lowered(&lower_with(
+            &prog,
+            gpu.target(),
+            threads,
+            lex_rt::dev::dialect(),
+        )?)?;
         let bytes = |p: &lex_front::ir::Param| {
             let n: usize = p.shape.iter().product();
             n * match p.dtype {
@@ -206,7 +211,12 @@ fn main() -> Result<(), String> {
             if lex_front::check(&prog, gpu.target()).is_err() {
                 continue;
             }
-            let Ok(pipe) = gpu.build_lowered(&lower_with(&prog, gpu.target(), threads, lex_rt::dev::dialect())?) else {
+            let Ok(pipe) = gpu.build_lowered(&lower_with(
+                &prog,
+                gpu.target(),
+                threads,
+                lex_rt::dev::dialect(),
+            )?) else {
                 continue;
             };
             let binds: Vec<Vec<&Buffer>> = sets

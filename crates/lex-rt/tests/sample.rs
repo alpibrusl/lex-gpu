@@ -43,8 +43,7 @@ fn sampling_stays_inside_the_top_k() {
     let v = logits(20_000);
     let mut order: Vec<usize> = (0..v.len()).collect();
     order.sort_unstable_by(|&a, &b| v[b].total_cmp(&v[a]));
-    let allowed: std::collections::HashSet<u32> =
-        order[..20].iter().map(|&i| i as u32).collect();
+    let allowed: std::collections::HashSet<u32> = order[..20].iter().map(|&i| i as u32).collect();
     let mut s = Sampler::seeded(7);
     for _ in 0..500 {
         let t = s.pick(&v);
@@ -157,7 +156,10 @@ fn speculative_sampling_reproduces_the_distribution_whatever_is_drafted() {
             .filter(|(t, _)| !target.0.contains(t))
             .map(|(_, f)| f)
             .sum();
-        assert!(outside == 0.0, "draft {draft}: {outside} of draws fell outside the nucleus");
+        assert!(
+            outside == 0.0,
+            "draft {draft}: {outside} of draws fell outside the nucleus"
+        );
     }
 }
 
@@ -188,7 +190,15 @@ fn at_temperature_zero_it_is_exactly_the_greedy_check() {
     let logits = plausible();
     let mut s = Sampler::new(0.0, 1.0, 20, 3);
     for _ in 0..100 {
-        assert_eq!(s.verify_draft(&logits, 10), Ok(()), "the argmax draft must be accepted");
-        assert_eq!(s.verify_draft(&logits, 12), Err(10), "anything else corrects to the argmax");
+        assert_eq!(
+            s.verify_draft(&logits, 10),
+            Ok(()),
+            "the argmax draft must be accepted"
+        );
+        assert_eq!(
+            s.verify_draft(&logits, 12),
+            Err(10),
+            "anything else corrects to the argmax"
+        );
     }
 }

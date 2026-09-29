@@ -219,10 +219,7 @@ impl DeltaNet {
                         Borrow(s),
                         View {
                             param: psnap,
-                            offset: vec![
-                                first.clone().plus(tok, hv * dv),
-                                IdxExpr::lit(0),
-                            ],
+                            offset: vec![first.clone().plus(tok, hv * dv), IdxExpr::lit(0)],
                             shape: vec![rows, dk],
                         },
                     ));
@@ -383,9 +380,7 @@ fn conv_silu_rows(
     let px = b.param("x", DType::F32, &[tokens, channels], false);
     let pw = b.param("w", DType::F32, &[kernel, channels], false);
     let py = b.param("y", DType::F32, &[tokens, channels], true);
-    let psnap = snap.then(|| {
-        b.param("snap", DType::F32, &[tokens * (kernel - 1), channels], true)
-    });
+    let psnap = snap.then(|| b.param("snap", DType::F32, &[tokens * (kernel - 1), channels], true));
     let col = b.grid(channels / chunk);
 
     let tile = TileTy::new(DType::F32, &[1, chunk], Space::Reg);
@@ -423,8 +418,7 @@ fn conv_silu_rows(
         // the same expression the final store below uses with t + 1.
         if let Some(psnap) = psnap {
             for i in 0..kernel - 1 {
-                let (param, r) =
-                    source(t as isize + 1 + i as isize - (kernel as isize - 1));
+                let (param, r) = source(t as isize + 1 + i as isize - (kernel as isize - 1));
                 let v = b.op("v", Op::Load(slice(param, r), tile.clone()));
                 b.effect(Op::Store(Move(v), slice(psnap, t * (kernel - 1) + i)));
             }
@@ -938,7 +932,12 @@ pub fn reference(
 /// block costs nothing and keeps the addressing affine and checkable --
 /// and a wrong block is then a wrong *pipeline*, which the plan makes
 /// visible, rather than a wrong number in a buffer.
-pub fn copy_block(blocks: usize, rows: usize, cols: usize, which: usize) -> Result<Program, String> {
+pub fn copy_block(
+    blocks: usize,
+    rows: usize,
+    cols: usize,
+    which: usize,
+) -> Result<Program, String> {
     if which >= blocks || rows == 0 || cols == 0 {
         return Err(format!("block {which} of {blocks} x [{rows}, {cols}]"));
     }
@@ -951,10 +950,7 @@ pub fn copy_block(blocks: usize, rows: usize, cols: usize, which: usize) -> Resu
     for c in 0..cols / chunk {
         let at = |param, base: usize| View {
             param,
-            offset: vec![
-                IdxExpr::scaled(row, 1, base),
-                IdxExpr::lit(c * chunk),
-            ],
+            offset: vec![IdxExpr::scaled(row, 1, base), IdxExpr::lit(c * chunk)],
             shape: vec![1, chunk],
         };
         let v = b.op("v", Op::Load(at(src, which * rows), tile.clone()));

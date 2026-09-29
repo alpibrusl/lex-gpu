@@ -34,8 +34,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use lex_front::ir::{
-    Arg, BinOp, Block, IdxExpr, Nibbles, Op, Program, Reduce, Stmt, TileTy, Trits, UnOp, Var,
-    View,
+    Arg, BinOp, Block, IdxExpr, Nibbles, Op, Program, Reduce, Stmt, TileTy, Trits, UnOp, Var, View,
 };
 use lex_ir::{DType, Space, Target};
 
@@ -1168,8 +1167,7 @@ impl Gen<'_> {
                         pack: Pack::None,
                     },
                 );
-                self.locs
-                    .insert(x, Loc::Lazy(e, reg(DType::F32, &[r, c])));
+                self.locs.insert(x, Loc::Lazy(e, reg(DType::F32, &[r, c])));
             }
             Op::DequantTernary(q, sc, group, trits) => {
                 let x = dst.ok_or("op without a result")?;
@@ -1370,9 +1368,7 @@ impl Gen<'_> {
                     &[
                         format!("const {sc} bfly_a = {mine};"),
                         format!("const {sc} bfly_b = {theirs};"),
-                        format!(
-                            "{name}[k] = (e & {stride}u) ? bfly_b - bfly_a : bfly_a + bfly_b;"
-                        ),
+                        format!("{name}[k] = (e & {stride}u) ? bfly_b - bfly_a : bfly_a + bfly_b;"),
                     ],
                 );
             }
@@ -1576,7 +1572,9 @@ impl Gen<'_> {
                                      + {a3} * (float(int((l1 >> 4u) | (((hh >> 6u) & 3u) << 4u)) - 32) * sg); }}"
                                 ));
                             }
-                            Pack::Fp4(qe, qc) if self.wide_fp4(qe, *qc, kd, vec, &ops[0].0).is_some() => {
+                            Pack::Fp4(qe, qc)
+                                if self.wide_fp4(qe, *qc, kd, vec, &ops[0].0).is_some() =>
+                            {
                                 // The same run as below, loaded wide: its
                                 // eight bytes as one `uint2` and its sixteen
                                 // inputs as four `float4`. Aligned by

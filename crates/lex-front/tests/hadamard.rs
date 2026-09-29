@@ -15,9 +15,8 @@
 //! by the same person.
 
 use lex_front::ir::{Arg, Builder, IdxExpr, Op, Program, TileTy, View};
+use lex_front::{check, interp::Tensor, interp::run};
 use lex_ir::{DType, Space, Target};
-use lex_front::{check, interp::run, interp::Tensor};
-
 
 /// `H_n x` by the definition: `H[i][j] = (-1)^popcount(i & j)`.
 fn hadamard_reference(x: &[f32], n: usize) -> Vec<f32> {
@@ -26,7 +25,11 @@ fn hadamard_reference(x: &[f32], n: usize) -> Vec<f32> {
             let (block, row) = (i / n, i % n);
             (0..n)
                 .map(|col| {
-                    let sign = if (row & col).count_ones() % 2 == 0 { 1.0 } else { -1.0 };
+                    let sign = if (row & col).count_ones() % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
                     sign * x[block * n + col]
                 })
                 .sum()
@@ -136,12 +139,18 @@ fn a_bad_stride_is_rejected() {
             offset: vec![IdxExpr::lit(0), IdxExpr::lit(0)],
             shape: vec![1, cols],
         };
-        let x = b.op("x", Op::Load(v(px), TileTy::new(DType::F32, &[1, cols], Space::Reg)));
+        let x = b.op(
+            "x",
+            Op::Load(v(px), TileTy::new(DType::F32, &[1, cols], Space::Reg)),
+        );
         let h = b.op("h", Op::Butterfly(Arg::Move(x), stride));
         b.effect(Op::Store(Arg::Move(h), v(py)));
         let errs = check(&b.finish(), &Target::apple_m_series());
         let msg = format!("{:?}", errs.unwrap_err());
-        assert!(msg.contains(why), "stride {stride} on {cols}: wanted {why:?}, got {msg}");
+        assert!(
+            msg.contains(why),
+            "stride {stride} on {cols}: wanted {why:?}, got {msg}"
+        );
     }
 }
 
@@ -158,7 +167,13 @@ fn the_rotation_matches_a_direct_normalized_hadamard() {
         let x = pattern(rows * cols, 3);
         // An explicit +-1 per column, as the file stores it.
         let sign: Vec<f32> = (0..cols)
-            .map(|c| if (c * 2_654_435_761usize).is_multiple_of(3) { -1.0 } else { 1.0 })
+            .map(|c| {
+                if (c * 2_654_435_761usize).is_multiple_of(3) {
+                    -1.0
+                } else {
+                    1.0
+                }
+            })
             .collect();
         let mut t = vec![
             Tensor::new(DType::F32, &[rows, cols], &x),
@@ -173,7 +188,11 @@ fn the_rotation_matches_a_direct_normalized_hadamard() {
                 let (base, row) = (i - i % block, i % block);
                 norm * (0..block)
                     .map(|col| {
-                        let sgn = if (row & col).count_ones() % 2 == 0 { 1.0 } else { -1.0 };
+                        let sgn = if (row & col).count_ones() % 2 == 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
                         sgn * sign[(base + col) % cols] * x[base + col]
                     })
                     .sum::<f32>()
@@ -210,7 +229,11 @@ fn the_inverse_rotation_undoes_the_forward_one() {
         Tensor::new(DType::F32, &[1, cols], &sign),
         Tensor::zeros(DType::F32, &[rows, cols]),
     ];
-    run(&hadamard_rotate(rows, cols, block, false).unwrap(), &mut fwd).expect("forward");
+    run(
+        &hadamard_rotate(rows, cols, block, false).unwrap(),
+        &mut fwd,
+    )
+    .expect("forward");
     let mid = fwd[2].data.clone();
     assert!(
         mid.iter().zip(&x).any(|(a, b)| (a - b).abs() > 1e-3),
@@ -221,7 +244,11 @@ fn the_inverse_rotation_undoes_the_forward_one() {
         Tensor::new(DType::F32, &[1, cols], &sign),
         Tensor::zeros(DType::F32, &[rows, cols]),
     ];
-    run(&hadamard_rotate(rows, cols, block, true).unwrap(), &mut back).expect("inverse");
+    run(
+        &hadamard_rotate(rows, cols, block, true).unwrap(),
+        &mut back,
+    )
+    .expect("inverse");
     let worst = back[2]
         .data
         .iter()

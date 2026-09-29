@@ -215,6 +215,7 @@ mod gpu {
     use std::collections::{BTreeMap, HashMap};
     use std::time::Instant;
 
+    use crate::dev::{Buffer, Gpu, Pipeline, Step};
     use half::f16;
     use lex_front::flash::{COMBINE_CHUNK, FlashDecode};
     use lex_front::llama::{
@@ -223,7 +224,6 @@ mod gpu {
     };
     use lex_front::{Program, check};
     use lex_ir::{DType, Space, Target};
-    use crate::dev::{Buffer, Gpu, Pipeline, Step};
     use lex_msl::program::lower_with;
 
     use super::{Config, QMat, Weights};

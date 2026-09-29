@@ -14,7 +14,9 @@ use lex_rt::chat::{Call, Template, parse_reply, render, render_within, tojson};
 use lex_rt::json::{Json, Map};
 
 fn data(sub: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(sub)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(sub)
 }
 
 /// Every fixture in `sub`, rendered by `t` and compared byte for byte.
@@ -89,7 +91,14 @@ fn the_mimo_template_matches_its_own() {
     matches_its_fixtures(
         Template::Mimo,
         "chatml_mimo",
-        &["tools", "tool_result", "odd_chars", "object_args", "no_think", "text_parts"],
+        &[
+            "tools",
+            "tool_result",
+            "odd_chars",
+            "object_args",
+            "no_think",
+            "text_parts",
+        ],
     );
 }
 
@@ -101,7 +110,10 @@ fn tojson_is_the_one_the_models_were_trained_through() {
     let mut m = Map::new();
     m.insert("b".to_string(), Json::Num(1.0));
     m.insert("a".to_string(), Json::Str("x < y & 'z' — naïve\n".into()));
-    m.insert("c".to_string(), Json::Arr(vec![Json::Bool(true), Json::Null]));
+    m.insert(
+        "c".to_string(),
+        Json::Arr(vec![Json::Bool(true), Json::Null]),
+    );
     assert_eq!(
         tojson(&Json::Obj(m)),
         "{\"b\": 1, \"a\": \"x < y & 'z' — naïve\\n\", \"c\": [true, null]}"
@@ -177,10 +189,15 @@ fn a_truncated_reply_is_all_reasoning() {
 
 #[test]
 fn a_bad_reasoning_effort_is_refused() {
-    let req = Json::parse(r#"{"messages":[{"role":"user","content":"hi"}],
-        "reasoning_effort":"high"}"#)
+    let req = Json::parse(
+        r#"{"messages":[{"role":"user","content":"hi"}],
+        "reasoning_effort":"high"}"#,
+    )
     .unwrap();
-    assert!(render(&req).is_err(), "`high` is not one the template takes");
+    assert!(
+        render(&req).is_err(),
+        "`high` is not one the template takes"
+    );
 }
 
 #[test]
@@ -229,7 +246,10 @@ fn a_streamed_reply_never_leaks_call_markup() {
     assert_eq!(reasoning, "mulling");
     assert_eq!(content, "On it.");
     for bad in ["<tool_call", "</tool", "<function", "<parameter", "</think"] {
-        assert!(!content.contains(bad), "{bad:?} leaked into streamed content");
+        assert!(
+            !content.contains(bad),
+            "{bad:?} leaked into streamed content"
+        );
     }
     assert_eq!(reply.calls.len(), 1);
     assert_eq!(reply.calls[0].arguments, "{\"a\": 7}");
@@ -284,16 +304,28 @@ fn an_overlong_conversation_drops_whole_turns_from_the_front() {
     let budget = 4000;
     let (prompt, dropped) = render_within(&req, budget, &mut count).expect("render");
 
-    assert!(dropped > 0, "nothing was dropped, so nothing is being tested");
+    assert!(
+        dropped > 0,
+        "nothing was dropped, so nothing is being tested"
+    );
     assert!(count(&prompt) <= budget, "still over budget after trimming");
     // The two that must survive: the tools and goal live in the system
     // block, and the last turn is the one being answered.
-    assert!(prompt.contains("SYSTEM MARKER"), "system message was dropped");
-    assert!(prompt.contains("LAST USER"), "the turn being answered was dropped");
+    assert!(
+        prompt.contains("SYSTEM MARKER"),
+        "system message was dropped"
+    );
+    assert!(
+        prompt.contains("LAST USER"),
+        "the turn being answered was dropped"
+    );
     // The task itself is pinned. Dropping it is what made a lex-code run
     // end with the agent asking the user what they would like built.
     assert!(prompt.contains("FIRST USER"), "the task was dropped");
-    assert!(!prompt.contains("TURNMARK0 "), "the oldest middle turn survived");
+    assert!(
+        !prompt.contains("TURNMARK0 "),
+        "the oldest middle turn survived"
+    );
     assert!(
         tool_responses_are_inside_a_user_turn(&prompt),
         "a tool response was orphaned by the trim:\n{}",
@@ -327,9 +359,18 @@ fn one_oversized_tool_result_is_elided_not_refused() {
     assert!(prompt.contains("SYSTEM MARKER"), "system message lost");
     // Both ends survive: the head says what the tool was, the tail is
     // usually where the answer is.
-    assert!(prompt.contains("HEAD-OF-OUTPUT"), "head of the output was lost");
-    assert!(prompt.contains("TAIL-OF-OUTPUT"), "tail of the output was lost");
-    assert!(prompt.contains("characters elided"), "elision was not declared");
+    assert!(
+        prompt.contains("HEAD-OF-OUTPUT"),
+        "head of the output was lost"
+    );
+    assert!(
+        prompt.contains("TAIL-OF-OUTPUT"),
+        "tail of the output was lost"
+    );
+    assert!(
+        prompt.contains("characters elided"),
+        "elision was not declared"
+    );
     assert!(
         tool_responses_are_inside_a_user_turn(&prompt),
         "eliding broke the turn structure"
@@ -366,7 +407,10 @@ fn a_mimo_call_comes_back_as_the_model_wrote_it() {
     );
 
     // No arguments at all is still a call, with an empty object.
-    let r = Template::Mimo.parse_reply("</think><tool_call><function=now></function></tool_call>", &[]);
+    let r = Template::Mimo.parse_reply(
+        "</think><tool_call><function=now></function></tool_call>",
+        &[],
+    );
     assert_eq!(r.calls[0].arguments, "{}");
 
     // Qwen's parameter form, which a relative may slip into, reads as that.
@@ -395,7 +439,10 @@ fn a_mimo_call_round_trips_through_the_history_unchanged() {
     ))
     .expect("json");
     let prompt = Template::Mimo.render(&req).expect("render");
-    assert!(prompt.contains(said), "the call changed on the way back:\n{prompt}");
+    assert!(
+        prompt.contains(said),
+        "the call changed on the way back:\n{prompt}"
+    );
 }
 
 #[test]
@@ -433,7 +480,9 @@ fn a_picture_is_refused_not_dropped() {
             {"type":"image_url","image_url":{"url":"data:,"}}]}]}"#,
     )
     .unwrap();
-    let e = Template::Mimo.render(&req).expect_err("an image must not vanish");
+    let e = Template::Mimo
+        .render(&req)
+        .expect_err("an image must not vanish");
     assert!(e.contains("text only"), "{e}");
 }
 
@@ -446,8 +495,15 @@ fn each_model_gets_its_own_template() {
         Template::recognise("{{ '<|im_start|>' + message.role }}<tool_call>"),
         None
     );
-    if lex_rt::gguf::gguf_path("maternion/mimo-v2.6:9b").ok().flatten().is_some() {
-        assert_eq!(Template::for_model("maternion/mimo-v2.6:9b"), Ok(Template::Mimo));
+    if lex_rt::gguf::gguf_path("maternion/mimo-v2.6:9b")
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        assert_eq!(
+            Template::for_model("maternion/mimo-v2.6:9b"),
+            Ok(Template::Mimo)
+        );
     } else {
         eprintln!("skipping the MiMo half: maternion/mimo-v2.6:9b is not pulled");
     }
@@ -490,7 +546,10 @@ fn trimming_keeps_the_start_of_the_prompt_still_while_history_grows() {
             let req = Json::parse(&format!(r#"{{"messages":[{}]}}"#, m.join(","))).expect("json");
             let (prompt, _) = t.render_within(&req, budget, &mut count).expect("render");
             let removed = count(&t.render(&req).unwrap()) - count(&prompt);
-            assert!(count(&prompt) <= budget, "{t:?}: over budget at {rounds} rounds");
+            assert!(
+                count(&prompt) <= budget,
+                "{t:?}: over budget at {rounds} rounds"
+            );
             assert!(prompt.contains("TASK") && prompt.contains(&format!("R{} ", rounds - 1)));
             if removed > 0 {
                 trimmed += 1;
@@ -499,13 +558,20 @@ fn trimming_keeps_the_start_of_the_prompt_still_while_history_grows() {
                 // Nothing more dropped, so the new prompt must begin with
                 // all of the old one but its generation prompt -- which the
                 // new one replaces with the turn the model gave.
-                let shared = prev.bytes().zip(prompt.bytes()).take_while(|(a, b)| a == b).count();
+                let shared = prev
+                    .bytes()
+                    .zip(prompt.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
                 assert!(
                     shared + 40 >= prev.len(),
                     "{t:?}: the start moved at {rounds} rounds with nothing more dropped"
                 );
             } else {
-                assert!(removed > prev_removed, "{t:?}: the cut moved backwards at {rounds}");
+                assert!(
+                    removed > prev_removed,
+                    "{t:?}: the cut moved backwards at {rounds}"
+                );
                 jumps += 1;
             }
             over = count(&t.render(&req).unwrap()).saturating_sub(budget);
@@ -518,9 +584,15 @@ fn trimming_keeps_the_start_of_the_prompt_still_while_history_grows() {
             jumps <= over.div_ceil(step),
             "{t:?}: {jumps} moves for {over} tokens of overflow at a step of {step}"
         );
-        assert!(trimmed > 30, "{t:?}: only {trimmed} trimmed turns, so nothing is being tested");
+        assert!(
+            trimmed > 30,
+            "{t:?}: only {trimmed} trimmed turns, so nothing is being tested"
+        );
         // Cutting at the fewest turns that fit would move on every one.
-        assert!(jumps < trimmed / 2, "{t:?}: {jumps} jumps over {trimmed} trimmed turns");
+        assert!(
+            jumps < trimmed / 2,
+            "{t:?}: {jumps} jumps over {trimmed} trimmed turns"
+        );
         eprintln!("{t:?}: the start moved {jumps} times over {trimmed} trimmed turns");
     }
 }

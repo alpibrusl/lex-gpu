@@ -276,14 +276,44 @@ extern "C" __global__ void int8_row(const char* __restrict__ xq, const float* __
     // 16) where the float path moves 4 B a value.
     let bytes8 = bytes - (4 * K) as f64 + (K + 4 * K / 16) as f64;
     let variants: Vec<(&str, Lowered, f64, Kind)> = vec![
-        ("read", hand("read", read, 58 * 16), (N * K / 2) as f64, Kind::Float),
+        (
+            "read",
+            hand("read", read, 58 * 16),
+            (N * K / 2) as f64,
+            Kind::Float,
+        ),
         ("emitted", emitted, bytes, Kind::Float),
         ("unroll4", unroll4, bytes, Kind::Float),
-        ("warp_row", hand("warp_row", warp_row("warp_row", false), N / 8), bytes, Kind::Float),
-        ("warp_row_smem", hand("warp_row_smem", warp_row("warp_row_smem", true), N / 8), bytes, Kind::Float),
-        ("warp_4rows", hand("warp_4rows", warp_4rows, N / 32), bytes, Kind::Float),
-        ("quant16", hand("quant16", quant16, (K / 16).div_ceil(256)), (4 * K + K + 4 * K / 16) as f64, Kind::Quant),
-        ("int8_row", hand("int8_row", int8_row, N / 8), bytes8, Kind::Int8),
+        (
+            "warp_row",
+            hand("warp_row", warp_row("warp_row", false), N / 8),
+            bytes,
+            Kind::Float,
+        ),
+        (
+            "warp_row_smem",
+            hand("warp_row_smem", warp_row("warp_row_smem", true), N / 8),
+            bytes,
+            Kind::Float,
+        ),
+        (
+            "warp_4rows",
+            hand("warp_4rows", warp_4rows, N / 32),
+            bytes,
+            Kind::Float,
+        ),
+        (
+            "quant16",
+            hand("quant16", quant16, (K / 16).div_ceil(256)),
+            (4 * K + K + 4 * K / 16) as f64,
+            Kind::Quant,
+        ),
+        (
+            "int8_row",
+            hand("int8_row", int8_row, N / 8),
+            bytes8,
+            Kind::Int8,
+        ),
     ];
 
     // `--emit DIR`: write the sources for scripts/cuda_check.sh and stop,
@@ -325,7 +355,9 @@ extern "C" __global__ void int8_row(const char* __restrict__ xq, const float* __
         state ^= state << 5;
         state
     };
-    let x: Vec<f32> = (0..K).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+    let x: Vec<f32> = (0..K)
+        .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
     let xb = gpu.upload(&x);
     let mut mats = vec![];
     for _ in 0..mats_n {
@@ -343,7 +375,9 @@ extern "C" __global__ void int8_row(const char* __restrict__ xq, const float* __
     let mut reference: Option<Vec<f32>> = None;
     println!("{:<14} {:>9} {:>8}  check", "variant", "us/call", "GB/s");
     for (name, lowered, moved, kind) in &variants {
-        let pipe = gpu.build_lowered(lowered).map_err(|e| format!("{name}: {e}"))?;
+        let pipe = gpu
+            .build_lowered(lowered)
+            .map_err(|e| format!("{name}: {e}"))?;
         // Once on matrix 0 for the answer, then timed over all of them.
         let (q0, s0, g0) = &mats[0];
         match kind {
@@ -363,7 +397,11 @@ extern "C" __global__ void int8_row(const char* __restrict__ xq, const float* __
             }
             (Some(want), _) => {
                 let scale = want.iter().fold(1e-9f32, |m, v| m.max(v.abs()));
-                let err = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                let err = got
+                    .iter()
+                    .zip(want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
                 format!("{:.1e} of scale", err / scale)
             }
         };
@@ -381,7 +419,11 @@ extern "C" __global__ void int8_row(const char* __restrict__ xq, const float* __
         let times = gpu.run_each_timed(&steps);
         // The first round warms the pipeline and the TLB; not counted.
         let t: f64 = times[mats_n..].iter().sum::<f64>() / (times.len() - mats_n) as f64;
-        println!("{name:<14} {:>9.1} {:>8.1}  {check}", 1e6 * t, moved / t / 1e9);
+        println!(
+            "{name:<14} {:>9.1} {:>8.1}  {check}",
+            1e6 * t,
+            moved / t / 1e9
+        );
     }
     Ok(())
 }

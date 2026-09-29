@@ -380,8 +380,12 @@ impl Gpu {
         let attr = |a: c_int| -> usize {
             let mut v: c_int = 0;
             unsafe {
-                check(&self.cu, (self.cu.cuDeviceGetAttribute)(&mut v, a, self.dev), "attr")
-                    .expect("device attribute");
+                check(
+                    &self.cu,
+                    (self.cu.cuDeviceGetAttribute)(&mut v, a, self.dev),
+                    "attr",
+                )
+                .expect("device attribute");
             }
             v as usize
         };
@@ -636,7 +640,12 @@ impl Gpu {
             for e in &mut ev {
                 check(d, (d.cuEventCreate)(e, 0), "cuEventCreate").expect("event");
             }
-            check(d, (d.cuEventRecord)(ev[0], ptr::null_mut()), "cuEventRecord").expect("record");
+            check(
+                d,
+                (d.cuEventRecord)(ev[0], ptr::null_mut()),
+                "cuEventRecord",
+            )
+            .expect("record");
         }
         for (i, &(p, buffers, groups)) in steps.iter().enumerate() {
             let (gx, gy) = match groups {
@@ -653,8 +662,12 @@ impl Gpu {
             };
             self.launch(p, buffers, gx, gy).expect("cuLaunchKernel");
             unsafe {
-                check(d, (d.cuEventRecord)(ev[i + 1], ptr::null_mut()), "cuEventRecord")
-                    .expect("record");
+                check(
+                    d,
+                    (d.cuEventRecord)(ev[i + 1], ptr::null_mut()),
+                    "cuEventRecord",
+                )
+                .expect("record");
             }
         }
         let mut out = Vec::with_capacity(steps.len());
@@ -662,8 +675,12 @@ impl Gpu {
             check(d, (d.cuCtxSynchronize)(), "cuCtxSynchronize").expect("sync");
             for w in ev.windows(2) {
                 let mut ms = 0f32;
-                check(d, (d.cuEventElapsedTime)(&mut ms, w[0], w[1]), "cuEventElapsedTime")
-                    .expect("elapsed");
+                check(
+                    d,
+                    (d.cuEventElapsedTime)(&mut ms, w[0], w[1]),
+                    "cuEventElapsedTime",
+                )
+                .expect("elapsed");
                 out.push(ms as f64 / 1e3);
             }
             for e in ev {

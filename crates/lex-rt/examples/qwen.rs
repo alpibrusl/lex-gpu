@@ -46,7 +46,10 @@ fn main() -> Result<(), String> {
         let mut idx: Vec<usize> = (0..logits.len()).collect();
         idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
         for &i in idx.iter().take(5) {
-            println!("   top  token {i:6}  logprob {:+.4}", logits[i] - m - z.ln());
+            println!(
+                "   top  token {i:6}  logprob {:+.4}",
+                logits[i] - m - z.ln()
+            );
         }
     }
     let t = Instant::now();

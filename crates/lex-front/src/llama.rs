@@ -13,8 +13,7 @@
 use lex_ir::{DType, Space};
 
 use crate::ir::{
-    Arg, BinOp, Builder, IdxExpr, Nibbles, Op, Program, Reduce, TileTy, Trits, Ty, UnOp, Var,
-    View,
+    Arg, BinOp, Builder, IdxExpr, Nibbles, Op, Program, Reduce, TileTy, Trits, Ty, UnOp, Var, View,
 };
 
 fn reg(dt: DType, shape: &[usize]) -> TileTy {

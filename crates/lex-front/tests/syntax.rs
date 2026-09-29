@@ -31,7 +31,11 @@ fn the_surface_builds_the_same_program_as_the_rust() {
     let b = lex_msl::program::lower(&want, &target, 256).expect("lower rust");
     if a.source != b.source {
         let (x, y): (Vec<_>, Vec<_>) = (a.source.lines().collect(), b.source.lines().collect());
-        let at = x.iter().zip(&y).position(|(p, q)| p != q).unwrap_or(x.len().min(y.len()));
+        let at = x
+            .iter()
+            .zip(&y)
+            .position(|(p, q)| p != q)
+            .unwrap_or(x.len().min(y.len()));
         panic!(
             "the emitted MSL differs at line {}:\n  parsed: {:?}\n  rust  : {:?}",
             at + 1,
@@ -49,7 +53,10 @@ fn a_moved_tile_cannot_be_used_again() {
     // decorative.
     let src = RMSNORM.replace("let sq = &x * &x", "let sq = x * x");
     let unit = syntax::parse(&src).expect("it should still parse");
-    let prog = unit.algo.build(&[("n", N as f64), ("eps", EPS as f64)]).expect("and build");
+    let prog = unit
+        .algo
+        .build(&[("n", N as f64), ("eps", EPS as f64)])
+        .expect("and build");
     let errs = lex_front::check(&prog, &lex_ir::Target::apple_m_series());
     assert!(
         errs.is_err(),
@@ -96,7 +103,10 @@ fn one_algorithm_two_schedules_two_backends() {
     let want = lex_front::llama::rmsnorm(N, EPS);
 
     for (target, dialect) in [
-        (lex_ir::Target::apple_m_series(), &Msl as &dyn lex_msl::dialect::Dialect),
+        (
+            lex_ir::Target::apple_m_series(),
+            &Msl as &dyn lex_msl::dialect::Dialect,
+        ),
         (lex_ir::Target::nvidia_ada(), &Cuda),
     ] {
         let sched = unit
@@ -120,9 +130,15 @@ fn one_algorithm_two_schedules_two_backends() {
         // checked, and why this asserts on the dialect's own keywords
         // instead.
         let (want, avoid) = if target.name.starts_with("apple") {
-            (["kernel void", "threadgroup"], ["__global__", "__syncthreads"])
+            (
+                ["kernel void", "threadgroup"],
+                ["__global__", "__syncthreads"],
+            )
         } else {
-            (["__global__", "__syncthreads"], ["kernel void", "threadgroup "])
+            (
+                ["__global__", "__syncthreads"],
+                ["kernel void", "threadgroup "],
+            )
         };
         for w in want {
             assert!(
@@ -175,7 +191,10 @@ fn a_grid_comes_from_the_schedule() {
     let a = lex_msl::program::lower(&got, &target, threads).expect("lower parsed");
     let b = lex_msl::program::lower(&want, &target, threads).expect("lower rust");
     assert_eq!(a.grid, b.grid, "the grid the schedule asked for");
-    assert!(a.grid > 1, "a chunked algo should have more than one instance");
+    assert!(
+        a.grid > 1,
+        "a chunked algo should have more than one instance"
+    );
     if a.source != b.source {
         let (x, y): (Vec<_>, Vec<_>) = (a.source.lines().collect(), b.source.lines().collect());
         let at = x.iter().zip(&y).position(|(p, q)| p != q).unwrap_or(0);

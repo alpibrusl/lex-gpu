@@ -213,11 +213,41 @@ fn the_gemm_matches_the_matmul_it_replaces() {
     use lex_msl::gemm::{Backend, Gemm, gemm_nvfp4};
     let Some(g) = gpu() else { return };
     for c in [
-        Gemm { m: 40, n: 100, k: 512, residual: false, x_half: true },
-        Gemm { m: 40, n: 100, k: 512, residual: true, x_half: true },
-        Gemm { m: 64, n: 128, k: 512, residual: false, x_half: false },
-        Gemm { m: 17, n: 48, k: 256, residual: true, x_half: false },
-        Gemm { m: 96, n: 192, k: 1024, residual: false, x_half: true },
+        Gemm {
+            m: 40,
+            n: 100,
+            k: 512,
+            residual: false,
+            x_half: true,
+        },
+        Gemm {
+            m: 40,
+            n: 100,
+            k: 512,
+            residual: true,
+            x_half: true,
+        },
+        Gemm {
+            m: 64,
+            n: 128,
+            k: 512,
+            residual: false,
+            x_half: false,
+        },
+        Gemm {
+            m: 17,
+            n: 48,
+            k: 256,
+            residual: true,
+            x_half: false,
+        },
+        Gemm {
+            m: 96,
+            n: 192,
+            k: 1024,
+            residual: false,
+            x_half: true,
+        },
     ] {
         let (m, n, k) = (c.m, c.n, c.k);
         let xt = if c.x_half { DType::F16 } else { DType::F32 };
@@ -248,7 +278,9 @@ fn the_gemm_matches_the_matmul_it_replaces() {
             .iter()
             .map(|t| match t.dtype {
                 DType::F32 => g.upload(&t.data),
-                DType::F16 => g.upload(&t.data.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>()),
+                DType::F16 => {
+                    g.upload(&t.data.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>())
+                }
                 DType::I8 => g.upload(&t.data.iter().map(|&x| x as i8).collect::<Vec<_>>()),
             })
             .collect();
@@ -261,7 +293,12 @@ fn the_gemm_matches_the_matmul_it_replaces() {
         let want = &tensors[out].data;
         let scale = want.iter().fold(1e-6f32, |a, x| a.max(x.abs()));
         assert!(scale > 1e-3, "{c:?}: the reference output is all but zero");
-        let err = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max) / scale;
+        let err = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+            / scale;
         eprintln!("{c:?}: {err:e} of scale");
         assert!(err < 2e-3, "{c:?}: GEMM vs interpreter {err:e} of scale");
     }

@@ -1,8 +1,11 @@
 //! Qwen3.8's gated-delta state update, against the rule it implements.
 
-use lex_front::qwen::{DeltaNet, build_conv_silu, build_conv_silu_rows, build_delta_qk, build_delta_qk_rows, build_delta_qk_rows_in,
-    build_gated_norm, build_gated_norm_rows, build_gates, build_gates_rows, build_matvec_dense,
-    build_qk_rope, build_qk_rope_rows, reference, build_conv_silu_rows_snap, copy_block};
+use lex_front::qwen::{
+    DeltaNet, build_conv_silu, build_conv_silu_rows, build_conv_silu_rows_snap, build_delta_qk,
+    build_delta_qk_rows, build_delta_qk_rows_in, build_gated_norm, build_gated_norm_rows,
+    build_gates, build_gates_rows, build_matvec_dense, build_qk_rope, build_qk_rope_rows,
+    copy_block, reference,
+};
 use lex_front::{Tensor, check, run};
 use lex_ir::reference::fill_pattern_f32;
 use lex_ir::{DType, Target};
@@ -670,7 +673,10 @@ fn every_delta_snapshot_is_the_state_after_that_token() {
             .zip(&state)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(d == 0.0, "snapshot {t} differs from the state after {t} by {d:e}");
+        assert!(
+            d == 0.0,
+            "snapshot {t} differs from the state after {t} by {d:e}"
+        );
     }
     // The last block and `state` are the same thing by construction; if
     // they ever disagree the carry is not what is being written out.
@@ -680,7 +686,10 @@ fn every_delta_snapshot_is_the_state_after_that_token() {
         .zip(&batch[0].data)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(d == 0.0, "the last snapshot differs from the final state by {d:e}");
+    assert!(
+        d == 0.0,
+        "the last snapshot differs from the final state by {d:e}"
+    );
 }
 
 /// Every conv snapshot block is the window as of that token.
@@ -725,7 +734,10 @@ fn every_conv_snapshot_is_the_window_after_that_token() {
             .zip(&state)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(d == 0.0, "conv snapshot {t} differs from the window after {t} by {d:e}");
+        assert!(
+            d == 0.0,
+            "conv snapshot {t} differs from the window after {t} by {d:e}"
+        );
     }
     let last = &batch[4].data[(tokens - 1) * block..];
     let d = last
@@ -733,7 +745,10 @@ fn every_conv_snapshot_is_the_window_after_that_token() {
         .zip(&batch[0].data)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    assert!(d == 0.0, "the last conv snapshot differs from the final window by {d:e}");
+    assert!(
+        d == 0.0,
+        "the last conv snapshot differs from the final window by {d:e}"
+    );
 }
 
 /// `copy_block` takes the block it is asked for, and only that block.
@@ -787,9 +802,22 @@ fn the_value_head_orders_pair_each_head_with_a_different_key() {
     // The normalised key head `k`, as grouped writes it first.
     let key = |k: usize| row(&grouped, k * per);
     for v in 0..hk * per {
-        assert_eq!(row(&grouped, v), key(v / per), "grouped: value head {v} should read key {}", v / per);
-        assert_eq!(row(&tiled, v), key(v % hk), "tiled: value head {v} should read key {}", v % hk);
+        assert_eq!(
+            row(&grouped, v),
+            key(v / per),
+            "grouped: value head {v} should read key {}",
+            v / per
+        );
+        assert_eq!(
+            row(&tiled, v),
+            key(v % hk),
+            "tiled: value head {v} should read key {}",
+            v % hk
+        );
     }
     // If the orders agreed, nothing above would distinguish them.
-    assert_ne!(grouped, tiled, "the two orders paired every head the same way");
+    assert_ne!(
+        grouped, tiled,
+        "the two orders paired every head the same way"
+    );
 }

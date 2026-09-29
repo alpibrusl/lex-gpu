@@ -30,8 +30,13 @@ fn main() -> Result<(), String> {
 
     use lex_rt::qwen_run::Runner;
 
-    let (mut model, mut tokens, mut context, mut verify, mut pre) =
-        ("qwen3.8:27b-mlx".to_string(), 32usize, 0usize, 3usize, 512usize);
+    let (mut model, mut tokens, mut context, mut verify, mut pre) = (
+        "qwen3.8:27b-mlx".to_string(),
+        32usize,
+        0usize,
+        3usize,
+        512usize,
+    );
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));

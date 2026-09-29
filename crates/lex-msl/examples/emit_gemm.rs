@@ -13,14 +13,41 @@ fn main() -> Result<(), String> {
     // gate/up, down (residual), the a/b projection's ragged 48 rows, and a
     // chunk of 32 tokens, which takes the half-height tile.
     for g in [
-        Gemm { m: 64, n: 17408, k: 5120, residual: false, x_half: true },
-        Gemm { m: 64, n: 5120, k: 17408, residual: true, x_half: false },
-        Gemm { m: 64, n: 48, k: 5120, residual: false, x_half: true },
-        Gemm { m: 32, n: 17408, k: 5120, residual: false, x_half: true },
+        Gemm {
+            m: 64,
+            n: 17408,
+            k: 5120,
+            residual: false,
+            x_half: true,
+        },
+        Gemm {
+            m: 64,
+            n: 5120,
+            k: 17408,
+            residual: true,
+            x_half: false,
+        },
+        Gemm {
+            m: 64,
+            n: 48,
+            k: 5120,
+            residual: false,
+            x_half: true,
+        },
+        Gemm {
+            m: 32,
+            n: 17408,
+            k: 5120,
+            residual: false,
+            x_half: true,
+        },
     ] {
         let l = gemm_nvfp4(&g, Backend::Cuda)?;
         std::fs::write(format!("{dir}/{}.cu", l.entry), &l.source).map_err(|e| e.to_string())?;
-        println!("{}: {} x {} blocks, {} B shared", l.entry, l.grid, l.grid2, l.threadgroup_bytes);
+        println!(
+            "{}: {} x {} blocks, {} B shared",
+            l.entry, l.grid, l.grid2, l.threadgroup_bytes
+        );
     }
     Ok(())
 }

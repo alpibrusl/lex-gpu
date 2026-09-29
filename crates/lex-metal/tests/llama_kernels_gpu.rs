@@ -804,7 +804,10 @@ fn ternary_weights_match_the_interpreter_and_each_other() {
         let (mut codes, mut scales) = (vec![], vec![]);
         for i in 0..BLOCKS {
             let (c, d) = match trits {
-                Trits::Dense => (&FIX[i * 28..i * 28 + 26], [FIX[i * 28 + 26], FIX[i * 28 + 27]]),
+                Trits::Dense => (
+                    &FIX[i * 28..i * 28 + 26],
+                    [FIX[i * 28 + 26], FIX[i * 28 + 27]],
+                ),
                 Trits::Slots2 => {
                     let o = 28 * BLOCKS + i * 34;
                     (&FIX[o + 2..o + 34], [FIX[o], FIX[o + 1]])
@@ -877,5 +880,8 @@ fn ternary_matvec_matches_the_interpreter_and_the_other_packing() {
         worst / scale < 1e-6,
         "the two packings of one matrix give different products: {worst:e} on {scale:e}"
     );
-    assert!(scale > 1e-3, "products all near zero; comparison is vacuous");
+    assert!(
+        scale > 1e-3,
+        "products all near zero; comparison is vacuous"
+    );
 }

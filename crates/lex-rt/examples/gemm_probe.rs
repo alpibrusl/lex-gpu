@@ -187,7 +187,11 @@ fn main() -> Result<(), String> {
             // perfectly, which reads as a pass. The MMA tile is BM=32 and
             // its grid had no token dimension, so every number this probe
             // reported past 32 tokens was a 32-token result divided by m.
-            let rows = |v: &[f32]| (0..m).filter(|r| v[r * n..(r + 1) * n].iter().any(|x| *x != 0.0)).count();
+            let rows = |v: &[f32]| {
+                (0..m)
+                    .filter(|r| v[r * n..(r + 1) * n].iter().any(|x| *x != 0.0))
+                    .count()
+            };
             let (rw, rg) = (rows(&want), rows(&got));
             assert!(
                 rw == m && rg == m,

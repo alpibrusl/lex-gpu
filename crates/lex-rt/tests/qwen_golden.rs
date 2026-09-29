@@ -489,7 +489,9 @@ fn prefill_lands_where_the_same_tokens_land_one_by_one() {
 fn a_long_prefill_through_the_gemm_lands_where_stepping_does() {
     let _lock = one_at_a_time();
     let (model, _) = parse(include_str!("data/qwen35_27b_golden.txt"));
-    let prompt: Vec<u32> = (0..150).map(|i| 1000 + (i as u32 * 7919) % 200000).collect();
+    let prompt: Vec<u32> = (0..150)
+        .map(|i| 1000 + (i as u32 * 7919) % 200000)
+        .collect();
     let mut rt = match Runner::load(&model, prompt.len() + 16) {
         Ok(rt) => rt,
         Err(e) => {
@@ -514,7 +516,10 @@ fn a_long_prefill_through_the_gemm_lands_where_stepping_does() {
     let top = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap();
     eprintln!("150-token prefill vs stepping: worst {worst:e} of scale");
     assert_eq!(top(&batched), top(&serial), "the next token changed");
-    assert!(worst < 2e-3, "prefill differs from stepping by {worst:e} of scale");
+    assert!(
+        worst < 2e-3,
+        "prefill differs from stepping by {worst:e} of scale"
+    );
 }
 
 /// Prefill compiles nothing after load. Every batch size a prompt is cut
@@ -539,7 +544,9 @@ fn prefill_compiles_nothing_after_load() {
     // rows at the end: the case that compiled. The rest end in a short tail.
     for n in [256usize, 64, 150, 77, 129, 9] {
         rt.reset();
-        let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i as u32 * 104729) % 200000).collect();
+        let prompt: Vec<u32> = (0..n)
+            .map(|i| 1000 + (i as u32 * 104729) % 200000)
+            .collect();
         rt.prefill(&prompt).expect("prefill");
     }
     assert_eq!(
@@ -624,7 +631,10 @@ fn speculation_survives_rejected_drafts() {
         spec, greedy,
         "speculation diverged from greedy after {rejected} rejected drafts"
     );
-    eprintln!("{rejected} of {} rounds rejected, output identical", spec.len());
+    eprintln!(
+        "{rejected} of {} rounds rejected, output identical",
+        spec.len()
+    );
 }
 
 /// Resuming from a checkpoint lands where a clean prefill lands.
@@ -645,7 +655,9 @@ fn resuming_from_a_checkpoint_lands_where_a_clean_prefill_lands() {
     let prompt: Vec<u32> = (0..40).map(|i| 1000 + (i as u32 * 7919) % 200000).collect();
     // A different continuation of the same prefix, to leave the recurrent
     // state somewhere else entirely before resuming.
-    let other: Vec<u32> = (0..23).map(|i| 500 + (i as u32 * 104_729) % 150_000).collect();
+    let other: Vec<u32> = (0..23)
+        .map(|i| 500 + (i as u32 * 104_729) % 150_000)
+        .collect();
     let cut = 17;
     let mut rt = match Runner::load(&model, prompt.len() + other.len() + 16) {
         Ok(rt) => rt,
@@ -670,7 +682,11 @@ fn resuming_from_a_checkpoint_lands_where_a_clean_prefill_lands() {
 
     let rel = |a: &[f32], b: &[f32]| {
         let scale = a.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max) / scale
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+            / scale
     };
     // The detour has to have moved the model, or nothing was restored.
     assert!(
@@ -733,5 +749,8 @@ fn sampled_speculation_accepts_drafts_and_rejects_some() {
         said as f64 / ROUNDS as f64
     );
     assert!(accepted > 0, "no draft was ever accepted under sampling");
-    assert!(short > 0, "no draft was ever rejected; the correction path never ran");
+    assert!(
+        short > 0,
+        "no draft was ever rejected; the correction path never ran"
+    );
 }

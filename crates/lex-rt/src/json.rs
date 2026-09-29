@@ -250,9 +250,10 @@ impl Parser<'_> {
                             // Outside the BMP, `json.dumps` writes a
                             // surrogate pair -- every emoji a Python client
                             // sends. Each half alone is not a character.
-                            let low = self.b.get(self.i..self.i + 6).filter(|t| {
-                                (0xd800..0xdc00).contains(&n) && t.starts_with(b"\\u")
-                            });
+                            let low = self
+                                .b
+                                .get(self.i..self.i + 6)
+                                .filter(|t| (0xd800..0xdc00).contains(&n) && t.starts_with(b"\\u"));
                             match low.map(|t| hex4(&t[2..])).transpose()? {
                                 Some(lo) if (0xdc00..0xe000).contains(&lo) => {
                                     self.i += 6;

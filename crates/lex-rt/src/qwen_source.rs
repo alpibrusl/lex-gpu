@@ -159,7 +159,11 @@ fn split(g: &Gguf, name: &str) -> Result<(Split, usize, usize), String> {
         GgmlType::Q8_0 => split_q8_0(b),
         GgmlType::PTQ1_0 => split_ternary(b, Trits::Dense),
         GgmlType::PQ2_0 => split_ternary(b, Trits::Slots2),
-        other => return Err(format!("{name}: {other:?} is not a quantised matrix this reads")),
+        other => {
+            return Err(format!(
+                "{name}: {other:?} is not a quantised matrix this reads"
+            ));
+        }
     };
     Ok((s, rows, cols))
 }

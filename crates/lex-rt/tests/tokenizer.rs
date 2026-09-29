@@ -25,7 +25,10 @@ const GGUF_MODEL: &str = "maternion/mimo-v2.6:9b";
 /// `"..."` as the fixture writes it, back to a string.
 fn unquote(s: &str) -> String {
     let b: Vec<char> = s.trim().chars().collect();
-    assert!(b.len() >= 2 && b[0] == '"' && b[b.len() - 1] == '"', "not quoted: {s}");
+    assert!(
+        b.len() >= 2 && b[0] == '"' && b[b.len() - 1] == '"',
+        "not quoted: {s}"
+    );
     let mut out = String::new();
     let mut i = 1;
     while i < b.len() - 1 {
@@ -122,7 +125,11 @@ fn decodes_the_references_ids(model: &str) {
     // two code points back. The reference does not round-trip that case
     // either, and a test demanding it would be demanding a bug.
     for (text, ids) in cases() {
-        assert_eq!(tok.decode(&ids), lex_rt::tokenizer::nfc(&text), "{model}: decoding {ids:?}");
+        assert_eq!(
+            tok.decode(&ids),
+            lex_rt::tokenizer::nfc(&text),
+            "{model}: decoding {ids:?}"
+        );
     }
 }
 
@@ -148,7 +155,11 @@ fn a_gguf_tokenizer_keeps_the_chat_markers_whole() {
             return;
         }
     };
-    for (marker, id) in [("<|endoftext|>", 248044), ("<|im_start|>", 248045), ("<|im_end|>", 248046)] {
+    for (marker, id) in [
+        ("<|endoftext|>", 248044),
+        ("<|im_start|>", 248045),
+        ("<|im_end|>", 248046),
+    ] {
         assert_eq!(tok.encode(marker), vec![id], "{marker}");
         assert_eq!(tok.decode(&[id]), marker, "{marker}");
     }

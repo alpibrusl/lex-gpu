@@ -251,7 +251,9 @@ fn render_qwen(req: &Json) -> Result<String, String> {
                 // Consecutive results share one user turn, which is how the
                 // template keeps a parallel-call round from looking like
                 // several turns of conversation.
-                let prev = i.checked_sub(1).map(|p| msgs[p].get("role").and_then(Json::str));
+                let prev = i
+                    .checked_sub(1)
+                    .map(|p| msgs[p].get("role").and_then(Json::str));
                 if prev.is_some() && prev != Some(Some("tool")) {
                     s.push_str("<|im_start|>user");
                 }
@@ -371,7 +373,11 @@ fn render_mimo(req: &Json) -> Result<String, String> {
         .get("chat_template_kwargs")
         .and_then(|k| k.get("enable_thinking"))
         != Some(&Json::Bool(false));
-    s.push_str(if thinking { "<think>\n" } else { "<think></think>" });
+    s.push_str(if thinking {
+        "<think>\n"
+    } else {
+        "<think></think>"
+    });
     Ok(s)
 }
 
@@ -402,7 +408,15 @@ fn mimo_content(c: Option<&Json>) -> Result<String, String> {
             Json::Str(s) => out.push_str(s),
             Json::Obj(_) => {
                 let ty = p.get("type").and_then(Json::str).unwrap_or("");
-                let media = ["image", "image_url", "audio", "audio_url", "input_audio", "video", "video_url"];
+                let media = [
+                    "image",
+                    "image_url",
+                    "audio",
+                    "audio_url",
+                    "input_audio",
+                    "video",
+                    "video_url",
+                ];
                 if media.contains(&ty) || media.iter().any(|k| p.get(k).is_some()) {
                     return Err(format!(
                         "a `{ty}` content part: this server reads text only"
@@ -415,7 +429,12 @@ fn mimo_content(c: Option<&Json>) -> Result<String, String> {
                     }
                 }
             }
-            other => return Err(format!("a content part that is not text: {}", tojson(other))),
+            other => {
+                return Err(format!(
+                    "a content part that is not text: {}",
+                    tojson(other)
+                ));
+            }
         }
     }
     Ok(out)
@@ -589,7 +608,11 @@ fn parse_json_call(body: &str, types: &[Json]) -> Option<Call> {
         return parse_call(body, types);
     }
     let raw = inner.trim();
-    let arguments = if raw.is_empty() { "{}".to_string() } else { raw.to_string() };
+    let arguments = if raw.is_empty() {
+        "{}".to_string()
+    } else {
+        raw.to_string()
+    };
     Some(Call { name, arguments })
 }
 
@@ -779,7 +802,10 @@ fn trim(
     if total <= budget {
         return Ok((full, 0));
     }
-    let msgs = req.get("messages").and_then(Json::arr).ok_or("no messages")?;
+    let msgs = req
+        .get("messages")
+        .and_then(Json::arr)
+        .ok_or("no messages")?;
     let starts = turns(msgs);
     let head: Vec<Json> = pinned(msgs).iter().map(|&i| msgs[i].clone()).collect();
     let keep_from = |d: usize| -> Result<String, String> {
@@ -847,7 +873,12 @@ fn trim(
             .max_by_key(|(_, m)| m.get("content").and_then(Json::str).unwrap_or("").len())
             .map(|(i, _)| i);
         match biggest.filter(|&i| {
-            kept[i].get("content").and_then(Json::str).unwrap_or("").len() > 256
+            kept[i]
+                .get("content")
+                .and_then(Json::str)
+                .unwrap_or("")
+                .len()
+                > 256
         }) {
             Some(i) => kept[i] = elide(&kept[i]),
             None => {

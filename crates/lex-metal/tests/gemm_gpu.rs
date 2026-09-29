@@ -69,7 +69,10 @@ fn gemm_error(gpu: &Gpu, g: Gemm) -> f32 {
     let want = &tensors[out].data;
     let scale = want.iter().fold(1e-6f32, |a, x| a.max(x.abs()));
     // Two kernels that both write nothing agree perfectly.
-    assert!(scale > 1.0, "{g:?}: the reference output is all but zero ({scale})");
+    assert!(
+        scale > 1.0,
+        "{g:?}: the reference output is all but zero ({scale})"
+    );
     got.iter()
         .zip(want)
         .map(|(a, b)| (a - b).abs())
@@ -86,10 +89,34 @@ fn the_gemm_matches_the_matmul_it_replaces() {
     // Ragged on purpose: 40 tokens and 100 rows fill no tile exactly, so the
     // guards on both are exercised, and 512 is 16 K-tiles.
     for g in [
-        Gemm { m: 40, n: 100, k: 512, residual: false, x_half: true },
-        Gemm { m: 40, n: 100, k: 512, residual: true, x_half: true },
-        Gemm { m: 64, n: 128, k: 512, residual: false, x_half: false },
-        Gemm { m: 17, n: 48, k: 256, residual: true, x_half: false },
+        Gemm {
+            m: 40,
+            n: 100,
+            k: 512,
+            residual: false,
+            x_half: true,
+        },
+        Gemm {
+            m: 40,
+            n: 100,
+            k: 512,
+            residual: true,
+            x_half: true,
+        },
+        Gemm {
+            m: 64,
+            n: 128,
+            k: 512,
+            residual: false,
+            x_half: false,
+        },
+        Gemm {
+            m: 17,
+            n: 48,
+            k: 256,
+            residual: true,
+            x_half: false,
+        },
     ] {
         // With half activations the match is exact, not close: an f16 input
         // times a dequantised NVFP4 weight has few enough significant bits

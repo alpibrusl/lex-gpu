@@ -13,7 +13,7 @@
 //! blocks of `output.weight` taken from each file.
 
 use lex_front::ir::{Arg, Builder, IdxExpr, Op, Program, TileTy, Trits, View};
-use lex_front::{check, interp::run, interp::Tensor};
+use lex_front::{check, interp::Tensor, interp::run};
 use lex_ir::{DType, Space, Target};
 
 const BLOCKS: usize = 64;
@@ -75,7 +75,10 @@ fn the_fixture_would_catch_the_hypotheses_that_were_wrong() {
         .flat_map(|i| ptq1(i)[..26].iter())
         .filter(|&&b| b > 242)
         .count();
-    assert!(over > 0, "no payload byte above 242; plain base-3 not excluded");
+    assert!(
+        over > 0,
+        "no payload byte above 242; plain base-3 not excluded"
+    );
 
     // All three codes present, so a decode that collapsed two would fail.
     let mut seen = [0usize; 3];
@@ -84,7 +87,10 @@ fn the_fixture_would_catch_the_hypotheses_that_were_wrong() {
             seen[Trits::Dense.code(&ptq1(i)[..26], col) as usize] += 1;
         }
     }
-    assert!(seen.iter().all(|&n| n > 0), "codes not all present: {seen:?}");
+    assert!(
+        seen.iter().all(|&n| n > 0),
+        "codes not all present: {seen:?}"
+    );
 
     // Reading the lanes sequentially -- five consecutive trits per byte --
     // is the other natural guess. It must disagree, or the lane map is not

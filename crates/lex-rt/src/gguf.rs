@@ -117,10 +117,7 @@ struct Cursor<'a> {
 
 impl Cursor<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8], String> {
-        let s = self
-            .b
-            .get(self.pos..self.pos + n)
-            .ok_or(TRUNCATED)?;
+        let s = self.b.get(self.pos..self.pos + n).ok_or(TRUNCATED)?;
         self.pos += n;
         Ok(s)
     }
@@ -359,8 +356,12 @@ pub fn ollama_model(tag: &str) -> Result<PathBuf, String> {
     // worked out by counting five components up from the manifest, which
     // holds only for `library/` tags and would have silently counted wrong
     // for any other depth.
-    let (root, text) =
-        found.ok_or_else(|| format!("no readable Ollama manifest for {tag}; tried {}", tried.join(", ")))?;
+    let (root, text) = found.ok_or_else(|| {
+        format!(
+            "no readable Ollama manifest for {tag}; tried {}",
+            tried.join(", ")
+        )
+    })?;
     // The manifest is small JSON; find the model layer's digest without a
     // JSON dependency.
     let key = "application/vnd.ollama.image.model";

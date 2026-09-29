@@ -16,9 +16,10 @@ use lex_front::llama::split_ternary;
 use lex_rt::gguf::{GgmlType, Gguf, Value};
 
 fn main() -> Result<(), String> {
-    let path = std::env::args().nth(1).map(PathBuf::from).ok_or(
-        "usage: bonsai <path to a Ternary-Bonsai GGUF>".to_string(),
-    )?;
+    let path = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .ok_or("usage: bonsai <path to a Ternary-Bonsai GGUF>".to_string())?;
     let g = Gguf::open(&path)?;
 
     let s = |k: &str| match g.meta.get(k) {
@@ -73,7 +74,11 @@ fn main() -> Result<(), String> {
             .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
             .collect();
         let finite = v.iter().filter(|x| x.is_finite()).count();
-        let rms = (v.iter().filter(|x| x.is_finite()).map(|x| x * x).sum::<f32>()
+        let rms = (v
+            .iter()
+            .filter(|x| x.is_finite())
+            .map(|x| x * x)
+            .sum::<f32>()
             / finite.max(1) as f32)
             .sqrt();
         println!(
@@ -81,13 +86,19 @@ fn main() -> Result<(), String> {
              max |x| {:.5}",
             t.dims,
             v.len(),
-            v.iter().filter(|x| x.is_finite()).fold(0.0f32, |a, x| a.max(x.abs()))
+            v.iter()
+                .filter(|x| x.is_finite())
+                .fold(0.0f32, |a, x| a.max(x.abs()))
         );
     }
 
     // Dequantise a row of a real ternary matrix and check it is what a
     // ternary format should give: three values, evenly spread.
-    for name in ["blk.0.ffn_gate.weight", "blk.0.attn_qkv.weight", "output.weight"] {
+    for name in [
+        "blk.0.ffn_gate.weight",
+        "blk.0.attn_qkv.weight",
+        "output.weight",
+    ] {
         let (t, b) = g.raw(name)?;
         let trits = match t.ty {
             GgmlType::PTQ1_0 => Trits::Dense,
@@ -112,7 +123,9 @@ fn main() -> Result<(), String> {
              scales {:.5}..{:.5}",
             t.dims,
             counts,
-            (0..cols / 128).map(|g| sp.scale(g)).fold(f32::MAX, f32::min),
+            (0..cols / 128)
+                .map(|g| sp.scale(g))
+                .fold(f32::MAX, f32::min),
             (0..cols / 128).map(|g| sp.scale(g)).fold(0.0f32, f32::max),
         );
     }

@@ -87,7 +87,8 @@ impl Tokenizer {
             let id = vocab_json
                 .get(key)
                 .and_then(Json::usize)
-                .ok_or_else(|| format!("vocab entry `{key}` is not an id"))? as u32;
+                .ok_or_else(|| format!("vocab entry `{key}` is not an id"))?
+                as u32;
             if text.len() <= id as usize {
                 text.resize(id as usize + 1, String::new());
             }
@@ -108,7 +109,9 @@ impl Tokenizer {
                         _ => return Err(format!("merge {rank} is not a pair of strings")),
                     },
                     _ => {
-                        let s = m.str().ok_or_else(|| format!("merge {rank} is not a string"))?;
+                        let s = m
+                            .str()
+                            .ok_or_else(|| format!("merge {rank} is not a string"))?;
                         split_joined(s, &vocab).map_err(|e| format!("merge {rank} {e}"))?
                     }
                 };
@@ -444,9 +447,7 @@ pub fn nfc(text: &str) -> String {
         let k = ccc(c);
         if let Some(s) = starter {
             let blocked = k != 0 && last >= k;
-            if !blocked
-                && let Some(j) = compose(res[s], c)
-            {
+            if !blocked && let Some(j) = compose(res[s], c) {
                 res[s] = j;
                 continue;
             }

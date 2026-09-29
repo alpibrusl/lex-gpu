@@ -82,7 +82,10 @@ pub fn dump_cuda(prog: &lex_front::Program, threads: usize) {
             let _ = std::fs::write(dir.join(format!("{}.cu", l.entry)), &l.source);
         }
         Err(e) => {
-            eprintln!("LEX_DUMP_CUDA: `{}` does not lower for CUDA: {e}", prog.name);
+            eprintln!(
+                "LEX_DUMP_CUDA: `{}` does not lower for CUDA: {e}",
+                prog.name
+            );
             let _ = std::fs::write(dir.join(format!("{}.err", prog.name)), e);
         }
     }

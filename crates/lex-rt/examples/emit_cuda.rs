@@ -115,7 +115,11 @@ fn main() -> Result<(), String> {
     for p in &progs {
         // 128 for attention, as the runtime builds it; the rest take the
         // default. Lowering is what can fail here, and it fails per kernel.
-        let threads = if p.name.starts_with("flash") { 128 } else { THREADS };
+        let threads = if p.name.starts_with("flash") {
+            128
+        } else {
+            THREADS
+        };
         let lowered = lower_with(p, &target, threads, &Cuda)
             .map_err(|e| format!("`{}` does not lower for CUDA: {e}", p.name))?;
         let path = dir.join(format!("{}.cu", lowered.entry));

@@ -31,9 +31,9 @@ mod serve {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use lex_rt::chat::{self, Piece, Stream, Template};
-use lex_rt::json::Json;
-use lex_rt::sample::Sampler;
+    use lex_rt::json::Json;
     use lex_rt::qwen_run::{Checkpoint, Runner, evict_index};
+    use lex_rt::sample::Sampler;
     use lex_rt::tokenizer::Tokenizer;
 
     /// What the model says to end a turn. `generation_config.json` lists
@@ -79,7 +79,10 @@ use lex_rt::sample::Sampler;
         // one: on CUDA each is seconds of NVRTC.
         let t = std::time::Instant::now();
         rt.compile_batches()?;
-        eprintln!("batch kernels compiled in {:.1} s", t.elapsed().as_secs_f64());
+        eprintln!(
+            "batch kernels compiled in {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
         let stop: Vec<u32> = STOP.iter().filter_map(|s| tok.id_of(s)).collect();
         // Speculation is only a win where there is a draft head to do it.
         let depth = if rt.has_mtp() { depth } else { 0 };
@@ -200,7 +203,11 @@ use lex_rt::sample::Sampler;
                 if let Some(p) = f("general.sampling.top_p") {
                     d.top_p = p as f32;
                 }
-                if let Some(k) = g.meta.get("general.sampling.top_k").and_then(|v| v.as_int()) {
+                if let Some(k) = g
+                    .meta
+                    .get("general.sampling.top_k")
+                    .and_then(|v| v.as_int())
+                {
                     d.top_k = k.max(0) as usize;
                 }
             }
@@ -288,7 +295,10 @@ use lex_rt::sample::Sampler;
         let num = |k: &str| j.get(k).and_then(Json::num);
         let temperature = num("temperature").map_or(defaults.temperature, |t| t as f32);
         let top_p = num("top_p").map_or(defaults.top_p, |p| p as f32);
-        let top_k = j.get("top_k").and_then(Json::usize).unwrap_or(defaults.top_k);
+        let top_k = j
+            .get("top_k")
+            .and_then(Json::usize)
+            .unwrap_or(defaults.top_k);
         let seed = j
             .get("seed")
             .and_then(Json::usize)
@@ -372,20 +382,31 @@ use lex_rt::sample::Sampler;
             };
             sse(conn, &chunk(r#"{"role":"assistant"}"#, "null".into()))?;
             let mut split = Stream::new(template);
-            let (text, reason, _) = generate(rt, tok, stop, depth, want, logits, &mut sampler, &mut |all| {
-                for p in split.push(all) {
-                    // Reasoning goes in its own field. A client that shows
-                    // `content` should not be shown the model's notes, and
-                    // an adapter looking for a tool call must not have to
-                    // dig it out of them.
-                    let d = match &p {
-                        Piece::Reasoning(t) => format!(r#"{{"reasoning_content":{}}}"#, quote(t)),
-                        Piece::Content(t) => format!(r#"{{"content":{}}}"#, quote(t)),
-                    };
-                    sse(conn, &chunk(&d, "null".into()))?;
-                }
-                Ok(())
-            })?;
+            let (text, reason, _) = generate(
+                rt,
+                tok,
+                stop,
+                depth,
+                want,
+                logits,
+                &mut sampler,
+                &mut |all| {
+                    for p in split.push(all) {
+                        // Reasoning goes in its own field. A client that shows
+                        // `content` should not be shown the model's notes, and
+                        // an adapter looking for a tool call must not have to
+                        // dig it out of them.
+                        let d = match &p {
+                            Piece::Reasoning(t) => {
+                                format!(r#"{{"reasoning_content":{}}}"#, quote(t))
+                            }
+                            Piece::Content(t) => format!(r#"{{"content":{}}}"#, quote(t)),
+                        };
+                        sse(conn, &chunk(&d, "null".into()))?;
+                    }
+                    Ok(())
+                },
+            )?;
             let (last, reply) = split.finish(&text, &types);
             for p in last {
                 let d = match &p {
@@ -407,11 +428,21 @@ use lex_rt::sample::Sampler;
             }
             let reason = finish_reason(reason, &reply);
             sse(conn, &chunk("{}", quote(reason)))?;
-            conn.write_all(b"data: [DONE]\n\n").map_err(|e| e.to_string())?;
+            conn.write_all(b"data: [DONE]\n\n")
+                .map_err(|e| e.to_string())?;
             return conn.flush().map_err(|e| e.to_string());
         }
 
-        let (text, reason, n) = generate(rt, tok, stop, depth, want, logits, &mut sampler, &mut |_| Ok(()))?;
+        let (text, reason, n) = generate(
+            rt,
+            tok,
+            stop,
+            depth,
+            want,
+            logits,
+            &mut sampler,
+            &mut |_| Ok(()),
+        )?;
         let reply = template.parse_reply(&text, &types);
         let calls: Vec<String> = reply
             .calls
@@ -495,7 +526,7 @@ use lex_rt::sample::Sampler;
         want: usize,
         logits: Vec<f32>,
         sampler: &mut Sampler,
-        emit: &mut dyn FnMut(&str) -> Result<(), String>,  // everything said so far
+        emit: &mut dyn FnMut(&str) -> Result<(), String>, // everything said so far
     ) -> Result<(String, &'static str, usize), String> {
         let mut out: Vec<u32> = vec![];
         let mut said = String::new();
@@ -541,7 +572,11 @@ use lex_rt::sample::Sampler;
     /// decode loop stopped on: the agent loop dispatches on this field and
     /// nothing else, so a call reported as "stop" is a call never run.
     fn finish_reason(reason: &'static str, reply: &chat::Reply) -> &'static str {
-        if reply.calls.is_empty() { reason } else { "tool_calls" }
+        if reply.calls.is_empty() {
+            reason
+        } else {
+            "tool_calls"
+        }
     }
 
     fn sse(conn: &mut TcpStream, data: &str) -> Result<(), String> {

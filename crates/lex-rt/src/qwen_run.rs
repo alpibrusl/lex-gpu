@@ -130,7 +130,8 @@ impl Config {
         // file also lists it outright, and two sources for one fact had
         // better agree: a layer run as the wrong kind reads the wrong
         // weights and says nothing about it.
-        if let Some(Value::Array(flags)) = g.meta.get(&format!("{arch}.attention.recurrent_layers")) {
+        if let Some(Value::Array(flags)) = g.meta.get(&format!("{arch}.attention.recurrent_layers"))
+        {
             for (i, flag) in flags.iter().enumerate() {
                 if let Value::Bool(recurrent) = flag
                     && *recurrent != cfg.is_linear(i)
@@ -187,6 +188,7 @@ mod gpu {
     use crate::sample::Sampler;
     use std::collections::HashMap;
 
+    use crate::dev::{Buffer, Gpu, Pipeline, Step};
     use half::f16;
     use lex_front::flash::{COMBINE_CHUNK, FlashDecode};
     use lex_front::llama::{
@@ -194,12 +196,11 @@ mod gpu {
     };
     use lex_front::qwen::{
         DeltaNet, build_conv_silu_rows, build_conv_silu_rows_snap, build_delta_qk_rows_in,
-        build_gated_norm_rows,
-        build_gates_rows, build_matvec_dense_rows, build_mul, build_qk_rope_rows,
+        build_gated_norm_rows, build_gates_rows, build_matvec_dense_rows, build_mul,
+        build_qk_rope_rows,
     };
     use lex_front::{Program, check};
     use lex_ir::{DType, Kernel, Space, Target, plan};
-    use crate::dev::{Buffer, Gpu, Pipeline, Step};
     use lex_msl::gemm::{Gemm, gemm_nvfp4};
     use lex_msl::program::lower_with;
 
@@ -476,8 +477,7 @@ mod gpu {
     /// and neither is the oldest, which is the only fallback for a prompt
     /// that diverges early.
     pub fn evict_index(positions: &[usize]) -> Option<usize> {
-        (1..positions.len().checked_sub(1)?)
-            .min_by_key(|&i| positions[i + 1] - positions[i - 1])
+        (1..positions.len().checked_sub(1)?).min_by_key(|&i| positions[i + 1] - positions[i - 1])
     }
 
     /// A resumable point in a conversation: the position, and the whole
@@ -1016,8 +1016,12 @@ mod gpu {
                     copy_state: build(sn)?,
                     copy_conv: build(cn)?,
                     pos: 0,
-                    rows_state: (0..delta).map(|_| gpu.zeroed::<f32>(SPEC_MAX * sn)).collect(),
-                    rows_conv: (0..delta).map(|_| gpu.zeroed::<f32>(SPEC_MAX * cn)).collect(),
+                    rows_state: (0..delta)
+                        .map(|_| gpu.zeroed::<f32>(SPEC_MAX * sn))
+                        .collect(),
+                    rows_conv: (0..delta)
+                        .map(|_| gpu.zeroed::<f32>(SPEC_MAX * cn))
+                        .collect(),
                     roll_state: block(hv * dv, dk)?,
                     roll_conv: block(cfg.conv_kernel - 1, ch)?,
                 })
@@ -1593,7 +1597,13 @@ mod gpu {
                 d.push((
                     "mtp attention",
                     &k.attn_combine,
-                    vec![&a.part_m, &a.part_l, &a.part_acc, &a.attn, &a.scalars_nsplit],
+                    vec![
+                        &a.part_m,
+                        &a.part_l,
+                        &a.part_acc,
+                        &a.attn,
+                        &a.scalars_nsplit,
+                    ],
                     None,
                 ));
             } else {
@@ -1605,7 +1615,12 @@ mod gpu {
                 ));
             }
             d.extend([
-                ("mtp gate mul", &k.mul, vec![&a.attn, &a.gate, &a.gated], None),
+                (
+                    "mtp gate mul",
+                    &k.mul,
+                    vec![&a.attn, &a.gate, &a.gated],
+                    None,
+                ),
                 (
                     "mtp matvec o_proj",
                     &k.mv[&at.o.key(true)],
@@ -2260,13 +2275,7 @@ mod gpu {
                             Some(s) => (
                                 "conv",
                                 k.conv_snap.as_ref().expect("checked"),
-                                vec![
-                                    &l.conv_state,
-                                    &a.qkv,
-                                    &l.conv_w,
-                                    &a.conv,
-                                    &s.rows_conv[li],
-                                ],
+                                vec![&l.conv_state, &a.qkv, &l.conv_w, &a.conv, &s.rows_conv[li]],
                                 None,
                             ),
                             None => (

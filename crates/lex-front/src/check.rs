@@ -730,7 +730,10 @@ impl Checker<'_> {
                 if !n.is_multiple_of(2 * stride) {
                     self.err(
                         Kind::Shape,
-                        format!("butterfly at stride {stride} needs a multiple of {} , not {n}", 2 * stride),
+                        format!(
+                            "butterfly at stride {stride} needs a multiple of {} , not {n}",
+                            2 * stride
+                        ),
                     );
                     return None;
                 }

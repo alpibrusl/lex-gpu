@@ -97,7 +97,10 @@ impl<'a> Lexer<'a> {
                     self.bump();
                 } else if c == '/' {
                     // Only a comment if doubled; a lone `/` divides.
-                    let at = At { line: self.line, col: self.col };
+                    let at = At {
+                        line: self.line,
+                        col: self.col,
+                    };
                     self.bump();
                     if self.src.peek() == Some(&'/') {
                         while let Some(c) = self.bump() {
@@ -112,7 +115,10 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             }
-            let at = At { line: self.line, col: self.col };
+            let at = At {
+                line: self.line,
+                col: self.col,
+            };
             let Some(&c) = self.src.peek() else {
                 out.push((Tok::End, at));
                 return Ok(out);
@@ -231,7 +237,11 @@ impl Parser {
         if self.eat_punct(p) {
             Ok(())
         } else {
-            Err(format!("{}: expected `{p}`, found {:?}", self.at(), self.peek()))
+            Err(format!(
+                "{}: expected `{p}`, found {:?}",
+                self.at(),
+                self.peek()
+            ))
         }
     }
 
@@ -255,7 +265,10 @@ impl Parser {
         match self.bump() {
             Tok::Num(n) => Ok(Dim::Lit(n as usize)),
             Tok::Ident(s) => Ok(Dim::Named(s)),
-            other => Err(format!("{}: expected a dimension, found {other:?}", self.at())),
+            other => Err(format!(
+                "{}: expected a dimension, found {other:?}",
+                self.at()
+            )),
         }
     }
 
@@ -648,7 +661,6 @@ impl Algo {
             params.insert(&p.name, (id, seen, p.dtype));
         }
 
-
         // Tiles in scope. A name maps to the IR var and the shape it has,
         // so a `Fill` can take the shape of whatever it is added to.
         let mut env: HashMap<String, (crate::ir::Var, Vec<usize>, DType)> = HashMap::new();
@@ -656,7 +668,8 @@ impl Algo {
         for stmt in &self.body {
             match stmt {
                 Stmt::Let(dst, e) => {
-                    let (v, shape, dt) = self.lower(&mut b, &mut env, &params, &subst(e), dst, pid)?;
+                    let (v, shape, dt) =
+                        self.lower(&mut b, &mut env, &params, &subst(e), dst, pid)?;
                     env.insert(dst.clone(), (v, shape, dt));
                 }
                 Stmt::Store(e, dst) => {
@@ -705,7 +718,11 @@ impl Algo {
                 let a = arg(inner, v);
                 match f.as_str() {
                     "rowsum" | "rowmax" => {
-                        let r = if f == "rowsum" { Reduce::Sum } else { Reduce::Max };
+                        let r = if f == "rowsum" {
+                            Reduce::Sum
+                        } else {
+                            Reduce::Max
+                        };
                         // A row reduction of `[rows, n]` gives `[rows]`,
                         // one dimension shorter -- not `[rows, 1]`. The
                         // checker broadcasts the 1-d form against the 2-d
