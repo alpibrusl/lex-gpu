@@ -226,7 +226,7 @@ kernel void {entry}(
             .build_lowered(lowered)
             .map_err(|e| format!("{name}: {e}"))?;
         let (q0, s0, g0) = &mats[0];
-        gpu.run(&pipe, &[&xb, q0, s0, g0, &y]);
+        gpu.run(&pipe, &[xb, q0, s0, g0, &y]);
         let mut got = vec![0.0f32; 4 * N];
         gpu.download(&y, &mut got);
         let check = match &reference {
