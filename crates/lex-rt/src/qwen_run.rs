@@ -201,6 +201,7 @@ mod gpu {
     };
     use lex_front::{Program, check};
     use lex_ir::{DType, Kernel, Space, Target, plan};
+    use lex_msl::delta::DeltaChunk;
     use lex_msl::gemm::{Gemm, gemm_nvfp4};
     use lex_msl::program::lower_with;
 
@@ -2322,7 +2323,29 @@ mod gpu {
                     128,
                 )?,
                 gates: compile(gpu, &build_gates_rows(t, hv, dv), 64)?,
-                delta: compile(gpu, &delta.build_steps(t)?, 128)?,
+                delta: {
+                    // A prefill chunk solves the recurrence a chunk of
+                    // tokens at a time on Metal (`lex_msl::delta`), rather
+                    // than token by token. `LEX_DELTA_STEPS=1` keeps the
+                    // step kernel, to measure one against the other.
+                    let dc = DeltaChunk {
+                        tokens: t,
+                        v_heads: hv,
+                        k_dim: dk,
+                        v_dim: dv,
+                        v_base: c.v_base(),
+                        v_width: ch,
+                    };
+                    if t > MAX_BATCH
+                        && crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
+                        && lex_msl::delta::fits(&dc)
+                        && std::env::var_os("LEX_DELTA_STEPS").is_none()
+                    {
+                        gpu.build_lowered(&lex_msl::delta::delta_chunked(&dc)?)?
+                    } else {
+                        compile(gpu, &delta.build_steps(t)?, 128)?
+                    }
+                },
                 gated_norm: compile(gpu, &build_gated_norm_rows(t, hv, dv, c.eps), 128)?,
                 rope_q: compile(
                     gpu,
