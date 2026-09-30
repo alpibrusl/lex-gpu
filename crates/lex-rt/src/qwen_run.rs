@@ -2491,7 +2491,27 @@ mod gpu {
                     &kv_append_rows(t, c.kv_heads, c.head_dim, self.cap, DType::F32),
                     64,
                 )?,
-                attn: compile(gpu, &attn.build_causal_blocks(t, attn_tq(t))?, 128)?,
+                attn: {
+                    // A prefill chunk's attention on the matrix units on
+                    // Metal (`lex_msl::attn`); verify batches and CUDA keep
+                    // the program. `LEX_ATTN_PROGRAM=1` keeps it everywhere.
+                    let mma = lex_msl::attn::Causal {
+                        tokens: t,
+                        kv_heads: c.kv_heads,
+                        group: c.heads / c.kv_heads,
+                        head_dim: c.head_dim,
+                        cap: self.cap,
+                    };
+                    if t > MAX_BATCH
+                        && crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
+                        && lex_msl::attn::fits(&mma)
+                        && std::env::var_os("LEX_ATTN_PROGRAM").is_none()
+                    {
+                        gpu.build_lowered(&lex_msl::attn::causal_mma(&mma)?)?
+                    } else {
+                        compile(gpu, &attn.build_causal_blocks(t, attn_tq(t))?, 128)?
+                    }
+                },
                 attn_split: compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128)?,
                 attn_combine: compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128)?,
                 mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
