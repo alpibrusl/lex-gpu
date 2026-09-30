@@ -9,11 +9,13 @@
 # checkpoint. Results go to ~/results/engines.jsonl, one line an engine.
 # ENGINES picks which run (default "lex vllm"), so one can be redone
 # without the other: JOB='ENGINES=vllm bash scripts/gcp/bench_engines.sh'.
+# vLLM runs each checkpoint in ~/hf the card can hold (CKPTS to choose):
+# NVIDIA's NVFP4 needs more than an L4's 24 GB, Red Hat's INT4 does not.
 #
 # vLLM's first try is what serves a user: the draft head speculating two
-# tokens (lex's default depth) on CUDA graphs. The checkpoint is 21.9 GB
-# against the card's 23, so if that does not start it tries eager mode,
-# then plain decode, and says which one ran.
+# tokens (lex's default depth) on CUDA graphs. If that does not start --
+# memory, or a checkpoint without the head -- it tries eager mode, then
+# plain decode, and says which one ran.
 set -uo pipefail
 cd "$HOME/lex-gpu"
 R="$HOME/results"
@@ -53,9 +55,10 @@ fi
 
 echo "=== $(cat "$HOME/vllm-version.txt" 2>/dev/null)"
 SPEC='{"method":"mtp","num_speculative_tokens":2}'
+GPU_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 try_vllm() { # name, then extra vLLM arguments
   local name=$1; shift
-  "$HOME/vllm/bin/vllm" serve "$HOME/hf/Qwen3.8-27B-NVFP4" --port 8000 \
+  "$HOME/vllm/bin/vllm" serve "$HOME/hf/$CKPT" --port 8000 \
     --served-model-name qwen3.8 \
     --max-model-len 8192 --max-num-seqs 1 --gpu-memory-utilization 0.95 \
     --kv-cache-dtype fp8_e4m3 --no-enable-prefix-caching \
@@ -72,11 +75,22 @@ try_vllm() { # name, then extra vLLM arguments
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
   return 1
 }
-try_vllm mtp2 --speculative-config "$SPEC" \
-  || try_vllm mtp2-eager --speculative-config "$SPEC" --enforce-eager \
-  || try_vllm plain-eager --enforce-eager
-# The plain one as well when speculation ran: it separates the kernels
-# from the speculation.
-grep -q "vllm-mtp2" "$R/engines.jsonl" 2>/dev/null && try_vllm plain
+for CKPT in ${CKPTS:-Qwen3.8-27B-INT4 Qwen3.8-27B-NVFP4}; do
+  if [ ! -d "$HOME/hf/$CKPT" ]; then
+    echo "no $CKPT in ~/hf" | tee -a "$R/engines.log"; continue
+  fi
+  if [ "$CKPT" = Qwen3.8-27B-NVFP4 ] && [ "$GPU_MB" -lt 40000 ]; then
+    echo "skipping $CKPT: needs more than this card's $GPU_MB MiB" | tee -a "$R/engines.log"
+    continue
+  fi
+  echo "=== vLLM, $CKPT" | tee -a "$R/engines.log"
+  pre="${CKPT#Qwen3.8-27B-}"
+  try_vllm "$pre-mtp2" --speculative-config "$SPEC" \
+    || try_vllm "$pre-mtp2-eager" --speculative-config "$SPEC" --enforce-eager \
+    || try_vllm "$pre-plain-eager" --enforce-eager
+  # The plain one as well when speculation ran: it separates the kernels
+  # from the speculation.
+  grep -q "vllm-$pre-mtp2\"" "$R/engines.jsonl" 2>/dev/null && try_vllm "$pre-plain"
+done
 echo "=== results"
 cat "$R/engines.jsonl" 2>/dev/null

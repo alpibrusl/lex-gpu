@@ -13,7 +13,8 @@
 #   ~/.ollama/models           qwen3.8:27b-mlx, fetched from the registry
 #   ~/lex-src.sha256           the source the build was made from
 #   ~/vllm                     vLLM (nightly), its version in ~/vllm-version.txt
-#   ~/hf/Qwen3.8-27B-NVFP4     NVIDIA's NVFP4 checkpoint, for vLLM
+#   ~/hf/Qwen3.8-27B-NVFP4     NVIDIA's NVFP4 checkpoint, for vLLM (48 GB+ cards)
+#   ~/hf/Qwen3.8-27B-INT4      Red Hat's W4A16 checkpoint, what vLLM fits on 24 GB
 #
 # The source itself is removed at the end: every run brings its own.
 set -euo pipefail
@@ -102,9 +103,13 @@ PY
 # compiler -- the step that failed on the L4 for want of Python.h. It
 # needs libcuda.so.1, which the driver packages put here, not a GPU.
 "$HOME/vllm/bin/python" -c "from triton.backends.nvidia.driver import CudaUtils; CudaUtils(); print('triton helper builds')"
-"$HOME/vllm/bin/hf" download nvidia/Qwen3.8-27B-NVFP4 \
-  --local-dir "$HOME/hf/Qwen3.8-27B-NVFP4" >/dev/null
-du -sh "$HOME/hf/Qwen3.8-27B-NVFP4" "$HOME/vllm"
+# NVIDIA's NVFP4 does not fit an L4 under vLLM: without FP4 hardware it
+# is repacked for Marlin, and that held 21.5 of 22 GB before any cache.
+# Red Hat's INT4 (W4A16, made for vLLM) is what a 24 GB card serves.
+for repo in nvidia/Qwen3.8-27B-NVFP4 RedHatAI/Qwen3.8-27B-INT4; do
+  "$HOME/vllm/bin/hf" download "$repo" --local-dir "$HOME/hf/${repo#*/}" >/dev/null
+done
+du -sh "$HOME"/hf/* "$HOME/vllm"
 
 step "leave the disk clean"
 # What the build was made from, so a run can tell which of its files are
