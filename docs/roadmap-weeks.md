@@ -557,6 +557,34 @@ lane L holds row `(L%8)/2 + 4*(L/16)`, columns `2*(L%2) + 4*((L/8)%2)` and
 the next. Reading `thread_elements()` works; writing its elements one at a
 time made a kernel twelve times slower on this SDK.
 
+## M5d — Metal decode: 0.93x, and a benchmark that compared two prompts (2026-09-30)
+
+Qwen3.8 through both servers on prose, same prompt token for token:
+**greedy 52.9 against Ollama's 56.7 (0.93x), sampled 47.2 against 54.0
+(0.87x).** What moved it, and what was wrong with the measurement:
+
+| change | effect |
+| --- | --- |
+| `lex_msl::few`: a verify's 2-4 tokens read each weight once, in the one-token kernel's structure | verify of 3: 1.20 -> 1.08 steps |
+| the draft head seeded with the *normalised* hidden state, as the model hands it (Ollama does the same) | tokens a verify accepts 2.63 -> 2.79 of 3 |
+| the same kernel at one token for decode | a step 36.25 -> 35.10 ms (Ollama 35) |
+| `--depth auto` (`lex_rt::spec`) | no change on this Mac; picks per machine |
+
+**The benchmark was comparing different prompts.** lex renders the
+checkpoint's chat template, which opens with a "Reasoning effort is set to
+xhigh" system turn by default; the Ollama measured against (0.34.4) renders
+none -- 40 prompt tokens against 82. Greedy decoding then wrote different
+text: under xhigh, terse notes ("Need produce final essay. Need likely no
+need web."); without, an outline ("The user wants a detailed ... Let me
+structure this"). A draft head predicts the second far better: Ollama's
+first draft was accepted 0.90-0.94 of the time, lex's 0.75 -- which looked
+like a defect in lex's head until the prompts were printed. Every
+through-the-server Qwen comparison before this (the 0.65-0.80x figures) had
+the same mismatch. `scripts/serve_bench.py` now asks lex for
+`reasoning_effort: medium`, which renders exactly Ollama's prompt, and
+prints both prompt token counts. `examples/mtp --prompt` measures
+acceptance on a chat-rendered prompt.
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`

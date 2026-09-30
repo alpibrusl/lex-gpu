@@ -18,7 +18,7 @@ Decode, tok/s, against Ollama on the same machine:
 | Model | Hardware | lex | Ollama |
 | --- | --- | --- | --- |
 | `maternion/mimo-v2.6:9b` | M4 Max, greedy / sampled | **74.6 / 73.4** | 66.9 / 62.0 |
-| `qwen3.8:27b-mlx` | M4 Max, speculating, greedy / sampled | 46.3 / 45.1 | 58.0 / 53.8 |
+| `qwen3.8:27b-mlx` | M4 Max, speculating, greedy / sampled | 52.9 / 47.2 | 56.7 / 54.0 |
 | `llama3.1:8b` | M4 Max | 79.2 | 86.0 |
 | `llama3.2:1b` | M4 Max | 233.7 | 261.9 |
 | `llama3.2:1b` | NVIDIA L4 | 124.4 | 162.9 |
@@ -32,8 +32,8 @@ MiMo 16/16; Qwen3.8 passes its whole golden suite on Metal and on the L4,
 worst log-prob difference 0.00077 against an f32 reference (tolerance
 0.02).
 
-Qwen decode on the Mac is the open gap: a plain step is at the memory
-roof, and the loss is in the speculation cycle. How each number was
+Qwen decode on the Mac is at 0.93x greedy and 0.87x sampled: a plain step
+matches Ollama's (35 ms), and what remains is in the speculation cycle. How each number was
 measured, and what is being tried next, is in
 [`docs/roadmap-weeks.md`](docs/roadmap-weeks.md).
 

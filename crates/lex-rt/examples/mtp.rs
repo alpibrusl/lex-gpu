@@ -20,6 +20,7 @@ fn main() -> Result<(), String> {
     let mut model = "qwen3.8:27b-mlx".to_string();
     let (mut steps, mut depth) = (64usize, 1usize);
     let mut ids = vec![760u32, 6511, 314, 9338, 369]; // "The capital of France is"
+    let mut prompt: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -33,8 +34,29 @@ fn main() -> Result<(), String> {
                     .map(|s| s.trim().parse().map_err(|_| "bad --ids".to_string()))
                     .collect::<Result<_, _>>()?
             }
+            // A user turn through the model's own chat template, so the
+            // acceptance measured is on the text a client would get.
+            "--prompt" => prompt = Some(val()?),
             other => return Err(format!("unknown argument `{other}`")),
         }
+    }
+
+    if let Some(p) = &prompt {
+        use lex_rt::json::{Json, Map};
+        let msg: Map = [
+            ("role", Json::Str("user".into())),
+            ("content", Json::Str(p.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let req = Json::Obj(
+            [("messages", Json::Arr(vec![Json::Obj(msg)]))]
+                .into_iter()
+                .collect(),
+        );
+        let text = lex_rt::chat::Template::for_model(&model)?.render(&req)?;
+        eprintln!("prompt: {text:?}");
+        ids = lex_rt::tokenizer::Tokenizer::for_model(&model)?.encode(&text);
     }
 
     // Decode speed against context, the way scripts/ollama_bench.py
