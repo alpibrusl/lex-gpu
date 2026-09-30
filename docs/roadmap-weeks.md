@@ -542,8 +542,11 @@ What is left, measured rather than guessed:
 - **CUDA gained too.** The attention, KV-append, last-row head and
   small-kernel changes are shared: 512-token prefill on an L4 went 199 ->
   234 tok/s, and all 11 Qwen goldens pass there with the int16 matvec
-  (`results/gcp/20260929-202622-l4`). The chunked delta kernel is Metal
-  only so far.
+  (`results/gcp/20260929-202622-l4`). The chunked delta kernel has a CUDA
+  form too, its products in f32 on the ordinary cores (the matrix units
+  take f32 only as TF32): 245 tok/s against 227 with the step kernel in the
+  same run, goldens 11/11, and decode 66 ms a token with the int16 matvec
+  now on by default (`results/gcp/20260930-081300-l4`).
 - Ollama's kernels, from the trace: MLX's `nvfp4_qmm_t` in bfloat16, a
   fused chunked gated-delta kernel with chunks of 16, attention as GEMMs
   plus a softmax, the convolution fused with its SiLU. The same shape of

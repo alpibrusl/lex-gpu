@@ -133,7 +133,7 @@ with the target's probability for it, else resample without it -- now
 lets both be true at once, at 38 tok/s sampled; the energy row has not
 been re-measured since.
 
-**Prefill: 203 tok/s on an M4 Max (was 87, then 123), 234 on an L4 (was
+**Prefill: 203 tok/s on an M4 Max (was 87, then 123), 245 on an L4 (was
 40, then 199), against Ollama's 250-260 on the Mac.** 512 tokens in 128-token
 chunks: a hand-scheduled NVFP4 GEMM (`lex_msl::gemm`) at 12.7 TFLOPS
 against MLX's 13.9 on the same shapes, the gated delta rule solved a
