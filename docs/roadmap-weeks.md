@@ -585,6 +585,41 @@ the same mismatch. `scripts/serve_bench.py` now asks lex for
 prints both prompt token counts. `examples/mtp --prompt` measures
 acceptance on a chat-rendered prompt.
 
+## M5e — the best engine on each machine as the bar; Mac prefill 229 (2026-09-30)
+
+**Who to beat.** The same measurement (`scripts/engine_bench.py`: decode
+by the difference of a 1- and a 257-token request, prefill on fresh
+random prompts, prompt tokens printed) against every engine that runs
+Qwen3.8-27B on the machine:
+
+| M4 Max | decode greedy | decode sampled | prefill (~430 tok) |
+| --- | --- | --- | --- |
+| Ollama 0.34.4 (MLX, draft head) | **57.5** | **56.4** | **236** |
+| mlx-lm 0.31.3, mlx-community 4-bit | 29.5 | 29.5 | 228 |
+| lex | 52.4 | 50.7 | 186 -> 205* |
+
+\* through the server, before the chunking and attention below; the
+profiler's 512-token prefill went 203 -> 229. mlx-lm drafts only with a
+separate draft model, so it decodes plainly; Ollama is the bar on the Mac
+for both. On NVIDIA the bar is vLLM with NVIDIA's own NVFP4 checkpoint
+(Ollama cannot run the MLX build there): `scripts/gcp/bench_engines.sh`.
+
+**Prefill, 512 tokens, 203 -> 229 tok/s; 2048 tokens 177 -> 221:**
+
+| change | effect |
+| --- | --- |
+| chunks of up to 512 tokens (were 128); split-KV scratch sized by MAX_BATCH, not the chunk | 204 -> 221; 1.6-6.4 GB of scratch never touched, gone |
+| causal attention on the matrix units (`lex_msl::attn`) | attention 97 -> 25 ms at 512, 949 -> 354 at 2048 |
+| silu_mul four elements a thread; the convolution in 128-channel pieces | 530 -> 162 us, 452 -> 334 us a call |
+
+Tried and dropped, measured: cutting prompts at any size on Metal. A
+never-built size took one to two minutes to compile -- the convolution
+and split-KV attention unroll over every token -- and the 0.1 s the
+server reported was Metal's shader cache. (The delta kernel keeps its new
+support for a ragged last chunk.) Taller GEMM tiles at 512 tokens: no
+gain; the GEMM is ~13 TFLOPS in the model, ~90% of its own multiply-only
+loop and ~93% of MLX's.
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`
