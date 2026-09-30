@@ -653,6 +653,15 @@ delta step and attention at three tokens (2.7x and 2.1x a step's), and
 the second draft's acceptance (0.73 after an accepted first, against
 Ollama's 0.90-0.94 first).
 
+**A draft's `lm_head` over fewer rows** -- 1.4 of its 2.5 ms is the pass
+over all 248320 -- measured before building (`LEX_PAIRS=1 examples/mtp`,
+399 rounds of prose): the first N ids by BPE rank are a poor frequency
+list. Outside the first 32768 fell 8.8% of the model's own tokens, which
+takes 4.5 points off first-draft acceptance; 65536 cost 1.5 points for a
+saving of ~1 ms a draft, about +1% net. Worth doing only with a ranking
+taken from the model's own output (the FR-Spec construction), a 32k-row
+head reordered to it.
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`
