@@ -18,4 +18,5 @@ pub mod qwen;
 pub mod qwen_run;
 pub mod qwen_source;
 pub mod sample;
+pub mod spec;
 pub mod tokenizer;

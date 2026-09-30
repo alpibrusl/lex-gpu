@@ -32,9 +32,12 @@ mod serve {
 
     use lex_rt::chat::{self, Piece, Stream, Template};
     use lex_rt::json::Json;
-    use lex_rt::qwen_run::{Checkpoint, Runner, evict_index};
+    use lex_rt::qwen_run::{Checkpoint, MAX_DEPTH, Runner, evict_index};
     use lex_rt::sample::Sampler;
+    use lex_rt::spec::DepthController;
     use lex_rt::tokenizer::Tokenizer;
+    use std::cell::RefCell;
+    use std::time::Instant;
 
     /// What the model says to end a turn. `generation_config.json` lists
     /// both of these, and a run that ignores them does not stop.
@@ -56,7 +59,9 @@ mod serve {
         // at 3. A sampled target accepts deep drafts less often than a
         // greedy one, so past 2 the drafting costs more than it saves. One
         // run each; the step from 1 to 2 is the robust part.
-        let (mut port, mut max_seq, mut depth) = (8080u16, 16384usize, 2usize);
+        // `auto` chooses each round from what drafting has been earning
+        // (`lex_rt::spec`); a number fixes it, for measuring one depth.
+        let (mut port, mut max_seq, mut depth) = (8080u16, 16384usize, "auto".to_string());
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -64,7 +69,7 @@ mod serve {
                 "--model" => model = val()?,
                 "--port" => port = val()?.parse().map_err(|_| "bad --port")?,
                 "--max-seq" => max_seq = val()?.parse().map_err(|_| "bad --max-seq")?,
-                "--depth" => depth = val()?.parse().map_err(|_| "bad --depth")?,
+                "--depth" => depth = val()?,
                 other => return Err(format!("unknown argument `{other}`")),
             }
         }
@@ -85,12 +90,25 @@ mod serve {
         );
         let stop: Vec<u32> = STOP.iter().filter_map(|s| tok.id_of(s)).collect();
         // Speculation is only a win where there is a draft head to do it.
-        let depth = if rt.has_mtp() { depth } else { 0 };
+        let depth = if !rt.has_mtp() {
+            Depth::Fixed(0)
+        } else if depth == "auto" {
+            Depth::Auto(RefCell::new(DepthController::new(MAX_DEPTH, 0.6)))
+        } else {
+            let d: usize = depth
+                .parse()
+                .map_err(|_| "--depth takes a number or `auto`")?;
+            Depth::Fixed(d.min(MAX_DEPTH))
+        };
         eprintln!(
-            "{model} on {} — {} tokens of context, depth {depth}, {template:?} template\n\
+            "{model} on {} — {} tokens of context, depth {}, {template:?} template\n\
              listening on http://127.0.0.1:{port}",
             rt.device(),
-            max_seq
+            max_seq,
+            match &depth {
+                Depth::Fixed(d) => d.to_string(),
+                Depth::Auto(_) => format!("auto (1-{MAX_DEPTH})"),
+            }
         );
 
         let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
@@ -98,7 +116,7 @@ mod serve {
         let ctx = Ctx {
             tok: &tok,
             stop: &stop,
-            depth,
+            depth: &depth,
             model: &model,
             max_seq,
             template,
@@ -163,11 +181,34 @@ mod serve {
         }
     }
 
+    /// How deep to draft: fixed, or chosen each round (`lex_rt::spec`).
+    /// The controller lives for the server, so what it learned about the
+    /// costs carries from one request to the next.
+    enum Depth {
+        Fixed(usize),
+        Auto(RefCell<DepthController>),
+    }
+
+    impl Depth {
+        fn pick(&self) -> usize {
+            match self {
+                Depth::Fixed(d) => *d,
+                Depth::Auto(c) => c.borrow_mut().pick(),
+            }
+        }
+
+        fn record(&self, depth: usize, kept: usize, ms: f64) {
+            if let Depth::Auto(c) = self {
+                c.borrow_mut().record(depth, kept, ms);
+            }
+        }
+    }
+
     /// What every request is served with.
     struct Ctx<'a> {
         tok: &'a Tokenizer,
         stop: &'a [u32],
-        depth: usize,
+        depth: &'a Depth,
         model: &'a str,
         max_seq: usize,
         template: Template,
@@ -522,7 +563,7 @@ mod serve {
         rt: &mut Runner,
         tok: &Tokenizer,
         stop: &[u32],
-        depth: usize,
+        depth: &Depth,
         want: usize,
         logits: Vec<f32>,
         sampler: &mut Sampler,
@@ -538,8 +579,17 @@ mod serve {
                 reason = "stop";
                 break;
             }
-            let committed = if depth > 0 {
-                let (c, after) = rt.speculate_with(next, depth, sampler)?;
+            let d = depth.pick();
+            let committed = if d > 0 {
+                let t0 = Instant::now();
+                let (c, after) = rt.speculate_with(next, d, sampler)?;
+                // Wall time, the cost the client sees: drafting, the
+                // verify, any undo and the sampler all count.
+                depth.record(
+                    d,
+                    c.len().saturating_sub(1),
+                    t0.elapsed().as_secs_f64() * 1e3,
+                );
                 next = after;
                 c
             } else {

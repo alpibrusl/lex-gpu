@@ -181,7 +181,7 @@ pub fn rope_tables(pos: usize, rot: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use gpu::{Checkpoint, MAX_BATCH, Runner, evict_index};
+pub use gpu::{Checkpoint, MAX_BATCH, MAX_DEPTH, Runner, evict_index};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gpu {
@@ -244,6 +244,8 @@ mod gpu {
     /// layer, 48 layers, so 604 MB at four. Prefill runs at MAX_BATCH and
     /// never rolls back, so it does not pay this.
     const SPEC_MAX: usize = 4;
+    /// The deepest a speculative round can draft: a verify of `SPEC_MAX`.
+    pub const MAX_DEPTH: usize = SPEC_MAX - 1;
 
     /// The decode RMSNorm, parsed from `lex-front/lx/rmsnorm.lx`.
     ///
