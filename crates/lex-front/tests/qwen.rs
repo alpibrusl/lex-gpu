@@ -539,7 +539,7 @@ fn every_batched_kernel_equals_the_tokens_one_by_one() {
         );
     }
 
-    let batch = build_gated_norm_rows(tokens, hv, dv, 1e-6);
+    let batch = build_gated_norm_rows(tokens, hv, dv, 1e-6, DType::F32);
     let y = pattern(tokens * hv * dv, 118);
     let z = pattern(tokens * hv * dv, 119);
     let nw = pattern(dv, 120);

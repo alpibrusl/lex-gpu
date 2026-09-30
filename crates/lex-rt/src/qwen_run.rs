@@ -600,14 +600,13 @@ mod gpu {
 
     /// Whether the batched matmul for this shape reads f16 activations.
     ///
-    /// `res` marks the matmuls that accumulate into the residual -- down and
-    /// o_proj -- which read `ffn_a` and `gated`, not `h`. Every batched
-    /// matmul reads a narrowed buffer except o_proj, which reads `gated`,
-    /// and the draft head's `fc`, which reads a fused input built on the
-    /// host: the decode path's `fc` reads it in f32, the two write the same
-    /// cache, and handed f16 it reads the f32 bytes as half pairs.
-    fn batch_x_half(c: &Config, n_in: usize, res: bool) -> bool {
-        !(n_in == 2 * c.hidden || (res && n_in == c.heads * c.head_dim)) && X_DTYPE == DType::F16
+    /// Every batched matmul reads a narrowed buffer -- `h`, `ffn_a`, and
+    /// `mixed` and `gated` for out_proj and o_proj -- except the draft
+    /// head's `fc`, which reads a fused input built on the host: the decode
+    /// path's `fc` reads it in f32, the two write the same cache, and handed
+    /// f16 it reads the f32 bytes as half pairs.
+    fn batch_x_half(c: &Config, n_in: usize, _res: bool) -> bool {
+        n_in != 2 * c.hidden && X_DTYPE == DType::F16
     }
 
     /// Every pipeline a step dispatches.
@@ -887,7 +886,11 @@ mod gpu {
                 )?,
                 gates: compile(&gpu, &build_gates_rows(1, hv, dv), 64)?,
                 delta: compile(&gpu, &delta.build_step()?, 128)?,
-                gated_norm: compile(&gpu, &build_gated_norm_rows(1, hv, dv, cfg.eps), 128)?,
+                gated_norm: compile(
+                    &gpu,
+                    &build_gated_norm_rows(1, hv, dv, cfg.eps, DType::F32),
+                    128,
+                )?,
                 rope_q: compile(
                     &gpu,
                     &build_qk_rope_rows(
@@ -927,7 +930,11 @@ mod gpu {
                 attn: compile(&gpu, &attn.build_dynamic()?, 128)?,
                 attn_split: compile(&gpu, &attn.build_split(ATTN_BPS)?, 128)?,
                 attn_combine: compile(&gpu, &attn.build_combine(ATTN_BPS)?, 128)?,
-                mul: compile(&gpu, &build_mul(cfg.heads * cfg.head_dim, 256)?, THREADS)?,
+                mul: compile(
+                    &gpu,
+                    &build_mul(cfg.heads * cfg.head_dim, 256, DType::F32)?,
+                    THREADS,
+                )?,
                 silu: compile(
                     &gpu,
                     &lex_front::llama::silu_mul(cfg.ffn, THREADS, DType::F32)?,
@@ -1042,7 +1049,15 @@ mod gpu {
                     g: f(hv * dv),
                     beta: f(hv * dv),
                     y: f(hv * dv),
-                    mixed: f(hv * dv),
+                    // Read back by out_proj and o_proj, every token's row
+                    // held in cache at once: f32 at four tokens was 96 KB
+                    // of it, and those two matvecs cost 3.5x a step's
+                    // (`lex_msl::few`).
+                    mixed: if narrow {
+                        gpu.zeroed::<f16>(t * hv * dv)
+                    } else {
+                        f(hv * dv)
+                    },
                     q32: f(2 * cfg.heads * cfg.head_dim),
                     k32: f(cfg.kv_heads * cfg.head_dim),
                     v32: f(cfg.kv_heads * cfg.head_dim),
@@ -1050,7 +1065,11 @@ mod gpu {
                     k16: gpu.zeroed::<f16>(t * cfg.kv_heads * cfg.head_dim),
                     gate: f(cfg.heads * cfg.head_dim),
                     attn: f(cfg.heads * cfg.head_dim),
-                    gated: f(cfg.heads * cfg.head_dim),
+                    gated: if narrow {
+                        gpu.zeroed::<f16>(t * cfg.heads * cfg.head_dim)
+                    } else {
+                        f(cfg.heads * cfg.head_dim)
+                    },
                     ffn_g: f(cfg.ffn),
                     ffn_u: f(cfg.ffn),
                     ffn_a: if narrow {
@@ -2289,12 +2308,9 @@ mod gpu {
             for key in want {
                 if let std::collections::hash_map::Entry::Vacant(slot) = mv.entry(key) {
                     let (n_in, n_out, res, layout) = key;
-                    // `res` marks the matmuls that accumulate into the
-                    // residual -- down and o_proj -- and those read ffn_a
-                    // and gated, not `h`, so they keep f32 inputs.
-                    // Every batched matmul now reads a narrowed buffer
-                    // except o_proj, which reads `gated`.
-                    // The draft head's `fc` is the exception: it reads a
+                    // Every batched matmul reads a narrowed buffer (see
+                    // `batch_x_half`). The draft head's `fc` is the
+                    // exception: it reads a
                     // fused input built on the host rather than a narrowed
                     // `h`, and the decode path's `fc` reads it in f32. The
                     // two write the same cache -- the batched one warming
@@ -2477,7 +2493,7 @@ mod gpu {
                         compile(gpu, &delta.build_steps(t)?, 128)?
                     }
                 },
-                gated_norm: compile(gpu, &build_gated_norm_rows(t, hv, dv, c.eps), 128)?,
+                gated_norm: compile(gpu, &build_gated_norm_rows(t, hv, dv, c.eps, X_DTYPE), 128)?,
                 rope_q: compile(
                     gpu,
                     &build_qk_rope_rows(t, c.heads, c.head_dim, c.rot, true, DType::F16, c.eps)?,
@@ -2533,7 +2549,11 @@ mod gpu {
                 attn_combine: (t <= MAX_BATCH)
                     .then(|| compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128))
                     .transpose()?,
-                mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
+                mul: compile(
+                    gpu,
+                    &build_mul(t * c.heads * c.head_dim, 256, X_DTYPE)?,
+                    THREADS,
+                )?,
                 silu: compile(
                     gpu,
                     // Four elements a thread where the size allows: one a

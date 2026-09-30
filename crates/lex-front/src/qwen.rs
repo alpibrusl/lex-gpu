@@ -830,18 +830,29 @@ pub fn build_matvec_dense_rows(
 /// Parameters: `y [v_heads, v_dim]`, the norm weight `[1, v_dim]`,
 /// `z [v_heads, v_dim]`, and the output `[v_heads, v_dim]`.
 pub fn build_gated_norm(v_heads: usize, v_dim: usize, eps: f32) -> Program {
-    build_gated_norm_rows(1, v_heads, v_dim, eps)
+    build_gated_norm_rows(1, v_heads, v_dim, eps, DType::F32)
 }
 
 /// [`build_gated_norm`] over a batch: every tensor but the weight gains a
-/// token dimension, `[tokens * v_heads, v_dim]`.
-pub fn build_gated_norm_rows(tokens: usize, v_heads: usize, v_dim: usize, eps: f32) -> Program {
+/// token dimension, `[tokens * v_heads, v_dim]`. The output is written as
+/// `out`: a batch narrows it to f16, because the matvec reading it back
+/// holds every token's row in cache at once (see `lex_msl::few`).
+pub fn build_gated_norm_rows(
+    tokens: usize,
+    v_heads: usize,
+    v_dim: usize,
+    eps: f32,
+    out: DType,
+) -> Program {
     use Arg::{Borrow, Move};
-    let mut b = Builder::new(&format!("delta_gated_norm{tokens}_h{v_heads}x{v_dim}"));
+    let mut b = Builder::new(&format!(
+        "delta_gated_norm{tokens}_h{v_heads}x{v_dim}_{}",
+        out.suffix()
+    ));
     let py = b.param("y", DType::F32, &[tokens * v_heads, v_dim], false);
     let pw = b.param("w", DType::F32, &[1, v_dim], false);
     let pz = b.param("z", DType::F32, &[tokens * v_heads, v_dim], false);
-    let po = b.param("o", DType::F32, &[tokens * v_heads, v_dim], true);
+    let po = b.param("o", out, &[tokens * v_heads, v_dim], true);
     let head = b.grid(v_heads);
     let token = b.grid2(tokens);
     let tile = TileTy::new(DType::F32, &[1, v_dim], Space::Reg);
@@ -881,21 +892,28 @@ pub fn build_gated_norm_rows(tokens: usize, v_heads: usize, v_dim: usize, eps: f
     let sz = b.op("sz", Op::Unary(UnOp::Sigmoid, Borrow(z)));
     let sz = b.op("sz", Op::Binary(BinOp::Mul, Move(z), Move(sz)));
     let o = b.op("o", Op::Binary(BinOp::Mul, Move(y), Move(sz)));
+    let o = if out == DType::F32 {
+        o
+    } else {
+        b.op("o16", Op::Convert(Move(o), out))
+    };
     b.effect(Op::Store(Move(o), rows(po)));
     b.finish()
 }
 
 /// Elementwise `y = a * b` over `n` values, `chunk` per instance: the
-/// attention output meeting its gate before the output projection.
-pub fn build_mul(n: usize, chunk: usize) -> Result<Program, String> {
+/// attention output meeting its gate before the output projection. `y` is
+/// written as `out`, f16 in a batch for the reason
+/// [`build_gated_norm_rows`] gives.
+pub fn build_mul(n: usize, chunk: usize, out: DType) -> Result<Program, String> {
     use Arg::Move;
     if chunk == 0 || !n.is_multiple_of(chunk) {
         return Err(format!("{n} values do not split into chunks of {chunk}"));
     }
-    let mut b = Builder::new(&format!("mul_{n}x{chunk}"));
+    let mut b = Builder::new(&format!("mul_{n}x{chunk}_{}", out.suffix()));
     let pa = b.param("a", DType::F32, &[1, n], false);
     let pb = b.param("b", DType::F32, &[1, n], false);
-    let py = b.param("y", DType::F32, &[1, n], true);
+    let py = b.param("y", out, &[1, n], true);
     let i = b.grid(n / chunk);
     let span = |param| View {
         param,
@@ -906,6 +924,11 @@ pub fn build_mul(n: usize, chunk: usize) -> Result<Program, String> {
     let a = b.op("a", Op::Load(span(pa), t.clone()));
     let bb = b.op("b", Op::Load(span(pb), t));
     let y = b.op("y", Op::Binary(BinOp::Mul, Move(a), Move(bb)));
+    let y = if out == DType::F32 {
+        y
+    } else {
+        b.op("y16", Op::Convert(Move(y), out))
+    };
     b.effect(Op::Store(Move(y), span(py)));
     Ok(b.finish())
 }
