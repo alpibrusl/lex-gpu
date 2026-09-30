@@ -426,3 +426,92 @@ fn the_int8_matmul_matches_the_matmul_and_ignores_its_batch() {
         "a token's output depends on its batch"
     );
 }
+
+/// The chunked gated delta rule (`lex_msl::delta`) against the interpreter
+/// running the step program it stands in for, token by token: outputs and
+/// the final state, to f32 rounding (the two sum in different orders).
+#[test]
+fn chunked_delta_rule_matches_the_step_program() {
+    use lex_front::qwen::DeltaNet;
+    use lex_msl::delta::{DeltaChunk, delta_chunked};
+    use lex_msl::gemm::Backend;
+    let Some(g) = gpu() else { return };
+    // (tokens, v_base, v_width, gate by head): mild decay; several chunks;
+    // v behind other columns; a head whose gate underflows to nothing.
+    type Gate = fn(usize) -> f32;
+    let cases: [(usize, usize, usize, Gate); 4] = [
+        (16, 0, 384, |h| 0.9 + 0.09 * ((h % 5) as f32 / 4.0)),
+        (64, 0, 384, |h| 0.5 + 0.49 * ((h * 7 % 9) as f32 / 8.0)),
+        (48, 100, 600, |_| 0.97),
+        (32, 0, 384, |h| if h % 3 == 1 { 0.0 } else { 0.95 }),
+    ];
+    let (hv, dk, dv) = (3usize, 128usize, 128usize);
+    for (t, v_base, v_width, gate) in cases {
+        let d = DeltaChunk {
+            tokens: t,
+            v_heads: hv,
+            k_dim: dk,
+            v_dim: dv,
+            v_base,
+            v_width,
+        };
+        let prog = DeltaNet {
+            v_heads: hv,
+            k_heads: hv,
+            k_dim: dk,
+            v_dim: dv,
+            rows: 8,
+            v_base,
+            v_width,
+        }
+        .build_steps(t)
+        .expect("step program");
+        let unit = |seed: u32| {
+            let mut x = fill(t * hv * dk, seed);
+            for row in x.chunks_mut(dk) {
+                let n = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+                row.iter_mut().for_each(|v| *v /= n);
+            }
+            x
+        };
+        let spread =
+            |f: &dyn Fn(usize) -> f32| (0..t * hv * dv).map(|i| f(i / dv)).collect::<Vec<f32>>();
+        let beta = |h: usize| 0.2 + 0.6 * ((h * 37 % 11) as f32 / 10.0);
+        let state0: Vec<f32> = fill(hv * dv * dk, 5).iter().map(|v| v * 0.3).collect();
+        let mut tensors = vec![
+            Tensor::new(DType::F32, &[hv * dv, dk], &state0),
+            Tensor::new(DType::F32, &[t * hv, dk], &unit(7)),
+            Tensor::new(DType::F32, &[t * hv, dk], &unit(9)),
+            Tensor::new(DType::F32, &[t * v_width], &fill(t * v_width, 11)),
+            Tensor::new(DType::F32, &[t * hv * dv], &spread(&gate)),
+            Tensor::new(DType::F32, &[t * hv * dv], &spread(&beta)),
+            Tensor::zeros(DType::F32, &[t * hv * dv]),
+        ];
+        let pipe = g
+            .build_lowered(&delta_chunked(&d, Backend::Cuda).expect("chunked"))
+            .unwrap_or_else(|e| panic!("{d:?}: {e}"));
+        let bufs: Vec<_> = tensors.iter().map(|x| g.upload(&x.data)).collect();
+        let refs: Vec<_> = bufs.iter().collect();
+        g.run(&pipe, &refs).unwrap_or_else(|e| panic!("{d:?}: {e}"));
+        let mut y = vec![0.0f32; t * hv * dv];
+        g.download(&bufs[6], &mut y);
+        let mut s = vec![0.0f32; hv * dv * dk];
+        g.download(&bufs[0], &mut s);
+        run(&prog, &mut tensors).expect("interpret");
+        let err = |got: &[f32], want: &[f32]| {
+            let scale = want.iter().fold(1e-6f32, |a, x| a.max(x.abs()));
+            assert!(
+                scale > 0.1,
+                "{d:?}: the reference is all but zero ({scale})"
+            );
+            got.iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+                / scale
+        };
+        let (ey, es) = (err(&y, &tensors[6].data), err(&s, &tensors[0].data));
+        eprintln!("{d:?}: y {ey:e}, state {es:e} of scale");
+        assert!(ey < 1e-4 && es < 1e-4, "{d:?}: y {ey:e}, state {es:e}");
+    }
+}

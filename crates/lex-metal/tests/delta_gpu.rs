@@ -13,6 +13,7 @@ use lex_ir::DType;
 use lex_ir::reference::fill_pattern_f32;
 use lex_metal::{Buffer, Gpu};
 use lex_msl::delta::{DeltaChunk, delta_chunked};
+use lex_msl::gemm::Backend;
 
 /// Largest difference over largest magnitude, for `y` and the final state.
 fn chunked_error(gpu: &Gpu, d: DeltaChunk, gate: impl Fn(usize) -> f32) -> (f32, f32) {
@@ -60,7 +61,7 @@ fn chunked_error(gpu: &Gpu, d: DeltaChunk, gate: impl Fn(usize) -> f32) -> (f32,
         Tensor::zeros(DType::F32, &[t * hv * dv]),
     ];
     let pipe = gpu
-        .build_lowered(&delta_chunked(&d).expect("chunked"))
+        .build_lowered(&delta_chunked(&d, Backend::Metal).expect("chunked"))
         .expect("compile");
     let bufs: Vec<Buffer> = tensors.iter().map(|x| gpu.upload(&x.data)).collect();
     let refs: Vec<&Buffer> = bufs.iter().collect();

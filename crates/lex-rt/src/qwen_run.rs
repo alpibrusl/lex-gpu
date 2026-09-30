@@ -2325,9 +2325,9 @@ mod gpu {
                 gates: compile(gpu, &build_gates_rows(t, hv, dv), 64)?,
                 delta: {
                     // A prefill chunk solves the recurrence a chunk of
-                    // tokens at a time on Metal (`lex_msl::delta`), rather
-                    // than token by token. `LEX_DELTA_STEPS=1` keeps the
-                    // step kernel, to measure one against the other.
+                    // tokens at a time (`lex_msl::delta`), rather than
+                    // token by token. `LEX_DELTA_STEPS=1` keeps the step
+                    // kernel, to measure one against the other.
                     let dc = DeltaChunk {
                         tokens: t,
                         v_heads: hv,
@@ -2337,11 +2337,11 @@ mod gpu {
                         v_width: ch,
                     };
                     if t > MAX_BATCH
-                        && crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
                         && lex_msl::delta::fits(&dc)
                         && std::env::var_os("LEX_DELTA_STEPS").is_none()
                     {
-                        gpu.build_lowered(&lex_msl::delta::delta_chunked(&dc)?)?
+                        let l = lex_msl::delta::delta_chunked(&dc, crate::dev::gemm_backend())?;
+                        gpu.build_lowered(&l)?
                     } else {
                         compile(gpu, &delta.build_steps(t)?, 128)?
                     }
