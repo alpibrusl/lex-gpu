@@ -79,12 +79,23 @@ rm -rf "$HOME/vllm"
   --extra-index-url https://wheels.vllm.ai/nightly --torch-backend=cu130
 "$HOME/vllm/bin/python" -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda)" \
   | tee "$HOME/vllm-version.txt"
-# Found here rather than on a GPU: the compiled extension loads, every
-# library it links resolved. The first image's torch was built for CUDA
-# 12.9 and the nightly vLLM for 13, and 'vllm serve' died on the L4 with
-# libcudart.so.13 not found. Loading needs no GPU, only the driver's
+# Found here rather than on a GPU: every compiled extension vLLM ships
+# loads, every library it links resolved. The first image's torch was
+# built for CUDA 12.9 and the nightly vLLM for 13, and 'vllm serve' died
+# on the L4 importing vllm._C_stable_libtorch (libcudart.so.13 not
+# found). 'import vllm' alone does not reach them here: with no GPU it
+# picks the CPU platform. Loading needs no GPU, only the driver's
 # libraries, which this image has.
-"$HOME/vllm/bin/python" -c "import torch, vllm._C; print('vllm._C loads')"
+"$HOME/vllm/bin/python" - <<'PY'
+import importlib, pathlib, torch, vllm
+root = pathlib.Path(vllm.__file__).parent
+names = sorted({"vllm." + ".".join(p.relative_to(root).parts[:-1] + (p.name.split(".")[0],))
+                for p in root.rglob("*.so")})
+assert names, "no compiled extensions found"
+for n in names:
+    importlib.import_module(n)
+print("loaded", len(names), "extensions:", " ".join(names))
+PY
 "$HOME/vllm/bin/hf" download nvidia/Qwen3.8-27B-NVFP4 \
   --local-dir "$HOME/hf/Qwen3.8-27B-NVFP4" >/dev/null
 du -sh "$HOME/hf/Qwen3.8-27B-NVFP4" "$HOME/vllm"
