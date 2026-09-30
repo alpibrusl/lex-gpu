@@ -34,7 +34,9 @@ uname -r
 
 step "system packages"
 sudo apt-get update -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential python3 >/dev/null
+# python3-dev: Triton compiles a C helper against Python.h when vLLM
+# starts, and without the headers every vLLM configuration died there.
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential python3 python3-dev >/dev/null
 
 step "Rust toolchain"
 if ! command -v cargo >/dev/null; then
@@ -96,6 +98,10 @@ for n in names:
     importlib.import_module(n)
 print("loaded", len(names), "extensions:", " ".join(names))
 PY
+# And Triton's own helper, which vLLM builds at start with the system
+# compiler -- the step that failed on the L4 for want of Python.h. It
+# needs libcuda.so.1, which the driver packages put here, not a GPU.
+"$HOME/vllm/bin/python" -c "from triton.backends.nvidia.driver import CudaUtils; CudaUtils(); print('triton helper builds')"
 "$HOME/vllm/bin/hf" download nvidia/Qwen3.8-27B-NVFP4 \
   --local-dir "$HOME/hf/Qwen3.8-27B-NVFP4" >/dev/null
 du -sh "$HOME/hf/Qwen3.8-27B-NVFP4" "$HOME/vllm"

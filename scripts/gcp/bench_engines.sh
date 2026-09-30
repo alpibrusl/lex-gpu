@@ -7,6 +7,8 @@
 # Needs the pre-built image (build_image.sh): the release build, qwen3.8 in
 # Ollama's store for lex, and vLLM (~/vllm) with NVIDIA's NVFP4
 # checkpoint. Results go to ~/results/engines.jsonl, one line an engine.
+# ENGINES picks which run (default "lex vllm"), so one can be redone
+# without the other: JOB='ENGINES=vllm bash scripts/gcp/bench_engines.sh'.
 #
 # vLLM's first try is what serves a user: the draft head speculating two
 # tokens (lex's default depth) on CUDA graphs. The checkpoint is 21.9 GB
@@ -28,6 +30,8 @@ wait_up() { # url, seconds, the server's pid: gives up when it dies, not
   return 1
 }
 
+ENGINES=" ${ENGINES:-lex vllm} "
+if [[ $ENGINES == *" lex "* ]]; then
 echo "=== lex"
 cargo build --release -q -p lex-rt --example serve
 # remote.sh points CARGO_TARGET_DIR at the image's pre-built target.
@@ -44,6 +48,8 @@ else
 fi
 kill "$LEX" 2>/dev/null; wait "$LEX" 2>/dev/null
 nvidia-smi --query-gpu=memory.used --format=csv,noheader
+fi
+[[ $ENGINES == *" vllm "* ]] || { cat "$R/engines.jsonl" 2>/dev/null; exit 0; }
 
 echo "=== $(cat "$HOME/vllm-version.txt" 2>/dev/null)"
 SPEC='{"method":"mtp","num_speculative_tokens":2}'
