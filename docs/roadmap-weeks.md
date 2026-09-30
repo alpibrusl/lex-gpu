@@ -621,6 +621,38 @@ support for a ragged last chunk.) Taller GEMM tiles at 512 tokens: no
 gain; the GEMM is ~13 TFLOPS in the model, ~90% of its own multiply-only
 loop and ~93% of MLX's.
 
+## M5f — a verify's inputs, not its weights: Mac decode 0.97x (2026-09-30)
+
+Traced through the server (`LEX_SPEC_TRACE=1`, 211 cycles at depth 2):
+a cycle was 48.2 ms for 2.52 tokens -- draft 5.0, verify 41.7, undo
+1.5 -- and the verify of three cost 1.15 steps, of four 1.43, so the
+controller almost never drafted three. Per call site (`qwen_profile
+--verify 4`), gate/up and down barely grew with the tokens, but out_proj
+and o_proj went 44 -> 82 -> 156 us at one, three and four.
+
+Those were the two batched matvecs still fed f32 (`mixed` from the gated
+norm, `gated` from the gate multiply). `lex_msl::few` timed alone
+at the model's shapes gives the rule: the time follows the bytes of
+input every token's row holds in cache together, not the token count --
+at the gate/up shape 231 us with 40 KB of it, 384 with 60, 823 with 80,
+whatever the dtype -- and four f32 rows of 6144 are 96 KB. Reading the
+inputs once for both of a simdgroup's rows instead of once a row did
+not help (slower at three tokens); narrowing them did:
+
+| M4 Max, context 300 | before | after |
+| --- | --- | --- |
+| verify of 3 | 40.8 ms (1.15 steps) | 38.5 ms (1.09) |
+| verify of 4 | 50.6 ms (1.43) | 43.3 ms (1.23) |
+| through the server, greedy / sampled | 52.3 / 51.2 | **55.8 / 52.9** |
+| Ollama, same measurement | 57.5 / 56.4 | |
+
+Depth 3 now pays often enough that `--depth auto` picks it on a third of
+the cycles. The sampler's top-k is also one pass now (0.40 -> 0.10 ms a
+row, five rows a cycle). What is left is the draft (2.5 ms a token), the
+delta step and attention at three tokens (2.7x and 2.1x a step's), and
+the second draft's acceptance (0.73 after an accepted first, against
+Ollama's 0.90-0.94 first).
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`
