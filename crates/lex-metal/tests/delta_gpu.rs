@@ -118,6 +118,12 @@ fn chunked_delta_rule_matches_the_step_program() {
             shape(32, 0, 384),
             Box::new(|i| if i % 3 == 1 { 0.0 } else { 0.95 }),
         ),
+        // Chunks that do not come out even: 37 is two of 16 and one of 5.
+        (
+            shape(37, 0, 384),
+            Box::new(|i| 0.9 + 0.09 * ((i % 5) as f32 / 4.0)),
+        ),
+        (shape(9, 100, 600), Box::new(|_| 0.97)),
     ];
     for (d, gate) in cases {
         let (ey, es) = chunked_error(&gpu, d, gate);

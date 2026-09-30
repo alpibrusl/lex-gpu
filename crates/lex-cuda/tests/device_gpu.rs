@@ -439,7 +439,10 @@ fn chunked_delta_rule_matches_the_step_program() {
     // (tokens, v_base, v_width, gate by head): mild decay; several chunks;
     // v behind other columns; a head whose gate underflows to nothing.
     type Gate = fn(usize) -> f32;
-    let cases: [(usize, usize, usize, Gate); 4] = [
+    // 37 and 9 are not whole chunks of 16: the last is padding.
+    let cases: [(usize, usize, usize, Gate); 6] = [
+        (37, 0, 384, |h| 0.9 + 0.09 * ((h % 5) as f32 / 4.0)),
+        (9, 100, 600, |_| 0.97),
         (16, 0, 384, |h| 0.9 + 0.09 * ((h % 5) as f32 / 4.0)),
         (64, 0, 384, |h| 0.5 + 0.49 * ((h * 7 % 9) as f32 / 8.0)),
         (48, 100, 600, |_| 0.97),
