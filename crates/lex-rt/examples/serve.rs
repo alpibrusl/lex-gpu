@@ -426,6 +426,7 @@ mod serve {
             let (text, reason, _) = generate(
                 rt,
                 tok,
+                &ids,
                 stop,
                 depth,
                 want,
@@ -477,6 +478,7 @@ mod serve {
         let (text, reason, n) = generate(
             rt,
             tok,
+            &ids,
             stop,
             depth,
             want,
@@ -562,6 +564,7 @@ mod serve {
     fn generate(
         rt: &mut Runner,
         tok: &Tokenizer,
+        prompt: &[u32],
         stop: &[u32],
         depth: &Depth,
         want: usize,
@@ -573,14 +576,32 @@ mod serve {
         let mut said = String::new();
         let mut next = sampler.pick(&logits);
         let mut reason = "length";
+        // Everything so far, for drafting from the context (lex-gpu#27):
+        // the prompt, the reply, and while a round is chosen, `next`.
+        let lookup_on = std::env::var("LEX_LOOKUP").map_or(true, |v| v != "0");
+        let mut context = prompt.to_vec();
 
         while out.len() < want {
             if stop.contains(&next) {
                 reason = "stop";
                 break;
             }
-            let d = depth.pick();
-            let committed = if d > 0 {
+            // A match of four or more tokens earlier in the context drafts
+            // this round; otherwise the head does. Four, not two: on prose
+            // two-token matches ("of the") are common and mostly wrong.
+            let proposed = if lookup_on && !matches!(depth, Depth::Fixed(0)) {
+                context.push(next);
+                let p = lex_rt::spec::lookup(&context, 8, 4, MAX_DEPTH);
+                context.pop();
+                p
+            } else {
+                vec![]
+            };
+            let committed = if !proposed.is_empty() {
+                let (c, after) = rt.speculate_proposed(next, &proposed, sampler)?;
+                next = after;
+                c
+            } else if let d @ 1.. = depth.pick() {
                 let t0 = Instant::now();
                 let (c, after) = rt.speculate_with(next, d, sampler)?;
                 // Wall time, the cost the client sees: drafting, the
@@ -604,6 +625,7 @@ mod serve {
                     break;
                 }
                 out.push(t);
+                context.push(t);
             }
             let full = tok.decode(&out);
             if full != said {
@@ -614,8 +636,34 @@ mod serve {
                 break;
             }
         }
+        log_request(prompt, &out);
         let n = out.len();
         Ok((said, reason, n))
+    }
+
+    /// `LEX_REQUEST_LOG=<file>` appends one JSON line a request -- the
+    /// prompt's token ids and the reply's -- so real sessions can be
+    /// replayed offline (`scripts/lookup_replay.py`) to measure what a
+    /// drafting scheme would have got from them. Off by default: it is the
+    /// whole conversation, in tokens.
+    fn log_request(prompt: &[u32], reply: &[u32]) {
+        let Some(path) = std::env::var_os("LEX_REQUEST_LOG") else {
+            return;
+        };
+        let ids = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let line = format!(
+            "{{\"prompt\":[{}],\"completion\":[{}]}}\n",
+            ids(prompt),
+            ids(reply)
+        );
+        let wrote = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+        if let Err(e) = wrote {
+            eprintln!("request log {}: {e}", path.to_string_lossy());
+        }
     }
 
     /// `tool_calls` whenever the model asked for one, whatever the

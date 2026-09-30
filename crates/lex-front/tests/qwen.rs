@@ -610,7 +610,7 @@ fn every_batched_kernel_equals_the_tokens_one_by_one() {
     }
 }
 
-/// Every snapshot block holds the state as of that token.
+/// Every snapshot block but the last holds the state as of that token.
 ///
 /// This is what a rejected speculative batch rolls back to, so "block `t`
 /// is exactly the state after token `t`" is the whole contract. Checked
@@ -667,6 +667,16 @@ fn every_delta_snapshot_is_the_state_after_that_token() {
         ];
         run(&one, &mut step).expect("step");
         state = step[0].data.clone();
+        if t == tokens - 1 {
+            // The last token's state goes to `state` only: nothing rolls
+            // back to after the last token.
+            assert_eq!(batch[0].data, state, "the final state");
+            assert!(
+                batch[7].data[t * block..].iter().all(|&x| x == 0.0),
+                "the last token's snapshot is not written"
+            );
+            continue;
+        }
         let got = &batch[7].data[t * block..(t + 1) * block];
         let d = got
             .iter()
@@ -678,18 +688,6 @@ fn every_delta_snapshot_is_the_state_after_that_token() {
             "snapshot {t} differs from the state after {t} by {d:e}"
         );
     }
-    // The last block and `state` are the same thing by construction; if
-    // they ever disagree the carry is not what is being written out.
-    let last = &batch[7].data[(tokens - 1) * block..];
-    let d = last
-        .iter()
-        .zip(&batch[0].data)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        d == 0.0,
-        "the last snapshot differs from the final state by {d:e}"
-    );
 }
 
 /// Every conv snapshot block is the window as of that token.

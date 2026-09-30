@@ -1395,7 +1395,6 @@ mod gpu {
                 let logits = self.step(last)?;
                 return Ok((vec![last], sampler.pick(&logits)));
             }
-            let trace = std::env::var_os("LEX_SPEC_TRACE").is_some();
             let mark = std::time::Instant::now();
             let (drafts, dists) = self.draft_with(depth, last, Some(&mut *sampler))?;
             let t_draft = mark.elapsed().as_secs_f64() * 1e3;
@@ -1403,7 +1402,52 @@ mod gpu {
                 let logits = self.step(last)?;
                 return Ok((vec![last], sampler.pick(&logits)));
             }
+            self.verify_drafts(last, &drafts, &dists, sampler, None, t_draft)
+        }
 
+        /// A speculative round on drafts proposed from outside the model --
+        /// the tokens that followed an earlier occurrence of the context's
+        /// last few (`crate::spec::lookup`).
+        ///
+        /// A proposal is a distribution with all its weight on one token,
+        /// and [`Sampler::verify_proposal`] takes any distribution, so what
+        /// comes out is distributed exactly as without it, sampled or not.
+        /// At most [`MAX_DEPTH`] drafts are verified; more are dropped.
+        pub fn speculate_proposed(
+            &mut self,
+            last: u32,
+            drafts: &[u32],
+            sampler: &mut Sampler,
+        ) -> Result<(Vec<u32>, u32), String> {
+            let drafts = &drafts[..drafts.len().min(MAX_DEPTH)];
+            if drafts.is_empty() {
+                let logits = self.step(last)?;
+                return Ok((vec![last], sampler.pick(&logits)));
+            }
+            let dists: Vec<Nucleus> = drafts.iter().map(|&t| (vec![t], vec![1.0])).collect();
+            // The hidden state before `last`: the head never drafted from it
+            // this round, so its cache has no pair for `last` yet.
+            let before = self.spec_h.take().unwrap_or_else(|| self.hidden());
+            self.verify_drafts(last, drafts, &dists, sampler, Some(before), 0.0)
+        }
+
+        /// Feed `last` and the drafts in one pass, keep the drafts up to the
+        /// first the model disagrees with, and undo the rest.
+        ///
+        /// `unheaded` is the hidden state before `last` when the drafts did
+        /// not come from the head, so the head's cache is missing the pair
+        /// its own first draft would have written; it is written here with
+        /// the accepted rows'.
+        fn verify_drafts(
+            &mut self,
+            last: u32,
+            drafts: &[u32],
+            dists: &[Nucleus],
+            sampler: &mut Sampler,
+            unheaded: Option<Vec<f32>>,
+            t_draft: f64,
+        ) -> Result<(Vec<u32>, u32), String> {
+            let trace = std::env::var_os("LEX_SPEC_TRACE").is_some();
             // `save` exists for the replay path: restore the pre-batch
             // state, feed the accepted prefix again. With per-token
             // snapshots nothing reads it, so on that path it is 0.8 ms of
@@ -1420,7 +1464,7 @@ mod gpu {
             }
             let t_save = mark.elapsed().as_secs_f64() * 1e3;
             let mut fed = vec![last];
-            fed.extend(&drafts);
+            fed.extend(drafts);
             let mark = std::time::Instant::now();
             let logits = self.forward_with(&fed, Head::All, true)?;
             let t_verify = mark.elapsed().as_secs_f64() * 1e3;
@@ -1481,11 +1525,24 @@ mod gpu {
             // the model's hidden states: row i of the verify with the token
             // after it.
             if self.mtp.is_some() {
-                // The round's first token sat at `pos - kept - 1`; its pair
-                // is at the position before that, so the head resumes here.
-                self.mtp_pos = self.pos - kept - 1;
-                if kept > 0 {
-                    self.mtp_warm(&rows[..kept * h], &fed[1..=kept])?;
+                match unheaded {
+                    None => {
+                        // The round's first token sat at `pos - kept - 1`;
+                        // its pair is at the position before that, which
+                        // the first draft wrote, so the head resumes here.
+                        self.mtp_pos = self.pos - kept - 1;
+                        if kept > 0 {
+                            self.mtp_warm(&rows[..kept * h], &fed[1..=kept])?;
+                        }
+                    }
+                    Some(before) => {
+                        // No draft wrote that pair: one position further
+                        // back, with the state before `last` paired with it.
+                        self.mtp_pos = self.pos - kept - 2;
+                        let mut hs = before;
+                        hs.extend_from_slice(&rows[..kept * h]);
+                        self.mtp_warm(&hs, &fed[..=kept])?;
+                    }
                 }
             }
             self.spec_h = Some(carry);
@@ -1509,6 +1566,29 @@ mod gpu {
         /// Does this checkpoint carry a draft head?
         pub fn has_mtp(&self) -> bool {
             self.mtp.is_some()
+        }
+
+        /// The draft head's cached keys for positions `0..n`, head by head,
+        /// for the tests: a cache entry left unwritten changes the head's
+        /// drafts too little to see from outside (it leans on its input far
+        /// more than on its cache), so the tests compare the cache itself.
+        #[doc(hidden)]
+        pub fn head_keys(&self, n: usize) -> Vec<f32> {
+            let Some(m) = &self.mtp else { return vec![] };
+            let Mixer::Attn(at) = &m.layer.mixer else {
+                return vec![];
+            };
+            let (kh, d, cap) = (self.cfg.kv_heads, self.cfg.head_dim, self.cap);
+            let mut all = vec![f16::ZERO; kh * cap * d];
+            self.gpu.download(&at.kcache, &mut all);
+            let n = n.min(cap);
+            (0..kh)
+                .flat_map(|h| {
+                    all[h * cap * d..(h * cap + n) * d]
+                        .iter()
+                        .map(|x| x.to_f32())
+                })
+                .collect()
         }
 
         /// Draft the next `depth` tokens with the checkpoint's own
