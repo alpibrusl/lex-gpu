@@ -662,6 +662,37 @@ saving of ~1 ms a draft, about +1% net. Worth doing only with a ranking
 taken from the model's own output (the FR-Spec construction), a 32k-row
 head reordered to it.
 
+## M5g — vLLM on the L4: lex decodes faster, vLLM prefills 5x faster (2026-10-01)
+
+The same `scripts/engine_bench.py` through both servers on one L4, the
+82-token prompt both render by default:
+
+| NVIDIA L4 | decode greedy | decode sampled | prefill (473 tok) |
+| --- | --- | --- | --- |
+| vLLM 0.30.1 nightly, RedHatAI INT4, plain, CUDA graphs | 16.1 | 16.0 | **828** |
+| lex, MLX NVFP4, speculating | **22.8** | **21.2** | 158 |
+
+What vLLM could run is itself the finding. NVIDIA's NVFP4 checkpoint does
+not fit: Ada has no FP4, so vLLM repacks it for Marlin, and that held
+21.5 of 22 GB before any cache. Red Hat's INT4 fits only without the draft
+head, which asked for 2.4 GB more beside 20 GB of weights. So on a 24 GB
+card vLLM decodes plainly, and lex -- 17 GB with its head -- speculates.
+Its plain step is a little faster than ours (16.1 against ~15).
+
+Prefill is where lex is behind, and by a lot: 473 tokens in 0.57 s is
+~45 TFLOPS of the L4's ~121, where lex's GEMM (`lex_msl::gemm` on wmma,
+the Metal tile shape) does ~13 even at a full 512-token chunk (245 tok/s).
+That, and the chunk cutting (158 through the server against 245), is the
+NVIDIA work.
+
+Getting vLLM to run took four image rebuilds, each fixing what the last
+L4 run died of, all now checked on the CPU builder: the nightly wheel
+needs torch for CUDA 13 (`libcudart.so.13`); Triton builds a C helper at
+start against `Python.h`; FlashInfer compiles attention at the first
+request unless its prebuilt kernels (`flashinfer-jit-cache`) are
+installed. A big-card run (NVFP4 native on Blackwell) waits on quota: the
+project has none above 24 GB.
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`

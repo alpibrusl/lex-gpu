@@ -27,6 +27,12 @@ Decode, tok/s, against Ollama on the same machine:
 Prefill, `qwen3.8:27b-mlx`, 512 tokens: **229 tok/s** on the M4 Max
 (221 at 2048) against Ollama's 250–260, and **245** on the L4.
 
+On the L4 the bar is vLLM (Ollama cannot run the MLX build there). Same
+prompt, through both servers: decode **lex 22.8** against vLLM's 16.1
+(Red Hat's INT4 checkpoint, plain -- its draft head does not fit a 24 GB
+card beside the weights, and NVIDIA's NVFP4 checkpoint does not fit at
+all); prefill **vLLM 828** against lex's 158. The CUDA GEMM is the gap.
+
 Correctness: Llama gives Ollama's tokens exactly (96/96 on both sizes),
 MiMo 16/16; Qwen3.8 passes its whole golden suite on Metal and on the L4,
 worst log-prob difference 0.00077 against an f32 reference (tolerance
