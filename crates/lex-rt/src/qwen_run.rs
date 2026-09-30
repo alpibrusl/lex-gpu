@@ -572,6 +572,9 @@ mod gpu {
         fc: QBuf,
         layer: Layer,
         norm: Buffer,
+        /// `norm` on the host, for the head's own output seeding its next
+        /// draft (see [`Runner::head_input`]).
+        norm_host: Vec<f32>,
     }
 
     /// The int8 matvec path (`lex_msl::int8`): its kernels by batch size and
@@ -740,6 +743,9 @@ mod gpu {
         layers: Vec<Layer>,
         embed: Vec<f32>,
         out_norm: Buffer,
+        /// `out_norm` on the host, for the model's hidden state entering
+        /// the draft head (see [`Runner::head_input`]).
+        out_norm_host: Vec<f32>,
         lm_head: QBuf,
         /// The draft head, when the checkpoint ships one.
         mtp: Option<Mtp>,
@@ -998,6 +1004,7 @@ mod gpu {
                         },
                     },
                     norm: floats(&gpu, &store, "mtp.norm.weight")?,
+                    norm_host: store.floats("mtp.norm.weight")?.0,
                 })
             } else {
                 None
@@ -1058,6 +1065,7 @@ mod gpu {
             let acts = acts_for(1, false);
             let bacts = acts_for(PREFILL_MAX, X_DTYPE != DType::F32);
             let out_norm = floats(&gpu, &store, "model.language_model.norm.weight")?;
+            let out_norm_host = store.floats("model.language_model.norm.weight")?.0;
             let lm_head = QBuf::load(&gpu, &store, "lm_head.weight")?;
             let gemm_ok = mv_keys(&layers, &lm_head, mtp.as_ref())
                 .iter()
@@ -1151,6 +1159,7 @@ mod gpu {
                 layers,
                 embed,
                 out_norm,
+                out_norm_host,
                 lm_head,
                 mtp,
                 mtp_in,
@@ -1474,7 +1483,7 @@ mod gpu {
             let mut h = self.spec_h.take().unwrap_or_else(|| self.hidden());
             let mut tok = last;
             let mut out = Vec::with_capacity(depth);
-            for _ in 0..depth {
+            for i in 0..depth {
                 if self.mtp_pos >= self.cap {
                     break;
                 }
@@ -1489,7 +1498,9 @@ mod gpu {
                     c.eps,
                     &mut fused[..c.hidden],
                 );
-                rms_into(&h, &m.pre_h, c.eps, &mut fused[c.hidden..]);
+                let hin = self.head_input(&h, i > 0);
+                let m = self.mtp.as_ref().expect("checked");
+                rms_into(&hin, &m.pre_h, c.eps, &mut fused[c.hidden..]);
                 self.gpu.write(&self.mtp_in, 0, &fused);
 
                 let (cos, sin) = rope_tables(self.mtp_pos, c.rot, c.theta);
@@ -1637,7 +1648,7 @@ mod gpu {
                     &mut fused[at..at + c.hidden],
                 );
                 rms_into(
-                    &hs[j * c.hidden..(j + 1) * c.hidden],
+                    &self.head_input(&hs[j * c.hidden..(j + 1) * c.hidden], false),
                     &pre_h,
                     c.eps,
                     &mut fused[at + c.hidden..at + 2 * c.hidden],
@@ -1878,6 +1889,31 @@ mod gpu {
             let mut h = vec![0.0f32; self.cfg.hidden];
             self.gpu.download(&self.acts.x, &mut h);
             h
+        }
+
+        /// The hidden state the draft head is seeded with: `x`, a residual
+        /// stream, through the norm that ends its stack -- the model's
+        /// final norm for the model's own state, the head's `mtp.norm` for
+        /// the head's output feeding its next draft. That is what the
+        /// model hands its head (the state its `lm_head` reads), and what
+        /// Ollama's runner does; the head's `pre_fc_norm_hidden` then
+        /// normalises again, but RMS normalisation takes out the scale and
+        /// not the final norm's per-channel weights, so seeding the raw
+        /// residual gave the head a differently weighted input than it was
+        /// trained on. `LEX_MTP_PRENORM=1` keeps the raw residual, to
+        /// measure the difference.
+        fn head_input(&self, x: &[f32], from_head: bool) -> Vec<f32> {
+            if std::env::var_os("LEX_MTP_PRENORM").is_some() {
+                return x.to_vec();
+            }
+            let w = if from_head {
+                &self.mtp.as_ref().expect("a head").norm_host
+            } else {
+                &self.out_norm_host
+            };
+            let mut out = vec![0.0f32; x.len()];
+            rms_into(x, w, self.cfg.eps, &mut out);
+            out
         }
 
         /// Forget the sequence. A linear layer's memory is its state and
