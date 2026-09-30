@@ -596,10 +596,11 @@ Qwen3.8-27B on the machine:
 | --- | --- | --- | --- |
 | Ollama 0.34.4 (MLX, draft head) | **57.5** | **56.4** | **236** |
 | mlx-lm 0.31.3, mlx-community 4-bit | 29.5 | 29.5 | 228 |
-| lex | 52.4 | 50.7 | 186 -> 205* |
+| lex | 52.3 | 50.6 | 186 -> 198* |
 
-\* through the server, before the chunking and attention below; the
-profiler's 512-token prefill went 203 -> 229. mlx-lm drafts only with a
+\* through the server, before and after the chunking, attention and
+elementwise changes below (431-token prompts cut 256 + 128 + 32 + 15);
+the profiler's 512-token prefill, one chunk, went 203 -> 229. mlx-lm drafts only with a
 separate draft model, so it decodes plainly; Ollama is the bar on the Mac
 for both. On NVIDIA the bar is vLLM with NVIDIA's own NVFP4 checkpoint
 (Ollama cannot run the MLX build there): `scripts/gcp/bench_engines.sh`.
