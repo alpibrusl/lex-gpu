@@ -80,6 +80,15 @@ rm -rf "$HOME/vllm"
 "$UV" venv -q --python 3.12 "$HOME/vllm"
 "$UV" pip install -q --python "$HOME/vllm/bin/python" -U vllm --pre \
   --extra-index-url https://wheels.vllm.ai/nightly --torch-backend=cu130
+# FlashInfer compiles its attention kernels at the first request unless
+# its prebuilt ones are installed, and that needs ninja and a CUDA 13
+# compiler this image does not have: on the L4 the first request died
+# with "No such file or directory: 'ninja'". The prebuilt kernels for
+# exactly the FlashInfer vLLM pulled in, and ninja for anything else.
+FI=$("$HOME/vllm/bin/python" -c "import flashinfer; print(flashinfer.__version__)")
+"$UV" pip install -q --python "$HOME/vllm/bin/python" ninja "flashinfer-jit-cache==$FI" \
+  --extra-index-url https://flashinfer.ai/whl/cu130
+"$HOME/vllm/bin/python" -c "import flashinfer_jit_cache, ninja; print('flashinfer', '$FI', 'prebuilt kernels installed')"
 "$HOME/vllm/bin/python" -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda)" \
   | tee "$HOME/vllm-version.txt"
 # Found here rather than on a GPU: every compiled extension vLLM ships

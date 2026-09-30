@@ -85,12 +85,12 @@ for CKPT in ${CKPTS:-Qwen3.8-27B-INT4 Qwen3.8-27B-NVFP4}; do
   fi
   echo "=== vLLM, $CKPT" | tee -a "$R/engines.log"
   pre="${CKPT#Qwen3.8-27B-}"
+  # Speculating, then plain -- both, whichever starts: the plain one
+  # separates the kernels from the speculation, and on a 24 GB card it is
+  # all that fits (the draft head wanted 2.4 GB more beside 20 of INT4).
   try_vllm "$pre-mtp2" --speculative-config "$SPEC" \
-    || try_vllm "$pre-mtp2-eager" --speculative-config "$SPEC" --enforce-eager \
-    || try_vllm "$pre-plain-eager" --enforce-eager
-  # The plain one as well when speculation ran: it separates the kernels
-  # from the speculation.
-  grep -q "vllm-$pre-mtp2\"" "$R/engines.jsonl" 2>/dev/null && try_vllm "$pre-plain"
+    || try_vllm "$pre-mtp2-eager" --speculative-config "$SPEC" --enforce-eager
+  try_vllm "$pre-plain" || try_vllm "$pre-plain-eager" --enforce-eager
 done
 echo "=== results"
 cat "$R/engines.jsonl" 2>/dev/null
