@@ -29,8 +29,8 @@
 #   MODELS       Ollama models for the baseline (default: llama3.2:1b llama3.1:8b).
 #   IMAGE_FAMILY boot from this family in GCP_PROJECT (default lex-gpu-l4,
 #                made by build_image.sh), else the stock Deep Learning image.
-#   LEX_INT8=1   run with the int8 decode path on (lex_msl::int8), so the
-#                golden suite checks its arithmetic.
+#   LEX_INT8=0   run with the float decode matvec instead of the default
+#                int16 one (lex_msl::int8), to measure one against the other.
 #   SPEED=1      only Qwen's timing (qwen_profile, mtp): no test suites, no
 #                Ollama baseline, no sweep. Implies QWEN=1. Minutes instead
 #                of most of an hour, for a question about speed.
@@ -41,7 +41,7 @@
 #   JOB          run this one shell command on the GPU and nothing else --
 #                no test suites, no Ollama baseline, no Llama models:
 #                  JOB='cargo test --release -p lex-rt --test qwen_golden'
-#                  JOB='LEX_INT8=1 cargo run --release -p lex-rt --example qwen_profile -- --tokens 8'
+#                  JOB='cargo run --release -p lex-rt --example qwen_profile -- --tokens 8'
 #                It runs in the source tree, from the pre-built image (Rust,
 #                a release build, qwen3.8 on disk), with Ollama's service
 #                stopped so its models do not hold GPU memory. Its output
