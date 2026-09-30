@@ -642,15 +642,17 @@ mod gpu {
     /// the matmuls go through the matrix-unit GEMM (`lex_msl::gemm`), which
     /// keeps its accumulators in fragments and so does not spill -- and
     /// every token more in a chunk is one fewer read of the 14.5 GB of
-    /// weights over a prompt.
-    pub const PREFILL_MAX: usize = 128;
+    /// weights over a prompt, one fewer set of GEMM tails and one fewer
+    /// warm of the draft head. 512-token prefill on an M4 Max in chunks of
+    /// 128: 204 tok/s; of 256: 218; of 512: 221.
+    pub const PREFILL_MAX: usize = 512;
 
     /// The GEMM chunk sizes. A prompt is cut into these, largest first, and
     /// its last few tokens into one batched-matvec chunk of at most
     /// `MAX_BATCH`: a fixed set of sizes, so the kernels for each are
     /// compiled once at load -- on CUDA each size is seconds of NVRTC, and a
     /// set that grew with every new prompt length would pay them per prompt.
-    const GEMM_SIZES: [usize; 4] = [128, 64, 32, 16];
+    const GEMM_SIZES: [usize; 6] = [512, 256, 128, 64, 32, 16];
 
     /// Every pipeline a batch of `t` tokens dispatches, compiled on first
     /// use of that size.
@@ -1017,6 +1019,7 @@ mod gpu {
             let splits = cap.div_ceil(ATTN_BK * ATTN_BPS);
             let acts_for = |t: usize, narrow: bool| {
                 let f = |n: usize| gpu.zeroed::<f32>(t * n);
+                let z = |n: usize| gpu.zeroed::<f32>(t.min(MAX_BATCH) * n);
                 Acts {
                     x: f(cfg.hidden),
                     x2: f(cfg.hidden),
@@ -1059,9 +1062,13 @@ mod gpu {
                     scalars_attn: gpu.zeroed::<u32>(2),
                     scalars_len: gpu.zeroed::<u32>(1),
                     scalars_nsplit: gpu.zeroed::<u32>(2),
-                    part_m: f(splits * cfg.heads),
-                    part_l: f(splits * cfg.heads),
-                    part_acc: f(splits * cfg.heads * cfg.head_dim),
+                    // Split-KV attention's partials. Only a batch of up to
+                    // MAX_BATCH ever splits (`split_attn`), so only that
+                    // many rows: sized by the batch, at 16k of context and
+                    // a 512-token chunk they were 6.4 GB never touched.
+                    part_m: z(splits * cfg.heads),
+                    part_l: z(splits * cfg.heads),
+                    part_acc: z(splits * cfg.heads * cfg.head_dim),
                 }
             };
             let acts = acts_for(1, false);
@@ -2226,7 +2233,7 @@ mod gpu {
             let want = std::env::var("LEX_PREFILL_CHUNK")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(128);
+                .unwrap_or(PREFILL_MAX);
             GEMM_SIZES
                 .into_iter()
                 .find(|&g| g <= want)

@@ -24,7 +24,7 @@ Decode, tok/s, against Ollama on the same machine:
 | `llama3.2:1b` | NVIDIA L4 | 124.4 | 162.9 |
 | `qwen3.8:27b-mlx` | NVIDIA L4, plain / speculating | 15.1 / 24.4 | — (MLX build) |
 
-Prefill, `qwen3.8:27b-mlx`, 512 tokens: **203 tok/s** on the M4 Max
+Prefill, `qwen3.8:27b-mlx`, 512 tokens: **221 tok/s** on the M4 Max
 against Ollama's 250–260, and **245** on the L4.
 
 Correctness: Llama gives Ollama's tokens exactly (96/96 on both sizes),
