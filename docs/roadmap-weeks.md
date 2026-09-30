@@ -503,6 +503,88 @@ other 0.2 steps (the recurrence and attention over three tokens cost 2.7x
 and 2.5x a step's), undo, and acceptance -- a third draft is accepted
 often enough to try again now that the verify is cheaper.
 
+## M5c — Metal prefill, 120 -> 203 tok/s (2026-09-29)
+
+512 tokens on an M4 Max, 128-token chunks. Each step was found by the
+per-call-site profile (`examples/qwen_profile`) and checked by the golden
+suite before the next; Ollama is 250-260 on the same machine
+(`scripts/ollama_bench.py`, and one 520-token prompt traced).
+
+| change | where it went | tok/s |
+| --- | --- | --- |
+| start | | 120.7 |
+| vocabulary projection for the prompt's last token only | 138 -> 1.5 ms | 126 |
+| GEMM: next K step's loads in flight, vector loads, 64-token tiles | gate/up 2.65 -> 1.97 ms a call | 164 |
+| KV append on a grid (was one instance, every row in turn) | 578 -> 6 us a call | 166 |
+| causal attention over tokens, not split-KV, for prefill | 329 -> 70 ms | 187 |
+| 16 delta rows per instance for prefill | 1.70 -> 1.53 ms a call | 189 |
+| gated delta rule a 16-token chunk at a time (`lex_msl::delta`) | 295 -> 92 ms | 202 |
+| q/k norm, gates, dense a/b spread over tokens | 26 + 20 + 39 -> 3 + 3 + 33 ms | 203 |
+
+What is left, measured rather than guessed:
+
+- **The GEMM is 8-10% behind MLX.** Compared the same way -- independent
+  outputs, so the concurrent encoder may overlap dispatches, which is how
+  MLX's own benchmark runs (`examples/gemm_metal --overlap`) -- ours does
+  12.7 TFLOPS on the model's shapes against `mx.quantized_matmul`'s 13.9.
+  With loads and staging removed the multiply loop alone reaches 14.3;
+  the global loads are hidden (removing them changes nothing), and the
+  rest is staging the tiles in front of a barrier. Not the fix, each
+  measured: row padding, the untransposed load, float fragments, half
+  arithmetic in the dequantise, more simdgroups, double-buffered tiles
+  (slower), taller or wider tiles (a simdgroup holding more than 32x32
+  spills, ten times slower).
+- **The GPU is busy 97% of the prefill** (4 chunks of ~610 ms GPU time in
+  2.52 s, encoding 0.5 ms a chunk): what is left is GPU work, not the CPU.
+- **Warming the draft head costs ~19 ms a chunk**: a download, a host-side
+  norm, an upload and the head's layer, serially. On the GPU and
+  overlapped with the next chunk it would be most of that back.
+- **CUDA gained too.** The attention, KV-append, last-row head and
+  small-kernel changes are shared: 512-token prefill on an L4 went 199 ->
+  234 tok/s, and all 11 Qwen goldens pass there with the int16 matvec
+  (`results/gcp/20260929-202622-l4`). The chunked delta kernel has a CUDA
+  form too, its products in f32 on the ordinary cores (the matrix units
+  take f32 only as TF32): 245 tok/s against 227 with the step kernel in the
+  same run, goldens 11/11, and decode 66 ms a token with the int16 matvec
+  now on by default (`results/gcp/20260930-081300-l4`).
+- Ollama's kernels, from the trace: MLX's `nvfp4_qmm_t` in bfloat16, a
+  fused chunked gated-delta kernel with chunks of 16, attention as GEMMs
+  plus a softmax, the convolution fused with its SiLU. The same shape of
+  solution; the remaining difference is in execution.
+
+The simdgroup_matrix 8x8 lane layout, measured by loading a known matrix:
+lane L holds row `(L%8)/2 + 4*(L/16)`, columns `2*(L%2) + 4*((L/8)%2)` and
+the next. Reading `thread_elements()` works; writing its elements one at a
+time made a kernel twelve times slower on this SDK.
+
+## M5d — Metal decode: 0.93x, and a benchmark that compared two prompts (2026-09-30)
+
+Qwen3.8 through both servers on prose, same prompt token for token:
+**greedy 52.9 against Ollama's 56.7 (0.93x), sampled 47.2 against 54.0
+(0.87x).** What moved it, and what was wrong with the measurement:
+
+| change | effect |
+| --- | --- |
+| `lex_msl::few`: a verify's 2-4 tokens read each weight once, in the one-token kernel's structure | verify of 3: 1.20 -> 1.08 steps |
+| the draft head seeded with the *normalised* hidden state, as the model hands it (Ollama does the same) | tokens a verify accepts 2.63 -> 2.79 of 3 |
+| the same kernel at one token for decode | a step 36.25 -> 35.10 ms (Ollama 35) |
+| `--depth auto` (`lex_rt::spec`) | no change on this Mac; picks per machine |
+
+**The benchmark was comparing different prompts.** lex renders the
+checkpoint's chat template, which opens with a "Reasoning effort is set to
+xhigh" system turn by default; the Ollama measured against (0.34.4) renders
+none -- 40 prompt tokens against 82. Greedy decoding then wrote different
+text: under xhigh, terse notes ("Need produce final essay. Need likely no
+need web."); without, an outline ("The user wants a detailed ... Let me
+structure this"). A draft head predicts the second far better: Ollama's
+first draft was accepted 0.90-0.94 of the time, lex's 0.75 -- which looked
+like a defect in lex's head until the prompts were printed. Every
+through-the-server Qwen comparison before this (the 0.65-0.80x figures) had
+the same mismatch. `scripts/serve_bench.py` now asks lex for
+`reasoning_effort: medium`, which renders exactly Ollama's prompt, and
+prints both prompt token counts. `examples/mtp --prompt` measures
+acceptance on a chat-rendered prompt.
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`

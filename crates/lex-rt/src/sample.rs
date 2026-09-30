@@ -24,6 +24,10 @@ fn mix(seed: u64) -> u64 {
     (z ^ (z >> 31)) | 1
 }
 
+/// A distribution over a few tokens, most likely first, as
+/// [`Sampler::nucleus`] gives it: the tokens and their probabilities.
+pub type Nucleus = (Vec<u32>, Vec<f32>);
+
 /// How to turn logits into a token.
 #[derive(Clone, Copy, Debug)]
 pub struct Sampler {
@@ -85,7 +89,7 @@ impl Sampler {
     /// `prob` and `verify_draft` describing the same distribution. A
     /// speculative rule that drew from one distribution and checked
     /// against another would be wrong in a way no output would show.
-    pub fn nucleus(&self, logits: &[f32]) -> (Vec<u32>, Vec<f32>) {
+    pub fn nucleus(&self, logits: &[f32]) -> Nucleus {
         if self.temperature <= 0.0 || self.top_k == 1 {
             let best = (0..logits.len())
                 .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
@@ -131,8 +135,8 @@ impl Sampler {
         (idx, p)
     }
 
-    /// One draw from a nucleus.
-    fn draw(&mut self, idx: &[u32], p: &[f32]) -> u32 {
+    /// One draw from a nucleus, as [`Self::nucleus`] returns it.
+    pub fn draw(&mut self, idx: &[u32], p: &[f32]) -> u32 {
         let r = self.next_unit();
         let mut acc = 0.0;
         for (j, &x) in p.iter().enumerate() {
@@ -194,5 +198,124 @@ impl Sampler {
             *x /= left;
         }
         Err(self.draw(&ri, &rp))
+    }
+
+    /// Speculative sampling's accept/reject for a draft *sampled* from a
+    /// proposal `q` (`q_idx`, `q_p`, as [`Self::nucleus`] gives them):
+    /// accept with min(1, p(x)/q(x)), else draw from (p - q)+ normalised.
+    /// Out comes `p` exactly, whatever `q` was (Leviathan et al.):
+    ///
+    ///   P(y) = q(y) min(1, p(y)/q(y)) + (1 - sum_x min(p, q)) (p(y) - q(y))+ / Z
+    ///        = min(p(y), q(y)) + (p(y) - q(y))+ = p(y)
+    ///
+    /// since Z = 1 - sum_x min(p(x), q(x)). Drafting the head's argmax and
+    /// accepting with p(x) ([`Self::verify_draft`]) is the special case of
+    /// a one-point `q`, and accepts sum min(p, q) less often whenever the
+    /// two spread their mass over the same few tokens -- at temperature 1
+    /// over top-20, most steps. At temperature 0 both are one point and
+    /// this is the greedy check.
+    pub fn verify_proposal(
+        &mut self,
+        logits: &[f32],
+        draft: u32,
+        q_idx: &[u32],
+        q_p: &[f32],
+    ) -> Result<(), u32> {
+        let (idx, p) = self.nucleus(logits);
+        let at =
+            |ix: &[u32], v: &[f32], t: u32| ix.iter().position(|&x| x == t).map_or(0.0, |i| v[i]);
+        let (px, qx) = (at(&idx, &p, draft), at(q_idx, q_p, draft));
+        if qx > 0.0 && self.next_unit() < (px / qx).min(1.0) {
+            return Ok(());
+        }
+        // (p - q)+ over p's support: where p is zero it is zero.
+        let (ri, mut rp): (Vec<u32>, Vec<f32>) = idx
+            .iter()
+            .zip(&p)
+            .map(|(&t, &x)| (t, (x - at(q_idx, q_p, t)).max(0.0)))
+            .filter(|(_, x)| *x > 0.0)
+            .unzip();
+        let left: f32 = rp.iter().sum();
+        if ri.is_empty() || left <= 0.0 {
+            // p <= q everywhere means p == q, which accepts with
+            // certainty; reachable only by rounding.
+            return Err(self.draw(&idx, &p));
+        }
+        for x in &mut rp {
+            *x /= left;
+        }
+        Err(self.draw(&ri, &rp))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sampler;
+
+    /// Logits whose nucleus under the default sampler is a handful of
+    /// tokens with spread-out mass.
+    fn logits(bias: &[f32]) -> Vec<f32> {
+        let mut v = vec![-30.0f32; 64];
+        for (i, b) in bias.iter().enumerate() {
+            v[i] = *b;
+        }
+        v
+    }
+
+    /// Draw a draft from q, verify against p, and the tokens that come out
+    /// are distributed as p -- measured, over many draws -- while accepting
+    /// sum min(p, q) of the time, more than a point proposal's p(argmax q).
+    #[test]
+    fn a_sampled_proposal_yields_the_target_and_accepts_more() {
+        let target = logits(&[1.0, 0.8, 0.5, 0.1]);
+        let draft = logits(&[0.8, 1.0, 0.4, 0.2]);
+        let mut s = Sampler::seeded(7);
+        let (pi, pp) = s.nucleus(&target);
+        let (qi, qp) = s.nucleus(&draft);
+        let n = 200_000;
+        let mut count = vec![0usize; 64];
+        let mut accepted = 0;
+        for _ in 0..n {
+            let x = s.draw(&qi, &qp);
+            let y = match s.verify_proposal(&target, x, &qi, &qp) {
+                Ok(()) => {
+                    accepted += 1;
+                    x
+                }
+                Err(t) => t,
+            };
+            count[y as usize] += 1;
+        }
+        for (t, p) in pi.iter().zip(&pp) {
+            let got = count[*t as usize] as f32 / n as f32;
+            assert!((got - p).abs() < 0.006, "token {t}: {got} against p = {p}");
+        }
+        let overlap: f32 = pi
+            .iter()
+            .zip(&pp)
+            .map(|(t, p)| p.min(qi.iter().position(|q| q == t).map_or(0.0, |i| qp[i])))
+            .sum();
+        let rate = accepted as f32 / n as f32;
+        assert!(
+            (rate - overlap).abs() < 0.006,
+            "accepted {rate}, sum min(p, q) = {overlap}"
+        );
+        let point = pp[pi.iter().position(|&t| t == qi[0]).expect("in nucleus")];
+        assert!(
+            rate > point + 0.05,
+            "sampled {rate} against a point proposal's {point}"
+        );
+    }
+
+    /// At temperature 0 both nuclei are one token and the rule is the
+    /// greedy check.
+    #[test]
+    fn at_temperature_zero_it_is_the_greedy_check() {
+        let mut s = Sampler::new(0.0, 1.0, 1, 3);
+        let target = logits(&[0.2, 1.0]);
+        let (qi, qp) = s.nucleus(&logits(&[1.0, 0.2]));
+        assert_eq!(s.verify_proposal(&target, qi[0], &qi, &qp), Err(1));
+        let (qi, qp) = s.nucleus(&logits(&[0.1, 0.9]));
+        assert_eq!(s.verify_proposal(&target, qi[0], &qi, &qp), Ok(()));
     }
 }

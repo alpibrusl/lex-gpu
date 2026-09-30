@@ -181,11 +181,11 @@ pub fn rope_tables(pos: usize, rot: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use gpu::{Checkpoint, MAX_BATCH, Runner, evict_index};
+pub use gpu::{Checkpoint, MAX_BATCH, MAX_DEPTH, Runner, evict_index};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gpu {
-    use crate::sample::Sampler;
+    use crate::sample::{Nucleus, Sampler};
     use std::collections::HashMap;
 
     use crate::dev::{Buffer, Gpu, Pipeline, Step};
@@ -201,6 +201,7 @@ mod gpu {
     };
     use lex_front::{Program, check};
     use lex_ir::{DType, Kernel, Space, Target, plan};
+    use lex_msl::delta::DeltaChunk;
     use lex_msl::gemm::{Gemm, gemm_nvfp4};
     use lex_msl::program::lower_with;
 
@@ -243,6 +244,8 @@ mod gpu {
     /// layer, 48 layers, so 604 MB at four. Prefill runs at MAX_BATCH and
     /// never rolls back, so it does not pay this.
     const SPEC_MAX: usize = 4;
+    /// The deepest a speculative round can draft: a verify of `SPEC_MAX`.
+    pub const MAX_DEPTH: usize = SPEC_MAX - 1;
 
     /// The decode RMSNorm, parsed from `lex-front/lx/rmsnorm.lx`.
     ///
@@ -278,8 +281,39 @@ mod gpu {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2)
     }
+    /// Tokens per instance of the batched causal attention: one, or the
+    /// largest block up to `LEX_ATTN_TQ` that divides the batch. At a
+    /// 128-token prefill chunk on an M4 Max, a layer's attention cost 1.09
+    /// ms in blocks of one token, 1.27 in two, 1.46 in four, 4.24 in
+    /// sixteen: the finest cut fills the GPU and each block still stops
+    /// masking where its token does.
+    fn attn_tq(t: usize) -> usize {
+        let want = std::env::var("LEX_ATTN_TQ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1usize);
+        (1..=want.min(t))
+            .rev()
+            .find(|q| t.is_multiple_of(*q))
+            .unwrap_or(1)
+    }
+    /// Whether a batch of `t` attends through the split-KV kernels.
+    ///
+    /// Splitting the cache is what keeps a verify's few tokens from being
+    /// one threadgroup per KV head scanning a long cache. A prefill chunk
+    /// is already spread across the GPU by its tokens ([`attn_tq`]), and
+    /// splitting it as well made every split carry all of the chunk's query
+    /// rows: 512-token prefill spent 329 ms in attention split against 70
+    /// in token blocks, and 2048 tokens 3.1 s against 0.92.
+    fn split_attn(t: usize, nsplit: usize) -> bool {
+        t <= MAX_BATCH && nsplit >= attn_min_splits()
+    }
     /// State rows per instance of the delta step.
     const DELTA_ROWS: usize = 8;
+    /// The same for a prefill chunk, whose instances each walk 128 tokens
+    /// in sequence. Per call at a 128-token chunk on an M4 Max: 4 rows
+    /// 2.15 ms, 8 rows 1.70, 16 rows 1.53, 32 rows 2.17.
+    const DELTA_ROWS_PREFILL: usize = 16;
     /// The dtype the *batched* path keeps normalised activations in.
     ///
     /// A batched matmul re-reads every token's activations once per
@@ -540,6 +574,9 @@ mod gpu {
         fc: QBuf,
         layer: Layer,
         norm: Buffer,
+        /// `norm` on the host, for the head's own output seeding its next
+        /// draft (see [`Runner::head_input`]).
+        norm_host: Vec<f32>,
     }
 
     /// The int8 matvec path (`lex_msl::int8`): its kernels by batch size and
@@ -547,12 +584,11 @@ mod gpu {
     ///
     /// On an L4 the float matvec is clock-bound under the 72 W cap -- its
     /// cost is instructions per weight byte -- and this spends about a fifth
-    /// as many. It changes the arithmetic (8-bit activations, a scale per 16
-    /// values), so it is CUDA-only, NVFP4-only, opt-in with `LEX_INT8=1`
-    /// (8-bit activations fail the golden tolerance; see where it is set), and
-    /// covers decode and verify batches (up to `SPEC_MAX` tokens): prefill
-    /// chunks go through the GEMM, and every shape here is an NVRTC compile
-    /// at load.
+    /// as many. It changes the arithmetic (16-bit activations, a scale per
+    /// 16 values), so it is CUDA-only and NVFP4-only; on by default,
+    /// `LEX_INT8=0` turns it off. It covers decode and verify batches (up to
+    /// `SPEC_MAX` tokens): prefill chunks go through the GEMM, and every
+    /// shape here is an NVRTC compile at load.
     struct Int8 {
         /// `(tokens, n_out, n_in, residual)`.
         mm: HashMap<(usize, usize, usize, bool), Pipeline>,
@@ -618,6 +654,21 @@ mod gpu {
 
     /// Every pipeline a batch of `t` tokens dispatches, compiled on first
     /// use of that size.
+    /// Which rows of a batch go through `lm_head`.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Head {
+        /// Every row: a verify judges each token.
+        All,
+        /// The last row only, through the decode step's head: what the
+        /// next token is sampled from. The batched head over a prefill
+        /// chunk computed 128 rows of logits to keep one, 35 ms a chunk
+        /// on an M4 Max.
+        Last,
+        /// None: a prefill chunk before the last, or a replay whose logits
+        /// the speculation already has.
+        Skip,
+    }
+
     struct Batch {
         rms: Pipeline,
         mv: HashMap<MvKey, Pipeline>,
@@ -637,6 +688,9 @@ mod gpu {
         attn_combine: Pipeline,
         mul: Pipeline,
         silu: Pipeline,
+        /// The batch's last row of the residual into the decode step's
+        /// `x`, for a head over that row alone ([`Head::Last`]).
+        last_row: Pipeline,
         /// The same delta and conv kernels, writing per-token snapshots.
         /// Only for batches a speculative verify can use.
         delta_snap: Option<Pipeline>,
@@ -691,6 +745,9 @@ mod gpu {
         layers: Vec<Layer>,
         embed: Vec<f32>,
         out_norm: Buffer,
+        /// `out_norm` on the host, for the model's hidden state entering
+        /// the draft head (see [`Runner::head_input`]).
+        out_norm_host: Vec<f32>,
         lm_head: QBuf,
         /// The draft head, when the checkpoint ships one.
         mtp: Option<Mtp>,
@@ -949,6 +1006,7 @@ mod gpu {
                         },
                     },
                     norm: floats(&gpu, &store, "mtp.norm.weight")?,
+                    norm_host: store.floats("mtp.norm.weight")?.0,
                 })
             } else {
                 None
@@ -1009,6 +1067,7 @@ mod gpu {
             let acts = acts_for(1, false);
             let bacts = acts_for(PREFILL_MAX, X_DTYPE != DType::F32);
             let out_norm = floats(&gpu, &store, "model.language_model.norm.weight")?;
+            let out_norm_host = store.floats("model.language_model.norm.weight")?.0;
             let lm_head = QBuf::load(&gpu, &store, "lm_head.weight")?;
             let gemm_ok = mv_keys(&layers, &lm_head, mtp.as_ref())
                 .iter()
@@ -1016,11 +1075,12 @@ mod gpu {
             let keys = mv_keys(&layers, &lm_head, mtp.as_ref());
             let int8_on = crate::dev::gemm_backend() == lex_msl::gemm::Backend::Cuda
                 && gemm_ok
-                // Opt-in: 66% faster decode on an L4 (112 -> 67 ms a token),
-                // but 8-bit activations moved a golden log-prob by 0.027
-                // against a 0.02 tolerance (2026-09-29). Off until the
-                // arithmetic passes.
-                && std::env::var("LEX_INT8").is_ok_and(|v| v == "1")
+                // Decode on an L4 112 -> 67 ms a token. 8-bit activations
+                // moved a golden log-prob by 0.027 against a 0.02 tolerance;
+                // 16-bit ones move it 0.00077, and the whole golden suite has
+                // passed with them on an L4 twice (2026-09-29). `LEX_INT8=0`
+                // keeps the float matvec, to measure one against the other.
+                && std::env::var("LEX_INT8").map_or(true, |v| v != "0")
                 && keys.iter().all(|&(n_in, ..)| lex_msl::int8::fits(n_in));
             let int8 = if int8_on {
                 let widest = keys.iter().map(|&(n_in, ..)| n_in).max().unwrap_or(0);
@@ -1049,6 +1109,25 @@ mod gpu {
             for key in mv_keys(&layers, &lm_head, mtp.as_ref()) {
                 if let std::collections::hash_map::Entry::Vacant(slot) = k.mv.entry(key) {
                     let (n_in, n_out, res, layout) = key;
+                    // NVFP4 on Metal: the hand-scheduled matvec
+                    // (`lex_msl::few` at one token), 6% faster than the
+                    // emitted one at the same bytes. `LEX_FEW=0` keeps the
+                    // emitted kernel.
+                    let few = lex_msl::few::Few {
+                        tokens: 1,
+                        n: n_out,
+                        k: n_in,
+                        residual: res,
+                        x_half: false,
+                    };
+                    if crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
+                        && layout == QLayout::NVFP4
+                        && lex_msl::few::fits(&few)
+                        && std::env::var("LEX_FEW").map_or(true, |v| v != "0")
+                    {
+                        slot.insert(gpu.build_lowered(&lex_msl::few::matvec_few_nvfp4(&few)?)?);
+                        continue;
+                    }
                     let p = matvec_q(n_in, n_out, bo(gpu.target()), n_in, layout, res)?;
                     slot.insert(compile(&gpu, &p, THREADS)?);
                 }
@@ -1101,6 +1180,7 @@ mod gpu {
                 layers,
                 embed,
                 out_norm,
+                out_norm_host,
                 lm_head,
                 mtp,
                 mtp_in,
@@ -1288,7 +1368,7 @@ mod gpu {
             }
             let trace = std::env::var_os("LEX_SPEC_TRACE").is_some();
             let mark = std::time::Instant::now();
-            let drafts = self.draft(depth, last)?;
+            let (drafts, dists) = self.draft_with(depth, last, Some(&mut *sampler))?;
             let t_draft = mark.elapsed().as_secs_f64() * 1e3;
             if drafts.is_empty() {
                 let logits = self.step(last)?;
@@ -1313,7 +1393,7 @@ mod gpu {
             let mut fed = vec![last];
             fed.extend(&drafts);
             let mark = std::time::Instant::now();
-            let logits = self.forward_with(&fed, true, true)?;
+            let logits = self.forward_with(&fed, Head::All, true)?;
             let t_verify = mark.elapsed().as_secs_f64() * 1e3;
 
             // How many drafts survive, longest prefix only. The first
@@ -1323,7 +1403,8 @@ mod gpu {
             let mut kept = 0;
             let mut instead = None;
             while kept < drafts.len() {
-                match sampler.verify_draft(&logits[kept], drafts[kept]) {
+                let (qi, qp) = &dists[kept];
+                match sampler.verify_proposal(&logits[kept], drafts[kept], qi, qp) {
                     Ok(()) => kept += 1,
                     Err(t) => {
                         instead = Some(t);
@@ -1354,7 +1435,7 @@ mod gpu {
                 if !self.roll_back_to(kept, fed.len()) {
                     self.restore();
                     if kept > 0 {
-                        self.forward(&committed, false)?;
+                        self.forward_with(&committed, Head::Skip, false)?;
                     } else {
                         self.step(last)?;
                     }
@@ -1417,14 +1498,33 @@ mod gpu {
         /// [`Self::reset`] clears it. Nothing here touches the model's
         /// state, so a rejected draft costs only the time.
         pub fn draft(&mut self, depth: usize, last: u32) -> Result<Vec<u32>, String> {
+            Ok(self.draft_with(depth, last, None)?.0)
+        }
+
+        /// [`Self::draft`], each draft *drawn* from the head's distribution
+        /// under `sampler` when there is one, and that distribution (as
+        /// [`Sampler::nucleus`] gives it) returned alongside, for
+        /// [`Sampler::verify_proposal`]. Without a sampler, or with
+        /// `LEX_GREEDY_DRAFT=1`, the head's argmax and a one-point
+        /// distribution.
+        pub fn draft_with(
+            &mut self,
+            depth: usize,
+            last: u32,
+            mut sampler: Option<&mut Sampler>,
+        ) -> Result<(Vec<u32>, Vec<Nucleus>), String> {
+            if std::env::var_os("LEX_GREEDY_DRAFT").is_some() {
+                sampler = None;
+            }
+            let mut dists = Vec::with_capacity(depth);
             if self.mtp.is_none() || depth == 0 {
-                return Ok(vec![]);
+                return Ok((vec![], dists));
             }
             let c = self.cfg.clone();
             let mut h = self.spec_h.take().unwrap_or_else(|| self.hidden());
             let mut tok = last;
             let mut out = Vec::with_capacity(depth);
-            for _ in 0..depth {
+            for i in 0..depth {
                 if self.mtp_pos >= self.cap {
                     break;
                 }
@@ -1439,7 +1539,9 @@ mod gpu {
                     c.eps,
                     &mut fused[..c.hidden],
                 );
-                rms_into(&h, &m.pre_h, c.eps, &mut fused[c.hidden..]);
+                let hin = self.head_input(&h, i > 0);
+                let m = self.mtp.as_ref().expect("checked");
+                rms_into(&hin, &m.pre_h, c.eps, &mut fused[c.hidden..]);
                 self.gpu.write(&self.mtp_in, 0, &fused);
 
                 let (cos, sin) = rope_tables(self.mtp_pos, c.rot, c.theta);
@@ -1470,14 +1572,26 @@ mod gpu {
 
                 let mut logits = vec![0.0f32; c.vocab];
                 self.gpu.download(&self.acts.logits, &mut logits);
-                tok = (0..logits.len())
-                    .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
-                    .expect("logits") as u32;
+                tok = match sampler.as_deref_mut() {
+                    Some(s) => {
+                        let (idx, p) = s.nucleus(&logits);
+                        let t = s.draw(&idx, &p);
+                        dists.push((idx, p));
+                        t
+                    }
+                    None => {
+                        let t = (0..logits.len())
+                            .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+                            .expect("logits") as u32;
+                        dists.push((vec![t], vec![1.0]));
+                        t
+                    }
+                };
                 out.push(tok);
                 // The head's own hidden state carries the next draft.
                 h = self.hidden();
             }
-            Ok(out)
+            Ok((out, dists))
         }
 
         /// The draft head's dispatches: `fc`, then one attention layer and
@@ -1516,10 +1630,17 @@ mod gpu {
             let mut done = 0;
             while done < n {
                 let t = self.chunk(n - done);
-                // Only the last row's logits: the rest are never read, and
-                // at 64 tokens they are 64 MB of download a chunk.
-                let out = self.forward(&tokens[done..done + t], false)?;
-                logits = out.last().cloned().expect("a batch is never empty");
+                // Logits for the prompt's last token only: every other row's
+                // are never read, and no chunk before the last has it.
+                let head = if done + t == n {
+                    Head::Last
+                } else {
+                    Head::Skip
+                };
+                let out = self.forward_with(&tokens[done..done + t], head, false)?;
+                if let Some(last) = out.into_iter().last() {
+                    logits = last;
+                }
                 let hs = self.batch_hidden_all(t);
                 // The last prompt position pairs with a token the prompt
                 // does not have -- the one the model is about to generate.
@@ -1580,7 +1701,7 @@ mod gpu {
                     &mut fused[at..at + c.hidden],
                 );
                 rms_into(
-                    &hs[j * c.hidden..(j + 1) * c.hidden],
+                    &self.head_input(&hs[j * c.hidden..(j + 1) * c.hidden], false),
                     &pre_h,
                     c.eps,
                     &mut fused[at + c.hidden..at + 2 * c.hidden],
@@ -1694,7 +1815,7 @@ mod gpu {
             // The head's cache is its own and shorter than the model's, so
             // it crosses the split threshold later -- but it crosses it.
             let nsplit = self.nsplit(self.mtp_pos + t);
-            if nsplit >= attn_min_splits() {
+            if split_attn(t, nsplit) {
                 d.push((
                     "mtp attention",
                     &k.attn_split,
@@ -1821,6 +1942,31 @@ mod gpu {
             let mut h = vec![0.0f32; self.cfg.hidden];
             self.gpu.download(&self.acts.x, &mut h);
             h
+        }
+
+        /// The hidden state the draft head is seeded with: `x`, a residual
+        /// stream, through the norm that ends its stack -- the model's
+        /// final norm for the model's own state, the head's `mtp.norm` for
+        /// the head's output feeding its next draft. That is what the
+        /// model hands its head (the state its `lm_head` reads), and what
+        /// Ollama's runner does; the head's `pre_fc_norm_hidden` then
+        /// normalises again, but RMS normalisation takes out the scale and
+        /// not the final norm's per-channel weights, so seeding the raw
+        /// residual gave the head a differently weighted input than it was
+        /// trained on. `LEX_MTP_PRENORM=1` keeps the raw residual, to
+        /// measure the difference.
+        fn head_input(&self, x: &[f32], from_head: bool) -> Vec<f32> {
+            if std::env::var_os("LEX_MTP_PRENORM").is_some() {
+                return x.to_vec();
+            }
+            let w = if from_head {
+                &self.mtp.as_ref().expect("a head").norm_host
+            } else {
+                &self.out_norm_host
+            };
+            let mut out = vec![0.0f32; x.len()];
+            rms_into(x, w, self.cfg.eps, &mut out);
+            out
         }
 
         /// Forget the sequence. A linear layer's memory is its state and
@@ -1952,7 +2098,8 @@ mod gpu {
         /// kernel, so the batch lands exactly where the same tokens would
         /// have one at a time.
         pub fn forward(&mut self, tokens: &[u32], all: bool) -> Result<Vec<Vec<f32>>, String> {
-            self.forward_with(tokens, all, false)
+            let head = if all { Head::All } else { Head::Last };
+            self.forward_with(tokens, head, false)
         }
 
         /// [`Self::forward`] recording where each gated-delta layer stood
@@ -1962,7 +2109,7 @@ mod gpu {
         fn forward_with(
             &mut self,
             tokens: &[u32],
-            all: bool,
+            head: Head,
             snap: bool,
         ) -> Result<Vec<Vec<f32>>, String> {
             let t = tokens.len();
@@ -2003,7 +2150,7 @@ mod gpu {
                 &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
             );
 
-            let mut plan = self.batch_plan_with(t, snap);
+            let mut plan = self.batch_plan_with(t, snap, head);
             if !self.skip.is_empty() {
                 // Exact labels, not prefixes. `"matvec qkv"` starts with
                 // `"matvec q"`, so a prefix match silently ablates two call
@@ -2023,16 +2170,18 @@ mod gpu {
             self.pos += t;
 
             let v = c.vocab;
-            if all {
-                let mut flat = vec![0.0f32; t * v];
-                self.gpu.download(&self.bacts.logits, &mut flat);
-                Ok(flat.chunks(v).map(<[f32]>::to_vec).collect())
-            } else {
-                // Only the last row is wanted, so only the last row moves.
-                let mut last = vec![0.0f32; v];
-                self.gpu
-                    .download_at(&self.bacts.logits, (t - 1) * v, &mut last);
-                Ok(vec![last])
+            match head {
+                Head::All => {
+                    let mut flat = vec![0.0f32; t * v];
+                    self.gpu.download(&self.bacts.logits, &mut flat);
+                    Ok(flat.chunks(v).map(<[f32]>::to_vec).collect())
+                }
+                Head::Last => {
+                    let mut last = vec![0.0f32; v];
+                    self.gpu.download(&self.acts.logits, &mut last);
+                    Ok(vec![last])
+                }
+                Head::Skip => Ok(vec![]),
             }
         }
 
@@ -2163,6 +2312,26 @@ mod gpu {
                         slot.insert(gpu.build_lowered(&l)?);
                         continue;
                     }
+                    // A verify's 2-4 tokens on Metal: each weight decoded
+                    // once for all of them, in the one-token kernel's
+                    // structure (`lex_msl::few`) -- a verify's matvecs cost
+                    // what a step's do instead of 1.18x. `LEX_FEW=0` keeps
+                    // the batched program, to measure one against the other.
+                    let few = lex_msl::few::Few {
+                        tokens: t,
+                        n: n_out,
+                        k: n_in,
+                        residual: res,
+                        x_half: xt == DType::F16,
+                    };
+                    if crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
+                        && layout == QLayout::NVFP4
+                        && lex_msl::few::fits(&few)
+                        && std::env::var("LEX_FEW").map_or(true, |v| v != "0")
+                    {
+                        slot.insert(gpu.build_lowered(&lex_msl::few::matvec_few_nvfp4(&few)?)?);
+                        continue;
+                    }
                     let p = matmul_q_x(t, n_in, n_out, bo, n_in, layout, res, xt)?;
                     slot.insert(compile(gpu, &p, THREADS)?);
                 }
@@ -2172,7 +2341,11 @@ mod gpu {
                 k_heads: c.k_heads,
                 k_dim: dk,
                 v_dim: dv,
-                rows: DELTA_ROWS,
+                rows: if t > MAX_BATCH {
+                    DELTA_ROWS_PREFILL
+                } else {
+                    DELTA_ROWS
+                },
                 v_base: c.v_base(),
                 v_width: ch,
             };
@@ -2259,7 +2432,29 @@ mod gpu {
                     128,
                 )?,
                 gates: compile(gpu, &build_gates_rows(t, hv, dv), 64)?,
-                delta: compile(gpu, &delta.build_steps(t)?, 128)?,
+                delta: {
+                    // A prefill chunk solves the recurrence a chunk of
+                    // tokens at a time (`lex_msl::delta`), rather than
+                    // token by token. `LEX_DELTA_STEPS=1` keeps the step
+                    // kernel, to measure one against the other.
+                    let dc = DeltaChunk {
+                        tokens: t,
+                        v_heads: hv,
+                        k_dim: dk,
+                        v_dim: dv,
+                        v_base: c.v_base(),
+                        v_width: ch,
+                    };
+                    if t > MAX_BATCH
+                        && lex_msl::delta::fits(&dc)
+                        && std::env::var_os("LEX_DELTA_STEPS").is_none()
+                    {
+                        let l = lex_msl::delta::delta_chunked(&dc, crate::dev::gemm_backend())?;
+                        gpu.build_lowered(&l)?
+                    } else {
+                        compile(gpu, &delta.build_steps(t)?, 128)?
+                    }
+                },
                 gated_norm: compile(gpu, &build_gated_norm_rows(t, hv, dv, c.eps), 128)?,
                 rope_q: compile(
                     gpu,
@@ -2289,13 +2484,18 @@ mod gpu {
                     &kv_append_rows(t, c.kv_heads, c.head_dim, self.cap, DType::F32),
                     64,
                 )?,
-                attn: compile(gpu, &attn.build_causal(t)?, 128)?,
+                attn: compile(gpu, &attn.build_causal_blocks(t, attn_tq(t))?, 128)?,
                 attn_split: compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128)?,
                 attn_combine: compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128)?,
                 mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
                 silu: compile(
                     gpu,
                     &lex_front::llama::silu_mul(t * c.ffn, THREADS, X_DTYPE)?,
+                    THREADS,
+                )?,
+                last_row: compile(
+                    gpu,
+                    &lex_front::qwen::copy_block(t, 1, c.hidden, t - 1)?,
                     THREADS,
                 )?,
                 // Only a batch a verify can roll back from, and only when
@@ -2426,7 +2626,7 @@ mod gpu {
         /// It falls back to the ordinary kernels when the batch is larger
         /// than `SPEC_MAX` or the checkpoint has no draft head, and the
         /// caller then pays the replay as before.
-        fn batch_plan_with(&self, t: usize, snap: bool) -> Vec<Dispatch<'_>> {
+        fn batch_plan_with(&self, t: usize, snap: bool, head: Head) -> Vec<Dispatch<'_>> {
             let a = &self.bacts;
             let k = &self.batches[&t];
             // The gated-delta layers in order, for indexing the snapshots.
@@ -2570,7 +2770,7 @@ mod gpu {
                         // masked to its own position, and a second kernel
                         // merges the partials per query row.
                         let nsplit = self.nsplit(self.pos + t);
-                        if nsplit >= attn_min_splits() {
+                        if split_attn(t, nsplit) {
                             d.push((
                                 "attention",
                                 &k.attn_split,
@@ -2641,16 +2841,41 @@ mod gpu {
                     None,
                 ));
             }
-            // Every token's logits: a verify needs them all, and the head
-            // is 0.7 GB against the 14.5 the batch has already moved.
             let out = &self.lm_head;
-            d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
-            d.push((
-                "matvec lm head",
-                &k.mv[&out.key(false)],
-                out.bind(&a.h, None, &a.logits),
-                None,
-            ));
+            match head {
+                // Every token's logits: a verify needs them all, and the
+                // head is 0.7 GB against the 14.5 the batch has moved.
+                Head::All => {
+                    d.push(("rmsnorm", &k.rms, vec![&a.x, &self.out_norm, &a.h], None));
+                    d.push((
+                        "matvec lm head",
+                        &k.mv[&out.key(false)],
+                        out.bind(&a.h, None, &a.logits),
+                        None,
+                    ));
+                }
+                // The residual, not the normed `h`: the batch stores `h` as
+                // f16 and the decode step reads it as f32. Normed here by
+                // the decode step's own kernel, the row goes through the
+                // same arithmetic a step would give it.
+                Head::Last => {
+                    let one = &self.acts;
+                    d.push(("lm head row", &k.last_row, vec![&a.x, &one.x], None));
+                    d.push((
+                        "rmsnorm",
+                        &self.k.rms,
+                        vec![&one.x, &self.out_norm, &one.h],
+                        None,
+                    ));
+                    d.push((
+                        "matvec lm head",
+                        self.mv(out, false),
+                        out.bind(&one.h, None, &one.logits),
+                        None,
+                    ));
+                }
+                Head::Skip => {}
+            }
             d
         }
 

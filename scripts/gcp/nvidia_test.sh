@@ -27,8 +27,10 @@
 #                cheaper and can be preempted mid-run; use SPOT=0 only for
 #                a run long enough that losing it matters.
 #   MODELS       Ollama models for the baseline (default: llama3.2:1b llama3.1:8b).
-#   LEX_INT8=1   run with the int8 decode path on (lex_msl::int8), so the
-#                golden suite checks its arithmetic.
+#   IMAGE_FAMILY boot from this family in GCP_PROJECT (default lex-gpu-l4,
+#                made by build_image.sh), else the stock Deep Learning image.
+#   LEX_INT8=0   run with the float decode matvec instead of the default
+#                int16 one (lex_msl::int8), to measure one against the other.
 #   SPEED=1      only Qwen's timing (qwen_profile, mtp): no test suites, no
 #                Ollama baseline, no sweep. Implies QWEN=1. Minutes instead
 #                of most of an hour, for a question about speed.
@@ -36,6 +38,14 @@
 #                gated-delta / NVFP4 / draft-head model. 14.5 GB to pull,
 #                and Ollama cannot run it here to compare against (MLX is
 #                macOS-only), so the check is our own golden file.
+#   JOB          run this one shell command on the GPU and nothing else --
+#                no test suites, no Ollama baseline, no Llama models:
+#                  JOB='cargo test --release -p lex-rt --test qwen_golden'
+#                  JOB='cargo run --release -p lex-rt --example qwen_profile -- --tokens 8'
+#                It runs in the source tree, from the pre-built image (Rust,
+#                a release build, qwen3.8 on disk), with Ollama's service
+#                stopped so its models do not hold GPU memory. Its output
+#                comes home as job.log; the exit status is the job's.
 #   MAX_RUN      hard cap on the VM's life (default 2h). GCE deletes the VM
 #                when it expires, even if this script is killed.
 #   KEEP=1       leave the VM running afterwards (debugging); you delete it.
@@ -79,7 +89,17 @@ gc() { gcloud --project "$GCP_PROJECT" --quiet "$@"; }
 FAMILY="$(gcloud compute images list --project deeplearning-platform-release \
   --filter='family~^common-cu12.*ubuntu' --format='value(family)' | sort | tail -1)"
 [ -n "$FAMILY" ] || { echo "no common-cu12 ubuntu image family found" >&2; exit 1; }
-echo "image family: deeplearning-platform-release/$FAMILY"
+# The image scripts/gcp/build_image.sh makes on a CPU VM -- Rust, a release
+# build, Ollama, the models already on it -- when there is one: installing
+# all that here took the first 15-20 minutes of every run at GPU prices.
+IMAGE_FAMILY="${IMAGE_FAMILY:-lex-gpu-l4}"
+if gc compute images describe-from-family "$IMAGE_FAMILY" >/dev/null 2>&1; then
+  IMG=(--image-project "$GCP_PROJECT" --image-family "$IMAGE_FAMILY")
+  echo "image: $GCP_PROJECT/$(gc compute images describe-from-family "$IMAGE_FAMILY" --format='value(name)') (pre-built)"
+else
+  IMG=(--image-project deeplearning-platform-release --image-family "$FAMILY")
+  echo "image family: deeplearning-platform-release/$FAMILY (no pre-built $IMAGE_FAMILY; run build_image.sh)"
+fi
 
 ZONE=""
 # Where the VM named $NAME is, if it exists anywhere in the project. Asked
@@ -129,7 +149,7 @@ for r in $REGIONS; do
       --machine-type "$MACHINE" \
       --maintenance-policy TERMINATE ${spot_flags[@]+"${spot_flags[@]}"} \
       --max-run-duration "$MAX_RUN" --instance-termination-action DELETE \
-      --image-project deeplearning-platform-release --image-family "$FAMILY" \
+      "${IMG[@]}" \
       --boot-disk-size 150GB --boot-disk-type pd-ssd \
       --metadata install-nvidia-driver=True \
       --labels purpose=lex-gpu-test 2>"$OUT/create-$r.log" >/dev/null; then
@@ -154,10 +174,16 @@ done
 
 git -C "$ROOT" archive --format=tar.gz -o "$OUT/src.tar.gz" HEAD
 gc compute scp --zone "$ZONE" "$OUT/src.tar.gz" "$NAME:~/src.tar.gz"
+# A job travels as a file, not inside the ssh command line below, so its
+# own quotes need no escaping.
+if [ -n "${JOB:-}" ]; then
+  printf '%s\n' "$JOB" > "$OUT/job.sh"
+  gc compute scp --zone "$ZONE" "$OUT/job.sh" "$NAME:~/job.sh"
+fi
 # A failing run must still bring its logs home: no errexit from here on.
 set +e
 gc compute ssh "$NAME" --zone "$ZONE" --command \
-  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' QWEN='${QWEN:-}' SPEED='${SPEED:-}' LEX_INT8='${LEX_INT8:-}' bash lex-gpu/scripts/gcp/remote.sh" \
+  "mkdir -p lex-gpu && tar -xzf src.tar.gz -C lex-gpu && MODELS='$MODELS' QWEN='${QWEN:-}' SPEED='${SPEED:-}' LEX_INT8='${LEX_INT8:-}' JOB='${JOB:+1}' bash lex-gpu/scripts/gcp/remote.sh" \
   2>&1 | tee "$OUT/remote.log"
 status=${PIPESTATUS[0]}
 gc compute scp --zone "$ZONE" --recurse "$NAME:~/results/*" "$OUT/" || true

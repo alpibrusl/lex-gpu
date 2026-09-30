@@ -1583,12 +1583,14 @@ impl Gen<'_> {
                                     self.wide_fp4(qe, *qc, kd, vec, &ops[0].0).expect("checked");
                                 let w = at_index(&wq, &format!("j * {qc}u + p0 / 2u"));
                                 self.line(&format!(
-                                    "    const uint2 wq = *reinterpret_cast<const uint2*>(&{w});"
+                                    "    const uint2 wq = {};",
+                                    self.d.vector_load("uint2", &w)
                                 ));
                                 for q in 0..4 {
                                     let xq = at_index(&xa, &format!("i * {kd}u + p0 + {}u", 4 * q));
                                     self.line(&format!(
-                                        "    const float4 x{q} = *reinterpret_cast<const float4*>(&{xq});"
+                                        "    const float4 x{q} = {};",
+                                        self.d.vector_load("float4", &xq)
                                     ));
                                 }
                                 self.line("    float run = 0.0f;");
@@ -2022,9 +2024,10 @@ impl Gen<'_> {
             for rr in 0..r {
                 self.line(&format!(
                     "{{ const uint j = min(sgid * {r}u + {rr}u, {}u); \
-                     wq[{rr}] = *reinterpret_cast<const uint2*>(&{}); }}",
+                     wq[{rr}] = {}; }}",
                     n - 1,
-                    at_index(&wq, &format!("j * {qc}u + p0 / 2u"))
+                    self.d
+                        .vector_load("uint2", &at_index(&wq, &format!("j * {qc}u + p0 / 2u")))
                 ));
             }
             for q in 0..4 {
@@ -2032,8 +2035,11 @@ impl Gen<'_> {
                 self.depth += 1;
                 for i in 0..m {
                     self.line(&format!(
-                        "const float4 x{i} = *reinterpret_cast<const float4*>(&{});",
-                        at_index(&xa, &format!("{}u + p0 + {}u", i * kd, 4 * q))
+                        "const float4 x{i} = {};",
+                        self.d.vector_load(
+                            "float4",
+                            &at_index(&xa, &format!("{}u + p0 + {}u", i * kd, 4 * q))
+                        )
                     ));
                 }
                 for rr in 0..r {

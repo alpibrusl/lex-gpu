@@ -1,602 +1,97 @@
 # lex
 
 A compiler for LLM inference kernels: one typed program for a forward pass,
-lowered to roofline-class kernels with no per-target kernel rewrites.
+lowered to roofline-class kernels for Apple GPUs (Metal) and NVIDIA (CUDA)
+with no per-target kernel rewrites. A **tile** — a block of values with an
+owner, a layout and a lifetime — is what the type system tracks, and the
+checker holds every one to being consumed exactly once.
 
-A **tile** is what the type system tracks — a block of values with an owner, a
-layout and a lifetime — and the checker enforces that every one is consumed
-exactly once. Tiles are what lex is made of.
+It runs real models end to end on the kernels it generates, behind an
+OpenAI-compatible server: Llama 3.x, MiMo-v2.6 and Qwen3.8-27B (hybrid
+gated-delta and attention layers, NVFP4 weights, a draft head for
+speculative decoding).
 
-**Two things the design promises and this does not do yet, stated plainly
-because the rest of this file is measurements and they deserve the same
-honesty:**
+## Status (2026-09-30)
 
-- **The surface syntax is two kernels deep.** `.lx` files parse, and
-  [`rmsnorm.lx`](crates/lex-front/lx/rmsnorm.lx) and
-  [`silu_mul.lx`](crates/lex-front/lx/silu_mul.lx) are each held to
-  emitting MSL byte-identical to the Rust that built them. What exists is
-  `algo` declarations, parameters, `let` bindings over the elementwise and
-  reduction ops, `store`, and `schedule` blocks that bind an algorithm to
-  a target with `threads` and `chunk`. What does not: loops, index
-  arithmetic, layouts and memory spaces in the type, the autotuner's `?`
-  — which is to say the half that makes it a *language* rather than a
-  notation. Every kernel the runtime runs is still Rust that builds the
-  typed IR (about thirty builders; see
-  [`llama.rs`](crates/lex-front/src/llama.rs)) — typed and checked, but
-  not written in the surface. [`docs/design.md`](docs/design.md) has the
-  rest of the intended syntax.
-- **The type system's case is still an argument.** Linear tiles and effects
-  are supposed to catch across targets what each target's own tooling
-  catches only on that target. Two backends now exist, so that is testable
-  — but the bugs found porting to the second were caught by NVRTC, by
-  golden tests and by deleting fixes to watch tests go red, not by the
-  checker. That may be what was touched rather than what it is worth, and
-  it is not yet a result.
+Decode, tok/s, against Ollama on the same machine:
 
-**Metal is no longer the only backend.** `llama3.2:1b` and
-`qwen3.8:27b-mlx` both run on an NVIDIA L4 from the same `lex-front`
-programs the Mac runs: the Llama gives Metal's tokens exactly, and Qwen
-passes the whole golden suite there against the f32 reference. Qwen is
-the one that matters — 48 of its 64 layers carry a recurrent state
-instead of a KV cache, its weights are NVFP4, and it has a
-multi-token-prediction head. Porting the runtime to CUDA took three
-lines.
+| Model | Hardware | lex | Ollama |
+| --- | --- | --- | --- |
+| `maternion/mimo-v2.6:9b` | M4 Max, greedy / sampled | **74.6 / 73.4** | 66.9 / 62.0 |
+| `qwen3.8:27b-mlx` | M4 Max, speculating, greedy / sampled | 52.8 / 51.1 | 56.8 / 53.2 |
+| `llama3.1:8b` | M4 Max | 79.2 | 86.0 |
+| `llama3.2:1b` | M4 Max | 233.7 | 261.9 |
+| `llama3.2:1b` | NVIDIA L4 | 124.4 | 162.9 |
+| `qwen3.8:27b-mlx` | NVIDIA L4, plain / speculating | 15.1 / 24.4 | — (MLX build) |
 
-**Two things are called Lex.** This repository's kernel language is
-`lex`, with `.lx` files. [Lex](https://github.com/alpibrusl/lex-lang) is the
-general-purpose language — the `lex` command, `.lex` files — that
-lex-llm and lex-code are written in, and that
-[`scripts/energy.lex`](scripts/energy.lex) is written in here. The kernel
-language is not embedded in it; they share a name and an author.
+Prefill, `qwen3.8:27b-mlx`, 512 tokens: **203 tok/s** on the M4 Max
+against Ollama's 250–260, and **245** on the L4.
 
-What *is* real: the linear type system, the checker, the reference
-interpreter, two backends, a 27.8B model that runs end to end on the
-kernels it generates and answers with the same tokens as Ollama, and an
-OpenAI-compatible endpoint so something other than a benchmark can use
-it:
+Correctness: Llama gives Ollama's tokens exactly (96/96 on both sizes),
+MiMo 16/16; Qwen3.8 passes its whole golden suite on Metal and on the L4,
+worst log-prob difference 0.00077 against an f32 reference (tolerance
+0.02).
+
+Qwen decode on the Mac is at 0.93x greedy and 0.96x sampled: a plain step
+matches Ollama's (35 ms), and what remains is in the speculation cycle. How each number was
+measured, and what is being tried next, is in
+[`docs/roadmap-weeks.md`](docs/roadmap-weeks.md).
+
+Not done yet: the `.lx` surface syntax covers two kernels (everything the
+runtime runs is built through the Rust IR API, typed and checked), and the
+matrix-unit kernels are hand-scheduled rather than lowered. See
+[`docs/guide.md`](docs/guide.md#not-built-yet).
+
+## Quick start
+
+Rust ≥ 1.88. Models come from Ollama's own store (`ollama pull ...`).
 
 ```bash
 cargo run --release -p lex-rt --example serve -- --model qwen3.8:27b-mlx
-curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"lex","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Streaming and non-streaming both work, and the official OpenAI Python
-client drives it unmodified.
-
-The full design is in [`docs/design.md`](docs/design.md). The plan for getting
-there is in [`docs/roadmap.md`](docs/roadmap.md).
-
-## Status
-
-Two backends, five model/hardware combinations, one model where lex is
-ahead and one where it has fallen behind. Everything here was measured on
-the dates in `docs/roadmap-weeks.md` and is re-measured rather than
-remembered.
-
-**Decode, against Ollama on the same machine:**
-
-| Model | Hardware | lex | Ollama | |
-| --- | --- | --- | --- | --- |
-| `maternion/mimo-v2.6:9b` | M4 Max, greedy | 74.6 | 66.9 | **113%** |
-| `maternion/mimo-v2.6:9b` | M4 Max, sampled | 73.4 | 62.0 | **118%** |
-| `qwen3.8:27b-mlx` | M4 Max, greedy (speculating) | 37.9 | 58.5 | 65% |
-| `qwen3.8:27b-mlx` | M4 Max, sampled (speculating) | 38.3 | 57.1 | 67% |
-| `qwen3.8:27b-mlx` | M4 Max, 1440 ctx | 34.4 | 39.7 | 87% |
-| `llama3.1:8b` | M4 Max | 79.2 | 86.0 | 92% |
-| `llama3.2:1b` | M4 Max | 233.7 | 261.9 | 89% |
-| `llama3.2:1b` | NVIDIA L4 | 124.4 | 162.9 | 76% |
-| `qwen3.8:27b-mlx` | NVIDIA L4 | 9.1 | — | see below |
-
-The MiMo and Qwen ctx-0 rows are from 2026-09-28, through both servers,
-by the method [`scripts/serve_bench.py`](scripts/serve_bench.py) now
-records: the same prose prompt, 256 decode tokens, two or three runs each,
-and where runs differed the lower lex figure is the one shown. Runs on a
-shared machine are not comparable -- one taken while another workload
-held the GPU had Ollama falling from 59.7 to 8.0 tok/s across three
-identical requests -- so check `ollama ps` and the process list first.
-
-**Qwen used to read "42.9 against 42.7, parity", and that no longer
-holds**: Ollama now decodes this model at 57–58 on prose, and keeps that
-under sampling — its draft acceptance does not collapse at temperature 1. MiMo has no draft head, so
-its row is plain decode against plain decode, and lex's kernels read its
-5.6 GB at about 420 GB/s of a 463 GB/s copy ceiling.
-
-**A caution about the Ollama column.** `scripts/ollama_bench.py` prompts
-with random words, which is right for timing prefill — it defeats the
-prompt cache — and wrong for timing decode on a model that speculates:
-noise has a more predictable continuation than prose, so a draft head
-accepts more of it. Ollama's Qwen decode at 1,440 positions is 57.8 on
-random words and 39.7 on a real passage. The prose figure is the one
-above; use `--prompt-file` for decode comparisons.
-
-**Energy, measured the same way on both** (`scripts/energy.lex`, and
-`LEX_NO_PREFIX_CACHE` has no part in it — this is raw decode):
-
-| | | tok/s | W | mJ/token |
-| --- | --- | --- | --- | --- |
-| NVIDIA L4, `llama3.2:1b`, 4096 tokens | lex | 103.2 | 68.5 | 663.7 |
-| | Ollama | 152.0 | 70.8 | 465.5 |
-| M-series, `qwen3.8:27b-mlx`, 256 tokens | lex | 26.1 | 46.8 | 1788.9 |
-| | Ollama | 50.1 | 46.7 | 932.4 |
-
-The two engines draw the *same power* — 68.5 against 70.8 W on the L4,
-46.8 against 46.7 on the Mac. Both sit at the same hardware limit, so
-energy per token is time per token and nothing else: 1.47x slower is 1.43x
-the energy, 1.92x slower is 1.92x the energy. There is no separate
-efficiency story to chase, which is worth knowing before chasing one.
-
-The Mac row is lex *without speculation*: at the time, speculation
-verified against the greedy token, so it could not run under the
-checkpoint's sampling defaults. Speculative sampling -- accept a draft
-with the target's probability for it, else resample without it -- now
-lets both be true at once, at 38 tok/s sampled; the energy row has not
-been re-measured since.
-
-**Prefill now runs on the matrix units: 123 tok/s on an M4 Max (was 87),
-200 on an L4 (was 40), against Ollama's ~250 on the Mac.** 512 tokens in
-128-token chunks through a hand-scheduled NVFP4 GEMM (`lex_msl::gemm`);
-see [`docs/roadmap-weeks.md`](docs/roadmap-weeks.md) M5a. What follows is
-how it stood before: Not a
-mystery. 512 tokens is 28.5 TFLOP, and at the measured 13.7 TFLOP/s that
-is 246 tok/s — which is what Ollama gets, because it prefills in large
-batches and pays only the arithmetic. `MAX_BATCH` is 8 here, so a
-512-token prompt also reads all 14.5 GB of weights sixty-four times.
-Raising it needs a tiled GEMM on the matrix units; `examples/gemm_probe`
-measures one at 6.95 ms/token against the batched matvec's best 8.49,
-with the crossover at 16 tokens.
-
-**Qwen on the L4 is correct, and speculating it doubles its speed.** The
-full golden suite passes there against the f32 reference — 24 steps over
-3 prompts, worst |dlogprob| 0.00064 against a tolerance of 0.02. Plain
-decode is 9.6 tok/s; speculating at depth 1 it is **21.6 (2.25x)**, with
-87.1% of drafts accepted, because a verify of three tokens costs 0.97 of
-a plain step there. (An earlier "speculation is a loss on CUDA" timed the
-first verify, which compiles its kernels with NVRTC; see
-[`docs/roadmap-weeks.md`](docs/roadmap-weeks.md).)
-
-Plain decode is still slow: 132 GB/s of a ~300 GB/s card, 44% of its
-roof, where Metal reaches 75% of its own. Timed per kernel with events
-(`examples/qwen_profile`), the matvecs are 92% of the step and run at
-140–156 GB/s; everything else together is about 5 ms of 106, so the fix
-is the decode matvec, not streams or launch overhead.
-
-| Phase | State | Details |
-| --- | --- | --- |
-| **P0** Spine | closed | RMSNorm at 98.1% of the copy ceiling (463.6 GB/s) on an M4 Max, matching the reference. [`docs/P0.md`](docs/P0.md) |
-| **P1** Types | closed (in the interpreter) | Linear tiles, effect-typed copies and barrier-synchronised pipes check a flash-attention decode loop: plain, double-buffered, and warp-specialised for Hopper. All variants match PyTorch. [`docs/P1.md`](docs/P1.md) |
-| **P2** Metal, correct | **exit test met** | Llama-3.1-8B in int4 (Q4_K_M, from Ollama) runs on lex kernels on the GPU, and its greedy tokens are identical to Ollama's. [`docs/P2.md`](docs/P2.md) |
-| **P3** Metal, fast | decode done, prefill open | Decode 87–100% of Ollama at every context measured, flat from 0 to 1,440 positions, reading as many bytes per token as llama.cpp. Prefill is 36%. [`docs/P3.md`](docs/P3.md) |
-| **P4** A second backend | **met** | `llama3.2:1b` gives Metal's tokens exactly on an L4; `qwen3.8:27b-mlx` passes the whole golden suite there. Porting each runtime took three lines. Speed on CUDA is open. |
-
-Measured on an M4 Max, each model greedy-decoded on 4 prompts × 24 tokens
-next to Ollama itself (`scripts/lex_vs_ollama.py`):
-
-| Model | Weights | Tokens identical to Ollama | Log-prob gap vs Ollama | vs f32 reference |
-| --- | --- | --- | --- | --- |
-| `llama3.2:1b` | Q8_0 | 96 / 96 | ≤ 0.009 | ≤ 0.007 |
-| `llama3.1:8b` | Q4_K_M | 96 / 96 | ≤ 0.08 | ≤ 0.007 |
-| `maternion/mimo-v2.6:9b` | Q4_K_M (GGUF) | 16 / 16 | ≤ 0.012 | — |
-
-MiMo-v2.6 is the Qwen3.5 architecture — the hybrid of gated-delta and
-attention layers that Qwen3.8 is — shipped as GGUF rather than MLX. It runs
-on the same runtime through `qwen_source`, which reads either format and
-keeps every convention the two disagree on in one place. Three of them
-differ, and none errors when got wrong: llama.cpp has already added the 1
-to the norm weights, stores `ssm_a` as `-exp(A_log)`, and orders the value
-heads tiled rather than grouped. That last one left the model fluent and
-wrong — "The capital of France is" continued "the 1960, 1961" with ' Paris'
-outside its top five — which is why the test checks log-probabilities and
-not just tokens. MiMo has no draft head, so it decodes without speculation.
-
-How to read that:
-- **Correctness:** lex agrees with an f32 PyTorch reference to within 0.007 on
-  both models. Ollama differs from both by more, up to 0.09 on the 8B,
-  because llama.cpp's quantised kernels round differently. So the remaining
-  gap is on Ollama's side, not lex's.
-- **Speed:** the big matvecs read at 437–523 GB/s against a 463 GB/s copy
-  benchmark, and 4.71 GB of weights move per token against llama.cpp's
-  4.62. Speed barely moves with context, because split-KV attention
-  spreads the cache over many threadgroups and merges their partial
-  softmaxes; before it, the 8B fell to 20 tok/s at 1,440 positions.
-  `cargo run --release -p lex-rt --example profile -- --model llama3.1:8b --context 512`
-  shows where the time goes, per kernel, from GPU timestamps.
-
-What runs where:
-- **Copy and RMSNorm** are hand-planned P0 kernels. They run on the GPU at
-  parity with PyTorch (example 3).
-- **Llama inference** is typed `lex-front` programs: RMSNorm, quantised
-  matvec (Q8_0 / Q4_K / Q6_K / NVFP4 / ternary), RoPE, flash-decode attention (serial and
-  split-KV), SiLU·mul. They are checked, run in the interpreter, and are
-  lowered to MSL to run on the GPU.
-- **Host glue:** the embedding-row lookup and the RoPE tables are written by
-  the CPU, on unified memory, before each token's command buffer. Everything
-  inside the token, KV-cache append included, runs on the GPU.
-
-## Examples
-
-Rust ≥ 1.88 for everything. The Python scripts need `torch`, `numpy` and
-`tokenizers` (`pip install torch numpy tokenizers`); nothing in `cargo test`
-does.
-
-### 0. Talk to it (Metal or CUDA)
-
-```sh
-cargo run --release -p lex-rt --example serve -- --model qwen3.8:27b-mlx
+```bash
+curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{"model":"lex","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-```sh
-curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"lex","messages":[{"role":"user","content":"hello"}]}'
+Streaming, tool calls and the checkpoint's own chat template work; the
+official OpenAI client and [lex-code](https://github.com/alpibrusl/lex-code)
+drive it unmodified.
+
+```bash
+cargo test --workspace                                   # any host; GPU suites need --release
+python3 scripts/lex_vs_ollama.py --model llama3.1:8b     # tokens and log-probs against Ollama
+GCP_PROJECT=<project> scripts/gcp/nvidia_test.sh         # the suite on an NVIDIA L4, VM deleted after
 ```
 
-An OpenAI-compatible endpoint: `GET /v1/models`, `POST
-/v1/chat/completions`, streaming and not. The official OpenAI Python
-client drives it unmodified, which is the point — an agent can use this
-without knowing what is behind it. So does
-[lex-llm](https://github.com/alpibrusl/lex-llm)'s agent loop, and so does
-[lex-code](https://github.com/alpibrusl/lex-code) — the coding agent runs a
-task here end to end, calling its own tools, against these kernels.
-
-Tool calling works: `tools` are rendered into the prompt, a `<tool_call>`
-reply comes back as OpenAI `tool_calls` with `finish_reason: "tool_calls"`,
-and the `<think>` block is split into `reasoning_content` so it neither
-pollutes the reply nor hides a call. Arguments are typed from the tool's
-own schema, because the model writes `17` and only the schema knows whether
-that was a number or a zip code.
-
-The chat template is the load-bearing part and it is not guessed:
-[`crates/lex-rt/src/chat.rs`](crates/lex-rt/src/chat.rs) is compared byte
-for byte against the template inside the checkpoint, rendered by
-[`scripts/chat_fixtures.py`](scripts/chat_fixtures.py). A wrong tool block
-does not fail loudly — it produces a model that never calls anything — so
-it is a golden test rather than an eyeball. Qwen3.8 wants
-`<function=name><parameter=k>`, not the `{"name":..,"arguments":..}` that
-earlier Qwens used.
-
-The same architecture does not mean the same prompt. MiMo-v2.6 brings its
-own template in its GGUF — no newline between turns, a one-line tool block,
-tool results as their own `tool` turn, arguments as JSON — and the server
-picks the template from the model file, refusing a GGUF whose template it
-has not written out rather than handing it Qwen's.
-
-Both templates' fixtures render through transformers' Jinja environment,
-not plain jinja2, because the two define `tojson` differently: plain
-Jinja sorts keys and escapes `' < > &` and non-ASCII, transformers' keeps
-the client's order and every character as itself — and transformers' is
-the one the training data went through. Rendering Qwen3.8's tools the
-plain way had cost 55 extra tokens (390 against 335) on one tool whose
-description said "don't" and "<pattern>". Against Ollama, the prompt token counts agree exactly on
-plain, system, tool, non-ASCII and tool-history prompts, and a
-call → result → answer loop runs end to end. A call's arguments go back to
-the client as the model wrote them, so the history it returns prints back
-byte for byte.
-
-One request at a time, deliberately: there is one GPU and a 14.5 GB model
-on it, so a second caller queues rather than interleaving two sequences
-through one KV cache. `--port`, `--max-seq` and `--depth` are the knobs.
-
-**It keeps the prefix.** An agent resends its whole history every turn —
-measured at 83–100% shared with the turn before, 92% overall — so the
-server resumes from the furthest point it has already read instead of
-re-reading it. The 16 attention layers need nothing kept, their KV cache
-is indexed by position; the 48 gated-delta layers compress their whole
-prefix into one evolving state with nothing to index into, so reuse means
-having kept a copy. Checkpoints sit at turn boundaries, because that is
-where the next prompt diverges: the harness re-renders the assistant turn
-it just received. 151 MB each, six kept, 0.4 ms to take.
-
-On one lex-code task, same binary, `LEX_NO_PREFIX_CACHE=1` for the
-ablation:
-
-| | prefill tokens | wall clock |
-| --- | --- | --- |
-| cache off | 35,972 | 16:00 |
-| cache on | 12,870 | 9:14 |
-
-Two of those three turns skipped 83% and 98% of their prefill; the first
-is a cold start and cannot. Longer runs amortise it further.
-
-The tokenizer comes from the checkpoint's own `tokenizer.json` in the
-Ollama store — byte-level BPE, written from the format because this
-repository is EUPL-1.2 and the reference tokenizers are Apache-2.0.
-`cargo test -p lex-rt --test tokenizer` holds it to the reference's exact
-output on twenty awkward cases, which is the only thing that makes
-"written from the format" mean anything.
-
-### 1. A real model, against Ollama (Metal or CUDA)
-
-```sh
-ollama pull llama3.1:8b                            # or llama3.2:1b (1.3 GB)
-python3 scripts/lex_vs_ollama.py --model llama3.1:8b
-```
-
-It tokenises each prompt the way Ollama does and greedy-decodes it with lex
-on the GPU. It asks Ollama for the same continuation, then compares every
-token and every top-5 log-probability. On `llama3.1:8b`:
-
-```text
-'The capital of France is'
-  lex    : ' a city of grandeur and beauty, with a rich history and culture that is reflected in its stunning architecture, world-class'
-  24/24 tokens identical to Ollama, worst |dlogprob| 0.0202 (tolerance 0.1)  PASS
-  lex decode 33.9 tok/s on the GPU
-
-'def fibonacci(n):'
-  lex    : ' \n    if n <= 0: \n        return "Input should be a positive integer" \n    elif n =='
-  24/24 tokens identical to Ollama, worst |dlogprob| 0.0828 (tolerance 0.1)  PASS
-  lex decode 64.3 tok/s on the GPU
-  ...
-```
-
-In this run the first prompt measured slower than the other three, which
-settled at ~63–64 tok/s against Ollama's ~88. That outlier isn't explained
-yet (it didn't show up in the previous run), so it's shown as measured.
-
-The weights are the GGUF blob in Ollama's own store, found through its
-manifest; there is no conversion step. `--prompt "..."` and `--steps N` take
-your own prompts.
-
-There are two more pieces, and neither needs Ollama running at test time:
-- `scripts/llama_ref.py --model <tag>` checks a float32 PyTorch reference
-  against Ollama. It writes that reference's outputs as a golden file.
-- `cargo test --release -p lex-rt --test llama_ollama` checks lex on the GPU
-  against the golden for each model that is pulled. It takes about 12 s for
-  the 8B.
-  [`docs/P2.md`](docs/P2.md) has the full chain.
-
-### 2. Bandwidth on the GPU (Mac only)
-
-```sh
-cargo run --release -p lex-bench
-```
-
-```text
-device : Apple M4 Max (unified memory, 32768 B threadgroup, 55.7 GB recommended working set)
-target : apple-m-series (simd 32, 1024 threads/tg, 32768 B threadgroup)
-
-kernel          ideal bytes         time       GB/s    % of copy
-copy_f32           536.9 MB     1.207 ms      444.9       100.0%
-rmsnorm_f32        536.9 MB     1.253 ms      428.5        96.3%
-
-exit test : rmsnorm at 96.3% of the copy ceiling (need >= 90.0%)  PASS
-            max rel err 1.42e-6 (tolerance 1e-5)  PASS
-```
-
-`--dtype f16`, `--rows`, `--cols`, `--mib`, `--iters` and `--repeats` all
-move; `--help` lists them. `--emit` prints the generated MSL instead, and works
-on any host.
-
-### 3. Benchmark against PyTorch (Mac only)
-
-```sh
-python3 scripts/bench_vs_pytorch.py              # f32
-python3 scripts/bench_vs_pytorch.py --dtype f16  # takes the lex-bench flags too
-```
-
-It runs `lex-bench` and the PyTorch MPS equivalents on the same shapes. Both
-are timed the same way (`iters` back-to-back calls, synchronise, fastest of
-`repeats` batches), and both use the same ideal-bytes accounting. It also
-checks that the two PyTorch paths agree. On an M4 Max:
-
-```text
-kernel                    lex GB/s  torch GB/s  lex / torch
-copy_f32                      433.8       437.2         0.99x
-rmsnorm_f32                   422.7       433.3         0.98x
-rmsnorm_f32 (eager)           422.7        67.3         6.28x
-
-copy_f16                      453.9       445.2         1.02x
-rmsnorm_f16                   444.5       452.4         0.98x
-rmsnorm_f16 (eager)           444.5        27.4        16.24x
-flash_decode_f16               23.4       379.5         0.06x
-flash_decode_f16 (gqa)         23.4        12.5         1.88x
-```
-
-How to read the rows:
-- **`rmsnorm`** is PyTorch's fused `F.rms_norm`. Parity is the expected result
-  for a bandwidth-bound op, and it is the comparison that matters.
-- **`(eager)`** is the textbook expression most model code runs: upcast,
-  square, mean, rsqrt and multiply, one kernel each.
-- **`flash_decode_f16`** uses Llama-3-8B's decode shape (batch 4, seq 4096; set
-  with `--batch` / `--seq`) and compares against SDPA on the same grouped
-  layout. That is the fair comparison, and lex loses it by about 16× for now:
-  one threadgroup per KV head, serial K/V streaming, conservative barriers.
-  [`docs/P2.md`](docs/P2.md) says what P3 changes.
-- **`flash_decode_f16 (gqa)`** is SDPA with `enable_gqa=True`. It is slower on
-  MPS, so it would flatter lex. It is shown so nobody quotes it by mistake.
-
-Expect a few percent of run-to-run noise either way.
-
-### 4. Flash-attention decode vs PyTorch (any host)
-
-```sh
-cargo run -p lex-front --example flash_decode
-```
-
-It builds one algorithm under three schedules and checks each against three
-target tables. It runs every schedule in the interpreter and compares against
-PyTorch's `scaled_dot_product_attention`:
-
-```text
-metal: bq 8, bk 32, 2 stages
-  apple-m-series   ok       32768 B threadgroup, 18 borrows, 0 dups
-                           warning: apple-m-series has no async copy engine; ...
-  nvidia-hopper    ok       32768 B threadgroup, 18 borrows, 0 dups
-  amd-cdna3        ok       32768 B threadgroup, 18 borrows, 0 dups
-  interpreter vs PyTorch SDPA: max rel err 1.02e-5
-
-hopper: bq 16, bk 128, 3 stages
-  apple-m-series   REJECT  Budget: peak threadgroup footprint is 196608 B; apple-m-series allows 32768 B
-  nvidia-hopper    ok      196608 B threadgroup, 27 borrows, 0 dups
-  amd-cdna3        REJECT  Budget: peak threadgroup footprint is 196608 B; amd-cdna3 allows 65536 B
-  interpreter vs PyTorch SDPA: max rel err 1.84e-5
-
-ws: producer + 2 consumer warpgroups, bk 128, 3 stages
-  apple-m-series   REJECT  Target: apple-m-series has no split barriers: ...
-  nvidia-hopper    ok      196608 B threadgroup, 24 borrows, 0 dups
-                           pipe: 3 slots, full barrier 1 arrival + 65536 B tx, empty barrier 2 arrivals, 288 threads
-  amd-cdna3        REJECT  Target: amd-cdna3 has no split barriers: ...
-  interpreter vs PyTorch SDPA: max rel err 1.84e-5
-```
-
-To read a program:
-
-```sh
-cargo run -p lex-front --example flash_decode -- --ir ws   # or metal, hopper
-```
-
-The PyTorch output is checked in, so this and `cargo test` need no Python. To
-regenerate it, run `scripts/flash_decode_golden.py`. It rebuilds the inputs from
-the same xorshift pattern the Rust side uses, and writes only SDPA's output:
-
-```sh
-python3 scripts/flash_decode_golden.py
-```
-
-### 5. Flash decode on the GPU (Mac only)
-
-```sh
-cargo run --release -p lex-bench -- --flash    # --batch, --seq, --emit
-```
-
-```text
-flash decode: 32 threadgroups x 128 threads, 18432 B threadgroup, 67.2 MB per step
-
-device : Apple M4 Max
-shape  : batch 4 x 8 kv heads x 4 q heads, head dim 128, seq 4096, f16
-kernel : 32 threadgroups x 128 threads, 18432 B threadgroup (16384 tiles + 2048 scratch), 34 barrier sites
-
-kernel              ideal bytes         time       GB/s    % of copy
-copy_f16               268.4 MB     0.574 ms      467.6       100.0%
-flash_decode_f16        67.2 MB     2.864 ms       23.5         5.0%
-
-correct : max rel err 8.21e-6 vs f64 reference (tolerance 1e-4)  PASS
-```
-
-The kernel is the same `lex-front` flash-decode program as example 4, with a
-grid of one instance per (sequence, KV head), lowered by
-`lex_msl::program::lower`. `--emit` prints the MSL, and
-`cargo test -p lex-metal --test flash_gpu` checks it against PyTorch on the
-GPU.
-
-### 6. Tests (any host, including Linux CI)
-
-```sh
-cargo test --workspace
-```
-
-This covers the IR, planner, emitter goldens (the lowered flash kernel
-included) and reference, plus these suites:
-- lex-front `flash`: schedules × targets, against PyTorch;
-- lex-front `roles`: warp specialisation, run under many thread
-  interleavings;
-- lex-front `linearity`: every checker rule rejecting the bug it exists for,
-  one diagnostic each;
-- lex-metal `flash_gpu`: the lowered kernel on the GPU, against PyTorch.
-  This one needs macOS; CI's paravirtualised device is enough.
-- lex-metal `llama_kernels_gpu`: every Llama kernel on the GPU against the
-  interpreter, at real sizes and in every weight layout.
-- lex-rt `llama_ollama`: Llama 3.2 1B and Llama 3.1 8B on the GPU against
-  the Ollama-checked reference, fed four ways (token by token, prefill in 4s
-  and 16s, batched verify).
-- lex-rt `qwen_golden`: Qwen3.8-27B against its f32 reference, plus the
-  batched, prefill, split-KV and speculative paths against the serial ones.
-  It passes on Metal and on an NVIDIA L4.
-- lex-rt `tokenizer`: byte-level BPE against the reference tokenizer's exact
-  output.
-
-  The GPU suites need a device and the models pulled; for any model missing
-  they print `SKIPPED`. Run them with `--release`: in a debug build they take
-  many minutes. `scripts/linux_check.sh` type-checks and lints the
-  Linux-only code in a container, because `lex-cuda`'s device module is not
-  compiled on macOS at all.
-
-### 7. Ollama's baseline, here or on an NVIDIA GPU in the cloud
-
-```sh
-python3 scripts/ollama_bench.py --model llama3.1:8b          # decode and prefill at 0/512/1440 context
-GCP_PROJECT=<project> scripts/gcp/nvidia_test.sh              # same, plus the test suite, on an L4 in europe-west4
-```
-
-On this M4 Max, Ollama decodes the 8B at 86/84/82 tok/s (0/512/1,440
-positions) and prefills at ~900 tok/s. The 1B decodes at 263–266 tok/s and
-prefills at 5,300–6,200 tok/s. The cloud script creates the VM, runs the
-workspace tests and the same benchmark on the GPU, copies the results home,
-and deletes the VM. [`docs/cloud.md`](docs/cloud.md) covers GPUs, EU zones,
-quota and the cost guard rails. `QWEN=1` also fetches and runs
-Qwen3.8-27B there — `ollama pull` refuses an MLX build on Linux, so
-`scripts/ollama_fetch.py` takes the blobs from the registry directly,
-which is a client-side check rather than a registry one and `lex-rt` reads
-the store without asking Ollama to run anything.
-
-## Layering
-
-```text
-  Kernel            what to compute. No target anywhere in it.
-    + Target        the hardware table. Data, not code.
-    = Plan          launch geometry, memory budget, derived constants.
-      -> backend    emits source from (Kernel, Plan).
-```
-
-`Plan` is a separate value on purpose. In P0 the planner computes it from two
-constants; in P3 it searches for it. Nothing above or below has to change shape
-for that to happen — which is the algorithm/schedule split from the design doc,
-in its smallest possible form.
-
-| Crate | Responsibility | Builds off a Mac |
-| --- | --- | --- |
-| `lex-ir` | Tile IR, target table (Apple, Hopper, CDNA3), planner, CPU reference | yes |
-| `lex-front` | Typed tile programs: linearity, effect and pipe-protocol checker; concurrent reference interpreter | yes |
-| `lex-msl` | MSL emission for P0 kernels; lowering of `lex-front` programs; golden files | yes |
-| `lex-metal` | Compile, allocate, dispatch, time | **no** |
-| `lex-cuda` | The same, on NVIDIA: NVRTC, driver API via `dlopen`, no link-time dependency on a driver | yes (device path is Linux-only) |
-| `lex-bench` | Harness: emit, verify, measure (`--flash` for decode attention) | yes (device path gated) |
-| `lex-rt` | Runtime: GGUF and safetensors readers, Q8_0/Q4_K/Q6_K/NVFP4/PQ2_0/PTQ1_0 repacking, Llama and Qwen decode loops, tokenizer, OpenAI-compatible server | yes (device paths gated) |
-
-That boundary is load-bearing. Everything except device dispatch is ordinary
-Rust with tests, so the compiler can be developed anywhere and only the numbers
-need the Mac.
-
-## Golden files
-
-`crates/lex-msl/tests/golden/*.metal` are the emitter's committed output. They
-are the only readable artifact the backend produces, and on a host with no Metal
-compiler they are the strongest available signal. After an intentional change:
-
-```sh
-LEX_BLESS=1 cargo test -p lex-msl
-```
-
-Read the diff before committing it.
-`crates/lex-front/tests/data/*.f32` is PyTorch output (see example 3).
-
-## Not built yet
-
-- **Layouts in the type:** no swizzle or MMA-fragment layouts are checked yet.
-- **Most of the surface syntax:** `.lx` parses algorithms, elementwise and
-  reduction ops, and schedules with `threads` and `chunk` — enough for
-  `rmsnorm` and `silu_mul`. Loops, index arithmetic and layouts are not
-  parsed, so the matvec, attention and the gated-delta recurrence are
-  still built through the Rust IR API. The measurement that most wants a
-  schedule block — rows per simdgroup, 1 on Apple and 2 on Ada — is still
-  a constant in the target table.
-- **Fast lowering:** simdgroup matrices, split-K decode and minimal barriers
-  are P3.
-- **Around the model:** the embedding lookup and KV append as kernels (host
-  glue today), paged KV, sampling beyond greedy, and batched prefill.
-- **Other parts of the design:** quantised formats, a graph compiler, MLIR.
-
-[`docs/P1.md`](docs/P1.md) lists exactly what the type system does and does not
-cover yet.
+More examples, benchmarks against PyTorch, and how to read the numbers:
+[`docs/guide.md`](docs/guide.md).
+
+## Crates
+
+| Crate | What it is |
+| --- | --- |
+| `lex-ir` | Tile IR, target table (Apple, Hopper, Ada, CDNA3), planner, CPU reference |
+| `lex-front` | Typed tile programs and the `.lx` surface; the linearity, effect and pipe checker; reference interpreter |
+| `lex-msl` | Lowering to MSL and CUDA C; hand-scheduled GEMM, chunked gated-delta and int16 matvec kernels |
+| `lex-metal` | Metal: compile, allocate, dispatch, time |
+| `lex-cuda` | CUDA: NVRTC and the driver API through `dlopen`, no link-time dependency on a driver |
+| `lex-rt` | Runtime: GGUF and safetensors, quantised formats, Llama and Qwen loops, speculation, tokenizer, server |
+| `lex-bench` | Emit, verify, measure |
+
+## Docs
+
+[`design.md`](docs/design.md) — the language and the type system.
+[`roadmap.md`](docs/roadmap.md) — the plan.
+[`roadmap-weeks.md`](docs/roadmap-weeks.md) — the measurement log.
+[`guide.md`](docs/guide.md) — examples and details.
+[`cloud.md`](docs/cloud.md) — running on NVIDIA in the cloud.
 
 ## Licence
 
-Copyright © 2026 Alfonso Sastre
-
-Licensed under the EUPL, Version 1.2 — see [`LICENSE`](LICENSE).
-
-The EUPL is copyleft: a derivative work must be released under the EUPL or one
-of the compatible licences in its Appendix (GPL, AGPL, LGPL, MPL-2.0, EPL,
-OSL, CeCILL, LiLiQ). Apache-2.0 and MIT are *not* on that list, so code from
-Apache- or MIT-licensed projects cannot be copied into this one, and this code
-cannot be vendored into an Apache-2.0 project. Everything here is written from
-the published behaviour of other kernels, not from their source.
+Copyright © 2026 Alfonso Sastre. Licensed under the EUPL, Version 1.2 —
+see [`LICENSE`](LICENSE). The EUPL is copyleft, and Apache-2.0 and MIT are
+not among its compatible licences: code from Apache- or MIT-licensed
+projects cannot be copied into this one, and this code cannot be vendored
+into an Apache-2.0 project. Everything here is written from the published
+behaviour of other kernels, not from their source.

@@ -142,6 +142,13 @@ pub trait Dialect {
         false
     }
 
+    /// One `ty` read from device memory at the address of `lvalue`: how a
+    /// wide load is spelled. CUDA reinterprets a pointer; Metal's pointers
+    /// carry an address space, and a cast that drops it does not compile.
+    fn vector_load(&self, ty: &str, lvalue: &str) -> String {
+        format!("*(const device {ty} *)(&{lvalue})")
+    }
+
     /// The NVFP4 decode helpers, when a kernel dequantises four-bit
     /// weights.
     ///
@@ -293,6 +300,10 @@ impl Dialect for Cuda {
 
     fn wide_loads(&self) -> bool {
         true
+    }
+
+    fn vector_load(&self, ty: &str, lvalue: &str) -> String {
+        format!("*reinterpret_cast<const {ty}*>(&{lvalue})")
     }
 
     fn shuffle(&self, value: &str, src: &str) -> String {

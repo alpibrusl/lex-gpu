@@ -18,6 +18,12 @@ fail=0
 step() { echo; echo "=== $*"; }
 
 step "waiting for the NVIDIA driver"
+# The pre-built image carries the driver already; with no module for the
+# kernel it booted there is nothing to wait for, only GPU time to lose.
+if [ -d "$HOME/lex-target" ] && ! find "/lib/modules/$(uname -r)" -name 'nvidia.ko*' | grep -q .; then
+  echo "no NVIDIA module for kernel $(uname -r) in the pre-built image; rebuild it (build_image.sh)"
+  exit 1
+fi
 for i in $(seq 1 90); do nvidia-smi >/dev/null 2>&1 && break; sleep 10; done
 nvidia-smi | tee "$R/nvidia-smi.txt" || { echo "no NVIDIA driver after 15 min"; exit 1; }
 { lscpu | head -20; nvcc --version 2>/dev/null || ls /usr/local | grep -i cuda; } > "$R/machine.txt"
@@ -31,11 +37,45 @@ if ! command -v cc >/dev/null; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential
 fi
 cc --version | head -1 | tee -a "$R/machine.txt"
+# A non-interactive shell does not read the profile that puts cargo on the
+# PATH, so without this the pre-built image's toolchain looked absent and
+# the installer ran again on every run.
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 if ! command -v cargo >/dev/null; then
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
 fi
 . "$HOME/.cargo/env"
 rustc --version | tee -a "$R/machine.txt"
+# A pre-built image (build_image.sh) carries a release build here; building
+# into it recompiles only what changed since, not the whole workspace.
+# Cargo decides by modification time, and `git archive` stamps every file
+# with the commit's time -- newer than the image's build, so all of it
+# would look changed. Files whose contents match the ones the image was
+# built from are put back in the past; the rest keep their new time.
+if [ -d "$HOME/lex-target" ]; then
+  export CARGO_TARGET_DIR="$HOME/lex-target"
+  if [ -f "$HOME/lex-src.sha256" ]; then
+    sha256sum -c "$HOME/lex-src.sha256" 2>/dev/null | sed -n 's/: OK$//p' |
+      xargs -r -d '\n' touch -d 2000-01-01
+  fi
+  echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR (pre-built)" | tee -a "$R/machine.txt"
+fi
+
+# JOB: one command, and nothing else (nvidia_test.sh copied it to
+# ~/job.sh). The driver and the toolchain above are all it needs; the
+# pre-built image already holds the release build and qwen3.8.
+if [ -n "${JOB:-}" ]; then
+  step "job"
+  export OLLAMA_MODELS="$HOME/.ollama/models"
+  # The service would keep whatever it last served on the GPU.
+  sudo systemctl stop ollama 2>/dev/null || true
+  cat "$HOME/job.sh"
+  nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader | tee -a "$R/machine.txt"
+  bash -e -o pipefail "$HOME/job.sh" 2>&1 | tee "$R/job.log"
+  status=${PIPESTATUS[0]}
+  echo "=== job exit $status"
+  exit "$status"
+fi
 
 # SPEED=1 is for a question about speed: it skips everything that checks
 # correctness or measures Ollama, which is most of an hour, and keeps the
@@ -43,7 +83,17 @@ rustc --version | tee -a "$R/machine.txt"
 # whether the numbers it times are right -- run without it for that.
 if [ -z "${SPEED:-}" ]; then
 step "workspace tests (frontend, interpreter, emitters)"
-cargo test --release --workspace 2>&1 | tee "$R/cargo-test.log" | grep -E "test result|FAILED|panicked"
+# The Qwen goldens take 17-25 minutes on an L4, and with QWEN=1 the step
+# below runs them anyway. They used to skip here for want of the model;
+# the pre-built image carries it, and one run paid for them twice.
+skip=()
+if [ -n "${QWEN:-}" ]; then
+  for t in $(cargo test --release -p lex-rt --test qwen_golden -- --list 2>/dev/null | sed -n 's/: test$//p'); do
+    skip+=(--skip "$t")
+  done
+  echo "the Qwen goldens (${#skip[@]} args) run in the QWEN step, not here"
+fi
+cargo test --release --workspace -- --exact "${skip[@]}" 2>&1 | tee "$R/cargo-test.log" | grep -E "test result|FAILED|panicked"
 [ "${PIPESTATUS[0]}" = 0 ] || fail=1
 
 step "CUDA backend"

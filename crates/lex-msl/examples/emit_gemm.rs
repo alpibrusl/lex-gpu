@@ -1,11 +1,12 @@
-//! Write the CUDA form of the prefill GEMM and the int8 matmul at Qwen3.8's
-//! shapes, so
+//! Write the CUDA form of the prefill GEMM, the int8 matmul and the chunked
+//! delta rule at Qwen3.8's shapes, so
 //! `scripts/cuda_check.sh` can compile it -- nvcc, ptxas and NVRTC -- on a
 //! machine with no NVIDIA GPU.
 //!
 //!     cargo run -p lex-msl --example emit_gemm -- out/
 //!     scripts/cuda_check.sh out/gemm_*.cu
 
+use lex_msl::delta::{DeltaChunk, delta_chunked};
 use lex_msl::gemm::{Backend, Gemm, gemm_nvfp4};
 use lex_msl::int8::{matmul_int8, quant16};
 
@@ -51,6 +52,24 @@ fn main() -> Result<(), String> {
             l.entry, l.grid, l.grid2, l.threadgroup_bytes
         );
     }
+    // A 128-token prefill chunk of Qwen3.8's gated delta rule: 48 value
+    // heads of 128 x 128, v after the queries and keys in a 10240-wide row.
+    let l = delta_chunked(
+        &DeltaChunk {
+            tokens: 128,
+            v_heads: 48,
+            k_dim: 128,
+            v_dim: 128,
+            v_base: 4096,
+            v_width: 10240,
+        },
+        Backend::Cuda,
+    )?;
+    std::fs::write(format!("{dir}/{}.cu", l.entry), &l.source).map_err(|e| e.to_string())?;
+    println!(
+        "{}: {} x {} blocks, {} B shared",
+        l.entry, l.grid, l.grid2, l.threadgroup_bytes
+    );
     for l in [
         quant16(1, 5120, false)?,
         quant16(3, 17408, true)?,

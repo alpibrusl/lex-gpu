@@ -117,6 +117,22 @@ fn the_gemm_matches_the_matmul_it_replaces() {
             residual: true,
             x_half: false,
         },
+        // Past 64 tokens the tile is 64 tall: ragged in both directions.
+        Gemm {
+            m: 100,
+            n: 132,
+            k: 512,
+            residual: true,
+            x_half: true,
+        },
+        // A reduction that is not whole steps of 64 falls back to 32.
+        Gemm {
+            m: 70,
+            n: 64,
+            k: 96,
+            residual: false,
+            x_half: false,
+        },
     ] {
         // With half activations the match is exact, not close: an f16 input
         // times a dequantised NVFP4 weight has few enough significant bits

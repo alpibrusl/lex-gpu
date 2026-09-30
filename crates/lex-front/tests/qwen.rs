@@ -3,8 +3,8 @@
 use lex_front::qwen::{
     DeltaNet, build_conv_silu, build_conv_silu_rows, build_conv_silu_rows_snap, build_delta_qk,
     build_delta_qk_rows, build_delta_qk_rows_in, build_gated_norm, build_gated_norm_rows,
-    build_gates, build_gates_rows, build_matvec_dense, build_qk_rope, build_qk_rope_rows,
-    copy_block, reference,
+    build_gates, build_gates_rows, build_matvec_dense, build_matvec_dense_rows, build_qk_rope,
+    build_qk_rope_rows, copy_block, reference,
 };
 use lex_front::{Tensor, check, run};
 use lex_ir::reference::fill_pattern_f32;
@@ -821,5 +821,96 @@ fn the_value_head_orders_pair_each_head_with_a_different_key() {
     assert_ne!(
         grouped, tiled,
         "the two orders paired every head the same way"
+    );
+}
+
+/// The batched q/k normalisation, gates and dense matvec spread a batch
+/// over its tokens on a second grid dimension; one token keeps its own
+/// schedule. Each token's arithmetic is the same either way, so a batch
+/// lands exactly where its tokens land one at a time.
+#[test]
+fn batched_small_kernels_land_where_one_token_lands() {
+    let t = 5usize;
+    let target = Target::apple_m_series();
+    // Run `batch` once over all of `inputs`, and `one` once per token over
+    // each token's slice; compare every output. `rows[i]` is how many
+    // elements param `i` holds per token.
+    let same = |name: &str,
+                batch: lex_front::Program,
+                one: lex_front::Program,
+                rows: &[usize],
+                fixed: &[bool],
+                out: &[usize]| {
+        check(&batch, &target).unwrap_or_else(|e| panic!("{name}: {e:#?}"));
+        let mut all: Vec<Tensor> = batch
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let n: usize = p.shape.iter().product();
+                let data = if out.contains(&i) {
+                    vec![0.0; n]
+                } else {
+                    pattern(n, 40 + i as u32)
+                };
+                Tensor::new(p.dtype, &p.shape, &data)
+            })
+            .collect();
+        let inputs = all.clone();
+        run(&batch, &mut all).expect("batch");
+        for tok in 0..t {
+            let mut each: Vec<Tensor> = one
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let n: usize = p.shape.iter().product();
+                    let data = if out.contains(&i) {
+                        vec![0.0; n]
+                    } else if fixed[i] {
+                        inputs[i].data.clone()
+                    } else {
+                        inputs[i].data[tok * rows[i]..(tok + 1) * rows[i]].to_vec()
+                    };
+                    Tensor::new(p.dtype, &p.shape, &data)
+                })
+                .collect();
+            run(&one, &mut each).expect("one");
+            for &o in out {
+                let got = &all[o].data[tok * rows[o]..(tok + 1) * rows[o]];
+                assert_eq!(got, &each[o].data[..], "{name}: token {tok}, param {o}");
+            }
+        }
+    };
+
+    let (hk, per, dk) = (2usize, 3usize, 16usize);
+    let width = 2 * hk * dk + 8;
+    for tiled in [false, true] {
+        same(
+            "delta_qk",
+            build_delta_qk_rows_in(t, hk, per, dk, width, hk * dk, 0.25, 1e-6, tiled).unwrap(),
+            build_delta_qk_rows_in(1, hk, per, dk, width, hk * dk, 0.25, 1e-6, tiled).unwrap(),
+            &[width, hk * per * dk],
+            &[false, false],
+            &[1],
+        );
+    }
+    let (hv, dv) = (4usize, 8usize);
+    same(
+        "gates",
+        build_gates_rows(t, hv, dv),
+        build_gates_rows(1, hv, dv),
+        &[hv, hv, 0, 0, hv * dv, hv * dv],
+        &[false, false, true, true, false, false],
+        &[4, 5],
+    );
+    let (n_in, n_out) = (32usize, 6usize);
+    same(
+        "dense",
+        build_matvec_dense_rows(t, n_in, n_out, 2, DType::F32, DType::F32).unwrap(),
+        build_matvec_dense_rows(1, n_in, n_out, 2, DType::F32, DType::F32).unwrap(),
+        &[n_in, 0, n_out],
+        &[false, true, false],
+        &[2],
     );
 }

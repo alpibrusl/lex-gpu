@@ -17,6 +17,16 @@ and at the model's own sampling defaults, for N decode tokens.
 
 Prose, not random words: a model that speculates accepts more of noise
 than of text, so random words flatter the decode of both engines.
+
+The same prompt, token for token. lex renders Qwen3.8's own chat template,
+which opens with a "Reasoning effort is set to xhigh" system turn unless
+the request says otherwise; the Ollama this was measured against (0.34.4)
+renders no such turn -- 40 prompt tokens against lex's 82 for the prompt
+below. The model then writes different text (terse notes under xhigh, an
+outline without it), and a draft head predicts one far better than the
+other, so the decode speeds were of different tasks. lex is asked for
+`reasoning_effort: medium`, which renders exactly what Ollama does; the
+prompt token counts are printed and a mismatch is flagged.
 """
 import json, statistics, sys, time, urllib.request
 
@@ -37,13 +47,19 @@ def main():
     reps = int(sys.argv[4]) if len(sys.argv) > 4 else 3
     lex = f"http://localhost:{port}/v1/chat/completions"
     msgs = [{"role": "user", "content": PROMPT}]
-    post(lex, {"model": "lex", "messages": msgs, "max_tokens": 8})
+    effort = {"reasoning_effort": "medium"}
+    j, _ = post(lex, {"model": "lex", "messages": msgs, "max_tokens": 8, **effort})
+    k, _ = post("http://localhost:11434/api/chat",
+                {"model": model, "messages": msgs, "stream": False, "options": {"num_predict": 1}})
+    ours_p, theirs_p = j["usage"]["prompt_tokens"], k["prompt_eval_count"]
+    print(f"prompt tokens: lex {ours_p}, ollama {theirs_p}"
+          + ("" if ours_p == theirs_p else "  -- MISMATCH: not the same prompt"), flush=True)
 
     for mode, samp in [("greedy", {"temperature": 0}), ("sampled", {})]:
         ours = []
         for rep in range(reps):
-            _, t1 = post(lex, dict(samp, model="lex", messages=msgs, max_tokens=1, seed=rep))
-            j, t2 = post(lex, dict(samp, model="lex", messages=msgs, max_tokens=n + 1, seed=rep))
+            _, t1 = post(lex, dict(samp, model="lex", messages=msgs, max_tokens=1, seed=rep, **effort))
+            j, t2 = post(lex, dict(samp, model="lex", messages=msgs, max_tokens=n + 1, seed=rep, **effort))
             ours.append((j["usage"]["completion_tokens"] - 1) / (t2 - t1))
         theirs = []
         for rep in range(reps):
