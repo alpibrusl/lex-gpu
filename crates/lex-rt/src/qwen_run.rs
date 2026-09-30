@@ -686,8 +686,11 @@ mod gpu {
         kv_k: Pipeline,
         kv_v: Pipeline,
         attn: Pipeline,
-        attn_split: Pipeline,
-        attn_combine: Pipeline,
+        /// Split-KV attention, only for a batch that can split (`split_attn`):
+        /// unrolled over every token, a prefill chunk's took most of the
+        /// minute-plus a new cache size spent compiling, and never ran.
+        attn_split: Option<Pipeline>,
+        attn_combine: Option<Pipeline>,
         mul: Pipeline,
         silu: Pipeline,
         /// The batch's last row of the residual into the decode step's
@@ -1825,7 +1828,9 @@ mod gpu {
             if split_attn(t, nsplit) {
                 d.push((
                     "mtp attention",
-                    &k.attn_split,
+                    k.attn_split
+                        .as_ref()
+                        .expect("split_attn: a batch that splits has them"),
                     vec![
                         &a.q16,
                         &at.kcache,
@@ -1839,7 +1844,9 @@ mod gpu {
                 ));
                 d.push((
                     "mtp attention",
-                    &k.attn_combine,
+                    k.attn_combine
+                        .as_ref()
+                        .expect("split_attn: a batch that splits has them"),
                     vec![
                         &a.part_m,
                         &a.part_l,
@@ -2520,8 +2527,12 @@ mod gpu {
                         compile(gpu, &attn.build_causal_blocks(t, attn_tq(t))?, 128)?
                     }
                 },
-                attn_split: compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128)?,
-                attn_combine: compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128)?,
+                attn_split: (t <= MAX_BATCH)
+                    .then(|| compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128))
+                    .transpose()?,
+                attn_combine: (t <= MAX_BATCH)
+                    .then(|| compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128))
+                    .transpose()?,
                 mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
                 silu: compile(
                     gpu,
@@ -2819,7 +2830,9 @@ mod gpu {
                         if split_attn(t, nsplit) {
                             d.push((
                                 "attention",
-                                &k.attn_split,
+                                k.attn_split
+                                    .as_ref()
+                                    .expect("split_attn: a batch that splits has them"),
                                 vec![
                                     &a.q16,
                                     &at.kcache,
@@ -2833,7 +2846,9 @@ mod gpu {
                             ));
                             d.push((
                                 "attention",
-                                &k.attn_combine,
+                                k.attn_combine
+                                    .as_ref()
+                                    .expect("split_attn: a batch that splits has them"),
                                 vec![
                                     &a.part_m,
                                     &a.part_l,
