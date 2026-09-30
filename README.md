@@ -18,7 +18,7 @@ Decode, tok/s, against Ollama on the same machine:
 | Model | Hardware | lex | Ollama |
 | --- | --- | --- | --- |
 | `maternion/mimo-v2.6:9b` | M4 Max, greedy / sampled | **74.6 / 73.4** | 66.9 / 62.0 |
-| `qwen3.8:27b-mlx` | M4 Max, speculating, greedy / sampled | 39.4 / 42.4 | 57.1 / 53.4 |
+| `qwen3.8:27b-mlx` | M4 Max, speculating, greedy / sampled | 46.3 / 45.1 | 58.0 / 53.8 |
 | `llama3.1:8b` | M4 Max | 79.2 | 86.0 |
 | `llama3.2:1b` | M4 Max | 233.7 | 261.9 |
 | `llama3.2:1b` | NVIDIA L4 | 124.4 | 162.9 |
