@@ -1,5 +1,5 @@
-//! The NVFP4 matvec for a few tokens at once, for Metal: `y = x Wᵀ (+ r)`
-//! for the 2-4 tokens a speculative verify feeds.
+//! The NVFP4 matvec for one to four tokens, for Metal: `y = x Wᵀ (+ r)` for
+//! a decode step and for the 2-4 tokens a speculative verify feeds.
 //!
 //! A decode step reads the weights at the memory roof. A verify of three
 //! tokens reads the same weights once and should cost about the same; the
@@ -19,7 +19,12 @@
 //!
 //! Past four tokens the accumulators cost more than the shared read saves,
 //! and a verify never has more than four (`SPEC_MAX`), so the runtime takes
-//! this for 2-4 and the batched kernel beyond.
+//! this for 1-4 and the batched kernel beyond.
+//!
+//! At one token it is the decode matvec: 103.8 us a call against the
+//! emitted kernel's 110.3 at gate/up (97.6 against 103.9 with independent
+//! calls overlapping, which is how MLX's 96 was timed), so a decode step
+//! reads its weights at the rate MLX's does.
 //!
 //! **Hand-scheduled, like `crate::gemm`**, and for the same reason; it
 //! takes exactly the parameters `lex_front::llama::matmul_q_x` does, in the
@@ -42,15 +47,15 @@ pub struct Few {
     pub x_half: bool,
 }
 
-/// Whether `f` fits: 2-4 tokens, whole groups of 16 inputs.
+/// Whether `f` fits: 1-4 tokens, whole groups of 16 inputs.
 pub fn fits(f: &Few) -> bool {
-    (2..=4).contains(&f.tokens) && f.n > 0 && f.k > 0 && f.k.is_multiple_of(16)
+    (1..=4).contains(&f.tokens) && f.n > 0 && f.k > 0 && f.k.is_multiple_of(16)
 }
 
 pub fn matvec_few_nvfp4(f: &Few) -> Result<Lowered, String> {
     if !fits(f) {
         return Err(format!(
-            "matvec_few: {} tokens (2-4), {} inputs (whole groups of 16)",
+            "matvec_few: {} tokens (1-4), {} inputs (whole groups of 16)",
             f.tokens, f.k
         ));
     }

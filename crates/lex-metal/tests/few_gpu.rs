@@ -30,6 +30,8 @@ fn the_few_token_matvec_matches_the_matmul_it_replaces() {
     // 102 rows leave the last threadgroup (four rows) half full; 1040
     // inputs are not whole steps of 512, so lanes run out unevenly.
     for (tokens, n, k, residual, x_half) in [
+        (1, 128, 512, true, false),
+        (1, 102, 1040, false, false),
         (2, 128, 512, false, true),
         (3, 102, 1040, true, true),
         (4, 128, 512, true, false),

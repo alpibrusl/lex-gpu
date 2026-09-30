@@ -1109,6 +1109,25 @@ mod gpu {
             for key in mv_keys(&layers, &lm_head, mtp.as_ref()) {
                 if let std::collections::hash_map::Entry::Vacant(slot) = k.mv.entry(key) {
                     let (n_in, n_out, res, layout) = key;
+                    // NVFP4 on Metal: the hand-scheduled matvec
+                    // (`lex_msl::few` at one token), 6% faster than the
+                    // emitted one at the same bytes. `LEX_FEW=0` keeps the
+                    // emitted kernel.
+                    let few = lex_msl::few::Few {
+                        tokens: 1,
+                        n: n_out,
+                        k: n_in,
+                        residual: res,
+                        x_half: false,
+                    };
+                    if crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
+                        && layout == QLayout::NVFP4
+                        && lex_msl::few::fits(&few)
+                        && std::env::var("LEX_FEW").map_or(true, |v| v != "0")
+                    {
+                        slot.insert(gpu.build_lowered(&lex_msl::few::matvec_few_nvfp4(&few)?)?);
+                        continue;
+                    }
                     let p = matvec_q(n_in, n_out, bo(gpu.target()), n_in, layout, res)?;
                     slot.insert(compile(&gpu, &p, THREADS)?);
                 }
