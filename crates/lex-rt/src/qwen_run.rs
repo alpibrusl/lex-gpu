@@ -185,7 +185,7 @@ pub use gpu::{Checkpoint, MAX_BATCH, MAX_DEPTH, Runner, evict_index};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gpu {
-    use crate::sample::Sampler;
+    use crate::sample::{Nucleus, Sampler};
     use std::collections::HashMap;
 
     use crate::dev::{Buffer, Gpu, Pipeline, Step};
@@ -1368,7 +1368,7 @@ mod gpu {
             }
             let trace = std::env::var_os("LEX_SPEC_TRACE").is_some();
             let mark = std::time::Instant::now();
-            let drafts = self.draft(depth, last)?;
+            let (drafts, dists) = self.draft_with(depth, last, Some(&mut *sampler))?;
             let t_draft = mark.elapsed().as_secs_f64() * 1e3;
             if drafts.is_empty() {
                 let logits = self.step(last)?;
@@ -1403,7 +1403,8 @@ mod gpu {
             let mut kept = 0;
             let mut instead = None;
             while kept < drafts.len() {
-                match sampler.verify_draft(&logits[kept], drafts[kept]) {
+                let (qi, qp) = &dists[kept];
+                match sampler.verify_proposal(&logits[kept], drafts[kept], qi, qp) {
                     Ok(()) => kept += 1,
                     Err(t) => {
                         instead = Some(t);
@@ -1497,8 +1498,27 @@ mod gpu {
         /// [`Self::reset`] clears it. Nothing here touches the model's
         /// state, so a rejected draft costs only the time.
         pub fn draft(&mut self, depth: usize, last: u32) -> Result<Vec<u32>, String> {
+            Ok(self.draft_with(depth, last, None)?.0)
+        }
+
+        /// [`Self::draft`], each draft *drawn* from the head's distribution
+        /// under `sampler` when there is one, and that distribution (as
+        /// [`Sampler::nucleus`] gives it) returned alongside, for
+        /// [`Sampler::verify_proposal`]. Without a sampler, or with
+        /// `LEX_GREEDY_DRAFT=1`, the head's argmax and a one-point
+        /// distribution.
+        pub fn draft_with(
+            &mut self,
+            depth: usize,
+            last: u32,
+            mut sampler: Option<&mut Sampler>,
+        ) -> Result<(Vec<u32>, Vec<Nucleus>), String> {
+            if std::env::var_os("LEX_GREEDY_DRAFT").is_some() {
+                sampler = None;
+            }
+            let mut dists = Vec::with_capacity(depth);
             if self.mtp.is_none() || depth == 0 {
-                return Ok(vec![]);
+                return Ok((vec![], dists));
             }
             let c = self.cfg.clone();
             let mut h = self.spec_h.take().unwrap_or_else(|| self.hidden());
@@ -1552,14 +1572,26 @@ mod gpu {
 
                 let mut logits = vec![0.0f32; c.vocab];
                 self.gpu.download(&self.acts.logits, &mut logits);
-                tok = (0..logits.len())
-                    .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
-                    .expect("logits") as u32;
+                tok = match sampler.as_deref_mut() {
+                    Some(s) => {
+                        let (idx, p) = s.nucleus(&logits);
+                        let t = s.draw(&idx, &p);
+                        dists.push((idx, p));
+                        t
+                    }
+                    None => {
+                        let t = (0..logits.len())
+                            .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+                            .expect("logits") as u32;
+                        dists.push((vec![t], vec![1.0]));
+                        t
+                    }
+                };
                 out.push(tok);
                 // The head's own hidden state carries the next draft.
                 h = self.hidden();
             }
-            Ok(out)
+            Ok((out, dists))
         }
 
         /// The draft head's dispatches: `fc`, then one attention layer and
