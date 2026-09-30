@@ -12,6 +12,7 @@
 
 pub mod delta;
 pub mod dialect;
+pub mod few;
 pub mod gemm;
 pub mod int8;
 pub mod program;

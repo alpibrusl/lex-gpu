@@ -186,6 +186,72 @@ kernel void {entry}(
             writes: vec![false, false, false, false, true],
         }
     };
+    // All `t` tokens in one pass: each lane decodes its 16 weights once and
+    // runs them against every token's 16 inputs, one accumulator per
+    // (token, row). The weights are read once, as the batched kernel does,
+    // in the one-token structure that reads at the memory roof.
+    let multi = |r: usize, sg: usize, t: usize| -> Lowered {
+        let entry = format!("multi_{r}_sg{sg}_t{t}");
+        let source = format!(
+            r#"{pre}
+kernel void {entry}(
+    device const half *x [[buffer(0)]],
+    device const uchar *q [[buffer(1)]],
+    device const uchar *s [[buffer(2)]],
+    device const float *gs [[buffer(3)]],
+    device float *y [[buffer(4)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{{
+    const uint K = {K}u;
+    const uint row0 = (tg.x * {sg}u + sgid) * {r}u;
+    float acc[{t}][{r}];
+    for (uint j = 0; j < {t}u; ++j)
+        for (uint i = 0; i < {r}u; ++i) acc[j][i] = 0.0f;
+    for (uint p0 = lane * 16u; p0 < K; p0 += 512u) {{
+        #pragma unroll
+        for (uint i = 0; i < {r}u; ++i) {{
+            const uint row = row0 + i;
+            const uint2 w = *(const device uint2 *)(q + row * (K / 2u) + p0 / 2u);
+            const float sc = fp8_e4m3(s[row * (K / 16u) + p0 / 16u]);
+            const float2 v0 = fp4_pair(w.x & 0xFFu), v1 = fp4_pair((w.x >> 8u) & 0xFFu),
+                         v2 = fp4_pair((w.x >> 16u) & 0xFFu), v3 = fp4_pair(w.x >> 24u),
+                         v4 = fp4_pair(w.y & 0xFFu), v5 = fp4_pair((w.y >> 8u) & 0xFFu),
+                         v6 = fp4_pair((w.y >> 16u) & 0xFFu), v7 = fp4_pair(w.y >> 24u);
+            #pragma unroll
+            for (uint j = 0; j < {t}u; ++j) {{
+                const device half4 *xp = (const device half4 *)(x + j * K + p0);
+                const float4 x0 = float4(xp[0]), x1 = float4(xp[1]), x2 = float4(xp[2]), x3 = float4(xp[3]);
+                const float run = x0.x * v0.x + x0.y * v0.y + x0.z * v1.x + x0.w * v1.y
+                                + x1.x * v2.x + x1.y * v2.y + x1.z * v3.x + x1.w * v3.y
+                                + x2.x * v4.x + x2.y * v4.y + x2.z * v5.x + x2.w * v5.y
+                                + x3.x * v6.x + x3.y * v6.y + x3.z * v7.x + x3.w * v7.y;
+                acc[j][i] += run * sc;
+            }}
+        }}
+    }}
+    for (uint j = 0; j < {t}u; ++j)
+        for (uint i = 0; i < {r}u; ++i) {{
+            const float v = simd_sum(acc[j][i]);
+            if (lane == 0u) y[j * {N}u + row0 + i] = v * gs[row0 + i] * 16384.0f;
+        }}
+}}
+"#
+        );
+        Lowered {
+            entry,
+            source,
+            grid: N / (r * sg),
+            grid2: 1,
+            threads: 32 * sg,
+            threadgroup_bytes: 0,
+            arena_bytes: 0,
+            scratch_bytes: 0,
+            barriers: 0,
+            writes: vec![false, false, false, false, true],
+        }
+    };
     let mut variants: Vec<(String, Lowered, bool)> = vec![("emitted".into(), emitted, false)];
     for (r, sg, xh, lut) in [
         (1, 8, false, false),
@@ -228,8 +294,8 @@ kernel void {entry}(
             &Msl,
         )?;
         variants.push((format!("batched_t{tok}"), batched, true));
-        for (r, sg) in [(1, 8), (2, 2)] {
-            let l = rows(r, sg, true, false, tok, false);
+        for (r, sg) in [(1, 8), (1, 4), (2, 2), (2, 4), (4, 2)] {
+            let l = multi(r, sg, tok);
             variants.push((l.entry.clone(), l, true));
         }
     }

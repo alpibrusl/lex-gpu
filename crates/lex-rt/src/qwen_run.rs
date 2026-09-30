@@ -2223,6 +2223,26 @@ mod gpu {
                         slot.insert(gpu.build_lowered(&l)?);
                         continue;
                     }
+                    // A verify's 2-4 tokens on Metal: each weight decoded
+                    // once for all of them, in the one-token kernel's
+                    // structure (`lex_msl::few`) -- a verify's matvecs cost
+                    // what a step's do instead of 1.18x. `LEX_FEW=0` keeps
+                    // the batched program, to measure one against the other.
+                    let few = lex_msl::few::Few {
+                        tokens: t,
+                        n: n_out,
+                        k: n_in,
+                        residual: res,
+                        x_half: xt == DType::F16,
+                    };
+                    if crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
+                        && layout == QLayout::NVFP4
+                        && lex_msl::few::fits(&few)
+                        && std::env::var("LEX_FEW").map_or(true, |v| v != "0")
+                    {
+                        slot.insert(gpu.build_lowered(&lex_msl::few::matvec_few_nvfp4(&few)?)?);
+                        continue;
+                    }
                     let p = matmul_q_x(t, n_in, n_out, bo, n_in, layout, res, xt)?;
                     slot.insert(compile(gpu, &p, THREADS)?);
                 }
