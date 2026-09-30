@@ -12,6 +12,8 @@
 #                              baseline Llama models
 #   ~/.ollama/models           qwen3.8:27b-mlx, fetched from the registry
 #   ~/lex-src.sha256           the source the build was made from
+#   vllm/vllm-openai:nightly   a docker image, its digest in ~/vllm-image.txt
+#   ~/hf/Qwen3.8-27B-NVFP4     NVIDIA's NVFP4 checkpoint, for vLLM
 #
 # The source itself is removed at the end: every run brings its own.
 set -euo pipefail
@@ -59,6 +61,22 @@ done
 
 step "qwen3.8:27b-mlx into ~/.ollama/models"
 python3 scripts/ollama_fetch.py qwen3.8:27b-mlx --root "$HOME/.ollama/models" 2>&1 | tail -3
+
+step "vLLM and NVIDIA's NVFP4 checkpoint -- the NVIDIA reference"
+# The engine NVIDIA's model card serves this checkpoint with, as its
+# nightly container (the release wheels lag the architecture). Pulled here,
+# on a machine billed a fraction of a GPU's, and its digest kept so a result
+# says exactly which vLLM it was.
+sudo systemctl enable --now docker >/dev/null 2>&1 || true
+sudo docker pull -q vllm/vllm-openai:nightly
+sudo docker image inspect vllm/vllm-openai:nightly --format '{{index .RepoDigests 0}}' \
+  | tee "$HOME/vllm-image.txt"
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv >/dev/null
+python3 -m venv "$HOME/hfvenv"
+"$HOME/hfvenv/bin/pip" install -q huggingface_hub
+"$HOME/hfvenv/bin/hf" download nvidia/Qwen3.8-27B-NVFP4 \
+  --local-dir "$HOME/hf/Qwen3.8-27B-NVFP4" >/dev/null
+du -sh "$HOME/hf/Qwen3.8-27B-NVFP4"
 
 step "leave the disk clean"
 # What the build was made from, so a run can tell which of its files are
