@@ -73,10 +73,18 @@ if ! command -v uv >/dev/null && [ ! -x "$HOME/.local/bin/uv" ]; then
   curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
 fi
 UV="$HOME/.local/bin/uv"
+rm -rf "$HOME/vllm"
 "$UV" venv -q --python 3.12 "$HOME/vllm"
 "$UV" pip install -q --python "$HOME/vllm/bin/python" -U vllm --pre \
-  --extra-index-url https://wheels.vllm.ai/nightly --torch-backend=cu129
-"$HOME/vllm/bin/python" -c "import vllm; print('vllm', vllm.__version__)" | tee "$HOME/vllm-version.txt"
+  --extra-index-url https://wheels.vllm.ai/nightly --torch-backend=cu130
+"$HOME/vllm/bin/python" -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda)" \
+  | tee "$HOME/vllm-version.txt"
+# Found here rather than on a GPU: the compiled extension loads, every
+# library it links resolved. The first image's torch was built for CUDA
+# 12.9 and the nightly vLLM for 13, and 'vllm serve' died on the L4 with
+# libcudart.so.13 not found. Loading needs no GPU, only the driver's
+# libraries, which this image has.
+"$HOME/vllm/bin/python" -c "import torch, vllm._C; print('vllm._C loads')"
 "$HOME/vllm/bin/hf" download nvidia/Qwen3.8-27B-NVFP4 \
   --local-dir "$HOME/hf/Qwen3.8-27B-NVFP4" >/dev/null
 du -sh "$HOME/hf/Qwen3.8-27B-NVFP4" "$HOME/vllm"

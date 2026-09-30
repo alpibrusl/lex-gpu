@@ -30,7 +30,8 @@ wait_up() { # url, seconds, the server's pid: gives up when it dies, not
 
 echo "=== lex"
 cargo build --release -q -p lex-rt --example serve
-LEX_NO_PREFIX_CACHE=1 target/release/examples/serve --model qwen3.8:27b-mlx --port 8094 \
+# remote.sh points CARGO_TARGET_DIR at the image's pre-built target.
+LEX_NO_PREFIX_CACHE=1 "${CARGO_TARGET_DIR:-target}/release/examples/serve" --model qwen3.8:27b-mlx --port 8094 \
   >"$R/lex-serve.log" 2>&1 &
 LEX=$!
 if wait_up http://localhost:8094 900 "$LEX"; then
