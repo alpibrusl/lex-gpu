@@ -2405,7 +2405,15 @@ mod gpu {
                 )?,
                 conv: compile(
                     gpu,
-                    &build_conv_silu_rows(t, ch, c.conv_kernel, 256)?,
+                    // A prefill chunk walks every token in each instance:
+                    // 128 channels an instance gives it 80 of them rather
+                    // than 40 (452 -> 334 us a call at 512 tokens).
+                    &build_conv_silu_rows(
+                        t,
+                        ch,
+                        c.conv_kernel,
+                        if t > MAX_BATCH { 128 } else { 256 },
+                    )?,
                     THREADS,
                 )?,
                 qk_q: compile(
@@ -2517,7 +2525,18 @@ mod gpu {
                 mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
                 silu: compile(
                     gpu,
-                    &lex_front::llama::silu_mul(t * c.ffn, THREADS, X_DTYPE)?,
+                    // Four elements a thread where the size allows: one a
+                    // thread read 170 GB/s at a 512-token chunk on an M4
+                    // Max (530 us a call), four 560 (162 us).
+                    &lex_front::llama::silu_mul(
+                        t * c.ffn,
+                        if (t * c.ffn).is_multiple_of(4 * THREADS) {
+                            4 * THREADS
+                        } else {
+                            THREADS
+                        },
+                        X_DTYPE,
+                    )?,
                     THREADS,
                 )?,
                 last_row: compile(
