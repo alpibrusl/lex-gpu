@@ -662,6 +662,33 @@ saving of ~1 ms a draft, about +1% net. Worth doing only with a ranking
 taken from the model's own output (the FR-Spec construction), a 32k-row
 head reordered to it.
 
+## M5i — the CUDA prefill GEMM, 2x on the L4 (2026-10-01)
+
+vLLM prefills this model 5.2x faster than lex on an L4 (M5g). The
+GEMM alone, at the model's four shapes and 512 tokens
+(`examples/gemm_bench`, each schedule checked against the interpreter
+first), TFLOPS for gate/up, down, qkv, out_proj:
+
+| CUDA schedule | TFLOPS |
+| --- | --- |
+| 64x64 tiles, 32 inputs a step, 4 warps, scalar tile loads (the first) | 19 22 25 28 |
+| the same, 16-byte tile loads | 23 27 35 36 |
+| 128x64, 16-byte loads | 32 32 47 42 |
+| **128x128, 64 inputs a step, 8 warps, 16-byte loads** | **41 36 55 47** |
+
+Taller tiles decode each FP4 weight for more tokens -- on Ada the decode,
+not the multiply, is what a tile costs -- and a deeper step halves the
+barriers. The output no longer stages a tile of f32 in shared memory
+(which past 128x128 would not fit in the 48 KB static limit): whole
+fragments go straight to `y`. Each element still sums over K in the same
+order, so the result is bit-identical to the old kernel's.
+
+**512-token prefill on the L4: 245 -> 489 tok/s** (vLLM 828). What is
+left, per prefill: the GEMMs ~640 ms of 1046, the delta recurrence 120,
+attention 84 (CUDA still runs the scalar program; the matrix-unit kernel
+is Metal's), and the a/b projections 69 -- a 48-row bf16 matvec at 714
+us a call for a quarter of a GFLOP, which should take ~20.
+
 ## M5h — drafting from the context, and a verify's attention on the matrix units (2026-10-01)
 
 Decode through the server on a small corpus of requests a coding agent
