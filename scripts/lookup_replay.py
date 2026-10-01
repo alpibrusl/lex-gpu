@@ -19,19 +19,19 @@ replayed here: it is charged its rate as measured through the server
 (`--head-tokens` per `--head-ms`) a token at a time. Costs of a verify of t rows are the measured ones on an M4 Max
 (`examples/verify`) at the round's context length -- the first version took
 them at 300 positions and over-promised on 2000-token prompts, where a
-verify costs more. Past four rows they are an assumption, printed as such.
+verify costs more.
 """
 import argparse, json, statistics
 
 # ms for a verify of t rows at a context of n positions, M4 Max, after the
 # split matrix-unit verify attention (examples/verify); interpolated
-# linearly in n. Past four rows nothing is measured yet: assumed.
-VERIFY_MS = {  # context: [t=1, 2, 3, 4]
-    300: [36.4, 37.1, 37.3, 42.5],
-    2300: [37.8, 39.5, 39.9, 45.0],
-    8000: [44.8, 46.6, 48.2, 51.9],
+# linearly in n. Past four rows a verify leaves the few-token matvec and
+# the matrix-unit attention, which is the jump from 4 to 5.
+VERIFY_MS = {  # context: [t = 1 .. 8]
+    300: [36.2, 37.1, 37.7, 42.7, 58.1, 66.1, 74.1, 83.1],
+    2300: [37.2, 39.2, 40.6, 45.3, 65.0, 74.3, 83.7, 95.2],
+    8000: [44.8, 46.6, 48.2, 51.9],  # 5-8 not measured here: 2300's slope
 }
-ASSUMED_PER_ROW = 4.5  # beyond 4 rows, until measured
 
 
 def verify_ms(t, n):
@@ -40,7 +40,13 @@ def verify_ms(t, n):
     lo = max(p for p in pts if p <= n)
     hi = min(p for p in pts if p >= n)
     f = 0.0 if hi == lo else (n - lo) / (hi - lo)
-    row = lambda p: VERIFY_MS[p][min(t, 4) - 1] + ASSUMED_PER_ROW * max(t - 4, 0)
+
+    def row(p):
+        v = VERIFY_MS[p]
+        if t <= len(v):
+            return v[t - 1]
+        return v[-1] + VERIFY_MS[2300][t - 1] - VERIFY_MS[2300][len(v) - 1]
+
     return row(lo) + f * (row(hi) - row(lo))
 
 
@@ -112,7 +118,7 @@ def main():
                 per = st["lookup_tokens"] / lc if lc else 0
                 line.append(f"{1000 * n / ms:6.1f} tok/s ({share:4.0%} of tokens by lookup, "
                             f"{per:.2f}/cycle)")
-            tag = f"k={k} n>={n_min}" + ("  (verify >4 rows assumed)" if k + 1 > 4 else "")
+            tag = f"k={k} n>={n_min}"
             print(tag)
             for r, l in zip(rows, line):
                 print(f"   {len(r['prompt']):5} + {len(r['completion']):5} tokens: {l}")
