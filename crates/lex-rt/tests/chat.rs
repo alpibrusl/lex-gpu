@@ -86,6 +86,7 @@ fn the_rust_template_matches_the_models_own() {
             "odd_chars",
             "no_think",
             "no_think_tools",
+            "no_think_tool_result",
         ],
     );
 }
