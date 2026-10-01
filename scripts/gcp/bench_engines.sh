@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# lex against vLLM on this GPU, Qwen3.8-27B, same prompts -- one engine at a
+# time, because a 24 GB card holds one copy of the model.
+#
+#   GCP_PROJECT=<project> JOB='bash scripts/gcp/bench_engines.sh' scripts/gcp/nvidia_test.sh
+#
+# Needs the pre-built image (build_image.sh): the release build, qwen3.8 in
+# Ollama's store for lex, and vLLM (~/vllm) with NVIDIA's NVFP4
+# checkpoint. Results go to ~/results/engines.jsonl, one line an engine.
+# ENGINES picks which run (default "lex vllm"), so one can be redone
+# without the other: JOB='ENGINES=vllm bash scripts/gcp/bench_engines.sh'.
+# vLLM runs each checkpoint in ~/hf the card can hold (CKPTS to choose):
+# NVIDIA's NVFP4 needs more than an L4's 24 GB, Red Hat's INT4 does not.
+#
+# vLLM's first try is what serves a user: the draft head speculating two
+# tokens (lex's default depth) on CUDA graphs. If that does not start --
+# memory, or a checkpoint without the head -- it tries eager mode, then
+# plain decode, and says which one ran.
+set -uo pipefail
+cd "$HOME/lex-gpu"
+R="$HOME/results"
+mkdir -p "$R"
+
+wait_up() { # url, seconds, the server's pid: gives up when it dies, not
+  # after the whole wait -- a vLLM that runs out of memory at start would
+  # otherwise hold the GPU for its full timeout.
+  for _ in $(seq 1 "$2"); do
+    curl -sf "$1/v1/models" >/dev/null && return 0
+    kill -0 "$3" 2>/dev/null || return 1
+    sleep 1
+  done
+  return 1
+}
+
+ENGINES=" ${ENGINES:-lex vllm} "
+if [[ $ENGINES == *" lex "* ]]; then
+echo "=== lex"
+cargo build --release -q -p lex-rt --example serve
+# remote.sh points CARGO_TARGET_DIR at the image's pre-built target.
+LEX_NO_PREFIX_CACHE=1 "${CARGO_TARGET_DIR:-target}/release/examples/serve" --model qwen3.8:27b-mlx --port 8094 \
+  >"$R/lex-serve.log" 2>&1 &
+LEX=$!
+if wait_up http://localhost:8094 900 "$LEX"; then
+  python3 scripts/engine_bench.py --url http://localhost:8094 --model lex --name lex \
+    --json "$R/engines.jsonl" 2>&1 | tee -a "$R/engines.log"
+  python3 scripts/engine_bench.py --url http://localhost:8094 --model lex --name lex-medium \
+    --extra '{"reasoning_effort":"medium"}' --json "$R/engines.jsonl" 2>&1 | tee -a "$R/engines.log"
+else
+  echo "lex did not come up; see lex-serve.log" | tee -a "$R/engines.log"
+fi
+kill "$LEX" 2>/dev/null; wait "$LEX" 2>/dev/null
+nvidia-smi --query-gpu=memory.used --format=csv,noheader
+fi
+[[ $ENGINES == *" vllm "* ]] || { cat "$R/engines.jsonl" 2>/dev/null; exit 0; }
+
+echo "=== $(cat "$HOME/vllm-version.txt" 2>/dev/null)"
+SPEC='{"method":"mtp","num_speculative_tokens":2}'
+GPU_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
+try_vllm() { # name, then extra vLLM arguments
+  local name=$1; shift
+  "$HOME/vllm/bin/vllm" serve "$HOME/hf/$CKPT" --port 8000 \
+    --served-model-name qwen3.8 \
+    --max-model-len 8192 --max-num-seqs 1 --gpu-memory-utilization 0.95 \
+    --kv-cache-dtype fp8_e4m3 --no-enable-prefix-caching \
+    --limit-mm-per-prompt '{"image":0,"video":0}' "$@" >"$R/vllm-$name.log" 2>&1 &
+  local pid=$!
+  if wait_up http://localhost:8000 1500 "$pid"; then
+    echo "vLLM up as $name" | tee -a "$R/engines.log"
+    python3 scripts/engine_bench.py --url http://localhost:8000 --model qwen3.8 --name "vllm-$name" \
+      --json "$R/engines.jsonl" 2>&1 | tee -a "$R/engines.log"
+    kill "$pid"; wait "$pid" 2>/dev/null
+    return 0
+  fi
+  echo "vLLM as $name did not come up" | tee -a "$R/engines.log"
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  return 1
+}
+for CKPT in ${CKPTS:-Qwen3.8-27B-INT4 Qwen3.8-27B-NVFP4}; do
+  if [ ! -d "$HOME/hf/$CKPT" ]; then
+    echo "no $CKPT in ~/hf" | tee -a "$R/engines.log"; continue
+  fi
+  if [ "$CKPT" = Qwen3.8-27B-NVFP4 ] && [ "$GPU_MB" -lt 40000 ]; then
+    echo "skipping $CKPT: needs more than this card's $GPU_MB MiB" | tee -a "$R/engines.log"
+    continue
+  fi
+  echo "=== vLLM, $CKPT" | tee -a "$R/engines.log"
+  pre="${CKPT#Qwen3.8-27B-}"
+  # Speculating, then plain -- both, whichever starts: the plain one
+  # separates the kernels from the speculation, and on a 24 GB card it is
+  # all that fits (the draft head wanted 2.4 GB more beside 20 of INT4).
+  try_vllm "$pre-mtp2" --speculative-config "$SPEC" \
+    || try_vllm "$pre-mtp2-eager" --speculative-config "$SPEC" --enforce-eager
+  try_vllm "$pre-plain" || try_vllm "$pre-plain-eager" --enforce-eager
+done
+echo "=== results"
+cat "$R/engines.jsonl" 2>/dev/null

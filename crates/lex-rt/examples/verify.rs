@@ -30,7 +30,7 @@ fn main() -> Result<(), String> {
         }
     }
 
-    const SIZES: [usize; 4] = [1, 2, 3, 4];
+    const SIZES: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     let top = MAX_BATCH.min(*SIZES.iter().max().expect("sizes"));
     let mut rt = Runner::load(&model, context + top * reps + 64)?;
     println!("{model} on {}, context {context}", rt.device());

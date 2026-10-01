@@ -585,6 +585,161 @@ the same mismatch. `scripts/serve_bench.py` now asks lex for
 prints both prompt token counts. `examples/mtp --prompt` measures
 acceptance on a chat-rendered prompt.
 
+## M5e — the best engine on each machine as the bar; Mac prefill 229 (2026-09-30)
+
+**Who to beat.** The same measurement (`scripts/engine_bench.py`: decode
+by the difference of a 1- and a 257-token request, prefill on fresh
+random prompts, prompt tokens printed) against every engine that runs
+Qwen3.8-27B on the machine:
+
+| M4 Max | decode greedy | decode sampled | prefill (~430 tok) |
+| --- | --- | --- | --- |
+| Ollama 0.34.4 (MLX, draft head) | **57.5** | **56.4** | **236** |
+| mlx-lm 0.31.3, mlx-community 4-bit | 29.5 | 29.5 | 228 |
+| lex | 52.3 | 50.6 | 186 -> 198* |
+
+\* through the server, before and after the chunking, attention and
+elementwise changes below (431-token prompts cut 256 + 128 + 32 + 15);
+the profiler's 512-token prefill, one chunk, went 203 -> 229. mlx-lm drafts only with a
+separate draft model, so it decodes plainly; Ollama is the bar on the Mac
+for both. On NVIDIA the bar is vLLM with NVIDIA's own NVFP4 checkpoint
+(Ollama cannot run the MLX build there): `scripts/gcp/bench_engines.sh`.
+
+**Prefill, 512 tokens, 203 -> 229 tok/s; 2048 tokens 177 -> 221:**
+
+| change | effect |
+| --- | --- |
+| chunks of up to 512 tokens (were 128); split-KV scratch sized by MAX_BATCH, not the chunk | 204 -> 221; 1.6-6.4 GB of scratch never touched, gone |
+| causal attention on the matrix units (`lex_msl::attn`) | attention 97 -> 25 ms at 512, 949 -> 354 at 2048 |
+| silu_mul four elements a thread; the convolution in 128-channel pieces | 530 -> 162 us, 452 -> 334 us a call |
+
+Tried and dropped, measured: cutting prompts at any size on Metal. A
+never-built size took one to two minutes to compile -- the convolution
+and split-KV attention unroll over every token -- and the 0.1 s the
+server reported was Metal's shader cache. (The delta kernel keeps its new
+support for a ragged last chunk.) Taller GEMM tiles at 512 tokens: no
+gain; the GEMM is ~13 TFLOPS in the model, ~90% of its own multiply-only
+loop and ~93% of MLX's.
+
+## M5f — a verify's inputs, not its weights: Mac decode 0.97x (2026-09-30)
+
+Traced through the server (`LEX_SPEC_TRACE=1`, 211 cycles at depth 2):
+a cycle was 48.2 ms for 2.52 tokens -- draft 5.0, verify 41.7, undo
+1.5 -- and the verify of three cost 1.15 steps, of four 1.43, so the
+controller almost never drafted three. Per call site (`qwen_profile
+--verify 4`), gate/up and down barely grew with the tokens, but out_proj
+and o_proj went 44 -> 82 -> 156 us at one, three and four.
+
+Those were the two batched matvecs still fed f32 (`mixed` from the gated
+norm, `gated` from the gate multiply). `lex_msl::few` timed alone
+at the model's shapes gives the rule: the time follows the bytes of
+input every token's row holds in cache together, not the token count --
+at the gate/up shape 231 us with 40 KB of it, 384 with 60, 823 with 80,
+whatever the dtype -- and four f32 rows of 6144 are 96 KB. Reading the
+inputs once for both of a simdgroup's rows instead of once a row did
+not help (slower at three tokens); narrowing them did:
+
+| M4 Max, context 300 | before | after |
+| --- | --- | --- |
+| verify of 3 | 40.8 ms (1.15 steps) | 38.5 ms (1.09) |
+| verify of 4 | 50.6 ms (1.43) | 43.3 ms (1.23) |
+| through the server, greedy / sampled | 52.3 / 51.2 | **55.8 / 52.9** |
+| Ollama, same measurement | 57.5 / 56.4 | |
+
+Depth 3 now pays often enough that `--depth auto` picks it on a third of
+the cycles. The sampler's top-k is also one pass now (0.40 -> 0.10 ms a
+row, five rows a cycle). What is left is the draft (2.5 ms a token), the
+delta step and attention at three tokens (2.7x and 2.1x a step's), and
+the second draft's acceptance (0.73 after an accepted first, against
+Ollama's 0.90-0.94 first).
+
+**A draft's `lm_head` over fewer rows** -- 1.4 of its 2.5 ms is the pass
+over all 248320 -- measured before building (`LEX_PAIRS=1 examples/mtp`,
+399 rounds of prose): the first N ids by BPE rank are a poor frequency
+list. Outside the first 32768 fell 8.8% of the model's own tokens, which
+takes 4.5 points off first-draft acceptance; 65536 cost 1.5 points for a
+saving of ~1 ms a draft, about +1% net. Worth doing only with a ranking
+taken from the model's own output (the FR-Spec construction), a 32k-row
+head reordered to it.
+
+## M5h — drafting from the context, and a verify's attention on the matrix units (2026-10-01)
+
+Decode through the server on a small corpus of requests a coding agent
+makes (`LEX_REQUEST_LOG`, 1000-token replies, greedy, M4 Max, GPU idle):
+
+| decode tok/s | before | split verify attention | + context lookup |
+| --- | --- | --- | --- |
+| whole-file edit, 3.2k-token prompt | 49.1 | 54.4 | **60.8** (+24%) |
+| whole-file edit, 1.3k prompt | 58.1 | 61.2 | **66.7** (+15%) |
+| change one function, 3.2k prompt | 46.9 | 49.6 | **53.4** (+14%) |
+| prose essay | 46.9 | 47.5 | 47.6 |
+
+**Context lookup (#27).** A round whose last four or more tokens occur
+earlier in the prompt or reply drafts the tokens that followed them
+(`lex_rt::spec::lookup`); otherwise the head drafts. Lookup rounds are
+accepted 3.83 tokens of 4 on average; they cover ~64% of a whole-file
+edit's reply, the rest (the reasoning before the code) is prose and goes
+to the head. Verified like any other draft (`Runner::speculate_proposed`,
+a point-mass proposal), so sampled output keeps its distribution. The
+head never drafts in a lookup round, so its cache entry for that round's
+first token is written with the accepted rows afterwards -- a hole there
+changed the head's next draft by only 1e-5, so the golden test compares
+the head's key cache with a clean prefill's (1.2e-3 of scale, 0.50 with
+the fix deleted). `scripts/lookup_replay.py` replays logged requests to
+project a scheme before building it; its first version priced verifies at
+300 positions and promised 74 where 63 came, now it interpolates the
+measured costs by context and matches (66.6 projected, 66.7 measured).
+
+**The verify's attention (#29)** was the cost that grew with context: at
+8000 positions a verify of four tokens cost 1.60 steps (1.25 at 300) --
+the split-KV program carries a scalar accumulator per token and walks
+them one after another. `lex_msl::attn::causal_mma_split` puts every
+token of the verify in one tile of the matrix units, a threadgroup per
+(KV head, 32 positions), and writes the program's partials so the same
+combine merges them:
+
+| verify of 4, M4 Max | before | after |
+| --- | --- | --- |
+| 300 positions | 1.25 steps | 1.19 |
+| 2300 | 1.31 | 1.22 |
+| 8000 | 1.60 | 1.24 |
+
+Also: the batched delta kernel no longer writes the last token's snapshot
+(never rolled back to), and #26 (a frequency-ranked draft vocabulary) was
+measured and dropped -- on code the lookup now drafts most of the reply
+without the head, on prose the list missed 16% of tokens.
+
+## M5g — vLLM on the L4: lex decodes faster, vLLM prefills 5x faster (2026-10-01)
+
+The same `scripts/engine_bench.py` through both servers on one L4, the
+82-token prompt both render by default:
+
+| NVIDIA L4 | decode greedy | decode sampled | prefill (473 tok) |
+| --- | --- | --- | --- |
+| vLLM 0.30.1 nightly, RedHatAI INT4, plain, CUDA graphs | 16.1 | 16.0 | **828** |
+| lex, MLX NVFP4, speculating | **22.8** | **21.2** | 158 |
+
+What vLLM could run is itself the finding. NVIDIA's NVFP4 checkpoint does
+not fit: Ada has no FP4, so vLLM repacks it for Marlin, and that held
+21.5 of 22 GB before any cache. Red Hat's INT4 fits only without the draft
+head, which asked for 2.4 GB more beside 20 GB of weights. So on a 24 GB
+card vLLM decodes plainly, and lex -- 17 GB with its head -- speculates.
+Its plain step is a little faster than ours (16.1 against ~15).
+
+Prefill is where lex is behind, and by a lot: 473 tokens in 0.57 s is
+~45 TFLOPS of the L4's ~121, where lex's GEMM (`lex_msl::gemm` on wmma,
+the Metal tile shape) does ~13 even at a full 512-token chunk (245 tok/s).
+That, and the chunk cutting (158 through the server against 245), is the
+NVIDIA work.
+
+Getting vLLM to run took four image rebuilds, each fixing what the last
+L4 run died of, all now checked on the CPU builder: the nightly wheel
+needs torch for CUDA 13 (`libcudart.so.13`); Triton builds a C helper at
+start against `Python.h`; FlashInfer compiles attention at the first
+request unless its prebuilt kernels (`flashinfer-jit-cache`) are
+installed. A big-card run (NVFP4 native on Blackwell) waits on quota: the
+project has none above 24 GB.
+
 ## M4 — first proof: a Llama on CUDA
 
 `llama3.2:1b` runs end to end on an L4, from the same `lex-front`

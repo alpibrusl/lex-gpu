@@ -24,6 +24,42 @@ fn mix(seed: u64) -> u64 {
     (z ^ (z >> 31)) | 1
 }
 
+/// The `k` largest logits' indices, largest first, equal logits in index
+/// order.
+///
+/// Speculation takes a nucleus of every row it drafts or verifies, five
+/// a cycle at depth 2, so this is on the decode path. Selecting over an
+/// index array of the whole vocabulary took 0.40 ms a row on the M4 Max;
+/// one pass keeping the best `k` so far takes 0.10: past the first few
+/// hundred entries almost nothing beats the k-th, and the pass is a
+/// compare. A large `k` would make each insert cost, so it selects.
+fn top_k(logits: &[f32], k: usize) -> Vec<u32> {
+    let desc = |a: &u32, b: &u32| {
+        logits[*b as usize]
+            .total_cmp(&logits[*a as usize])
+            .then(a.cmp(b))
+    };
+    if k > 64 {
+        let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+        idx.select_nth_unstable_by(k - 1, desc);
+        idx.truncate(k);
+        idx.sort_unstable_by(desc);
+        return idx;
+    }
+    let mut top: Vec<u32> = Vec::with_capacity(k + 1);
+    for (i, x) in logits.iter().enumerate() {
+        if top.len() == k && x.total_cmp(&logits[top[k - 1] as usize]).is_le() {
+            continue;
+        }
+        // After every entry at least as large: equal logits stay in index
+        // order.
+        let at = top.partition_point(|&j| logits[j as usize].total_cmp(x).is_ge());
+        top.insert(at, i as u32);
+        top.truncate(k);
+    }
+    top
+}
+
 /// A distribution over a few tokens, most likely first, as
 /// [`Sampler::nucleus`] gives it: the tokens and their probabilities.
 pub type Nucleus = (Vec<u32>, Vec<f32>);
@@ -99,12 +135,7 @@ impl Sampler {
         // Top-k first: the vocabulary is 248320 wide and all but a handful
         // of it is noise, so everything below is done on k entries.
         let k = self.top_k.min(logits.len());
-        let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-        idx.select_nth_unstable_by(k - 1, |&a, &b| {
-            logits[b as usize].total_cmp(&logits[a as usize])
-        });
-        idx.truncate(k);
-        idx.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+        let mut idx = top_k(logits, k);
 
         let top = logits[idx[0] as usize];
         let mut p: Vec<f32> = idx
@@ -317,5 +348,22 @@ mod tests {
         assert_eq!(s.verify_proposal(&target, qi[0], &qi, &qp), Err(1));
         let (qi, qp) = s.nucleus(&logits(&[0.1, 0.9]));
         assert_eq!(s.verify_proposal(&target, qi[0], &qi, &qp), Ok(()));
+    }
+
+    #[test]
+    fn top_k_is_a_full_sorts_prefix() {
+        // Coarse values, so there are many ties to order.
+        let mut z = 7u64;
+        let v: Vec<f32> = (0..5000)
+            .map(|_| {
+                z = super::mix(z);
+                (z % 97) as f32 * 0.25 - 12.0
+            })
+            .collect();
+        let mut all: Vec<u32> = (0..v.len() as u32).collect();
+        all.sort_by(|&a, &b| v[b as usize].total_cmp(&v[a as usize]).then(a.cmp(&b)));
+        for k in [1, 2, 20, 64, 65, 300, 5000] {
+            assert_eq!(super::top_k(&v, k), all[..k], "k = {k}");
+        }
     }
 }

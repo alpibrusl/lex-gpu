@@ -18,23 +18,31 @@ Decode, tok/s, against Ollama on the same machine:
 | Model | Hardware | lex | Ollama |
 | --- | --- | --- | --- |
 | `maternion/mimo-v2.6:9b` | M4 Max, greedy / sampled | **74.6 / 73.4** | 66.9 / 62.0 |
-| `qwen3.8:27b-mlx` | M4 Max, speculating, greedy / sampled | 52.8 / 51.1 | 56.8 / 53.2 |
+| `qwen3.8:27b-mlx` | M4 Max, speculating, greedy / sampled | 55.8 / 52.9 | 57.5 / 56.4 |
 | `llama3.1:8b` | M4 Max | 79.2 | 86.0 |
 | `llama3.2:1b` | M4 Max | 233.7 | 261.9 |
 | `llama3.2:1b` | NVIDIA L4 | 124.4 | 162.9 |
 | `qwen3.8:27b-mlx` | NVIDIA L4, plain / speculating | 15.1 / 24.4 | — (MLX build) |
 
-Prefill, `qwen3.8:27b-mlx`, 512 tokens: **203 tok/s** on the M4 Max
-against Ollama's 250–260, and **245** on the L4.
+Prefill, `qwen3.8:27b-mlx`, 512 tokens: **229 tok/s** on the M4 Max
+(221 at 2048) against Ollama's 250–260, and **245** on the L4.
+
+On the L4 the bar is vLLM (Ollama cannot run the MLX build there). Same
+prompt, through both servers: decode **lex 22.8** against vLLM's 16.1
+(Red Hat's INT4 checkpoint, plain -- its draft head does not fit a 24 GB
+card beside the weights, and NVIDIA's NVFP4 checkpoint does not fit at
+all); prefill **vLLM 828** against lex's 158. The CUDA GEMM is the gap.
 
 Correctness: Llama gives Ollama's tokens exactly (96/96 on both sizes),
 MiMo 16/16; Qwen3.8 passes its whole golden suite on Metal and on the L4,
 worst log-prob difference 0.00077 against an f32 reference (tolerance
 0.02).
 
-Qwen decode on the Mac is at 0.93x greedy and 0.96x sampled: a plain step
-matches Ollama's (35 ms), and what remains is in the speculation cycle. How each number was
-measured, and what is being tried next, is in
+Qwen decode on the Mac is at 0.97x greedy and 0.94x sampled
+(`scripts/engine_bench.py`, same prompt token for token): a plain step
+matches Ollama's (35 ms), and a verify of three tokens costs 1.09 steps.
+mlx-lm decodes the same model at 29.5. How each number was measured, and
+what is being tried next, is in
 [`docs/roadmap-weeks.md`](docs/roadmap-weeks.md).
 
 Not done yet: the `.lx` surface syntax covers two kernels (everything the

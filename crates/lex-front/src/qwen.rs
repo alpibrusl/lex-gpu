@@ -84,11 +84,9 @@ impl DeltaNet {
     /// accepted prefix, which is a whole extra pass over the weights --
     /// 38.6 ms against a 42.8 ms verify, on 28% of rounds.
     ///
-    /// Every token is written, including the last, whose block simply
-    /// duplicates what goes to `state`. Skipping it would need the loop
-    /// body to know it is on the final iteration, which a `for_range` over
-    /// a register carry cannot express, and the write is 1/`tokens` of a
-    /// cost that is already small beside what it removes.
+    /// Every token but the last is written: a rollback goes back to a
+    /// token before the last, and the last's state is what goes to `state`.
+    /// Its block in `snap` is left as it was.
     pub fn build_steps_snap(&self, tokens: usize) -> Result<Program, String> {
         self.steps(tokens, true)
     }
@@ -163,70 +161,90 @@ impl DeltaNet {
             shape: vec![rows, dk],
         };
         let s0 = b.op("s", Op::Load(state_at.clone(), tile.clone()));
-        let out = b.for_range(
-            0,
-            tokens,
-            vec![s0],
-            vec![Ty::Tile(tile.clone())],
-            |b, tok, p| {
-                // Token `tok`'s slice of every per-token parameter.
-                let kv_row = |param| View {
-                    param,
-                    offset: vec![IdxExpr::scaled(tok, hv, 0).plus(head, 1), IdxExpr::lit(0)],
-                    shape: vec![1, dk],
-                };
-                let gate = |param| View {
-                    param,
-                    offset: vec![first.clone().plus(tok, gates)],
-                    shape: vec![rows],
-                };
-                let s = p[0];
-                let g = b.op("g", Op::Load(gate(pg), vecr.clone()));
-                let s = b.op("s", Op::Binary(BinOp::Mul, Move(s), Move(g)));
+        // One token's step. `at(e, stride)` adds the token's term to an
+        // index: the loop variable's inside the loop, a constant for a
+        // token peeled off after it.
+        let step = |b: &mut Builder,
+                    at: &dyn Fn(IdxExpr, usize) -> IdxExpr,
+                    s: Var,
+                    snapshot: bool|
+         -> Var {
+            let kv_row = |param| View {
+                param,
+                offset: vec![at(IdxExpr::scaled(head, 1, 0), hv), IdxExpr::lit(0)],
+                shape: vec![1, dk],
+            };
+            let gate = |param| View {
+                param,
+                offset: vec![at(first.clone(), gates)],
+                shape: vec![rows],
+            };
+            let g = b.op("g", Op::Load(gate(pg), vecr.clone()));
+            let s = b.op("s", Op::Binary(BinOp::Mul, Move(s), Move(g)));
 
-                let k = b.op("k", Op::Load(kv_row(pk), vecc.clone()));
-                let sk = b.op("sk", Op::Binary(BinOp::Mul, Borrow(s), Borrow(k)));
-                let sk = b.op("sk", Op::RowReduce(Reduce::Sum, Move(sk)));
+            let k = b.op("k", Op::Load(kv_row(pk), vecc.clone()));
+            let sk = b.op("sk", Op::Binary(BinOp::Mul, Borrow(s), Borrow(k)));
+            let sk = b.op("sk", Op::RowReduce(Reduce::Sum, Move(sk)));
 
-                let v = b.op(
-                    "v",
-                    Op::Load(
-                        View {
-                            param: pv,
-                            offset: vec![first.clone().shift(c.v_base).plus(tok, c.v_width)],
-                            shape: vec![rows],
-                        },
-                        vecr.clone(),
-                    ),
-                );
-                let d = b.op("d", Op::Binary(BinOp::Sub, Move(v), Move(sk)));
-                let beta = b.op("beta", Op::Load(gate(pb), vecr.clone()));
-                let d = b.op("d", Op::Binary(BinOp::Mul, Move(d), Move(beta)));
-                let ones = b.op("ones", Op::Fill(tile.clone(), 1.0));
-                let kb = b.op("kb", Op::Binary(BinOp::Mul, Move(ones), Move(k)));
-                let upd = b.op("upd", Op::Binary(BinOp::Mul, Move(kb), Move(d)));
-                let s = b.op("s", Op::Binary(BinOp::Add, Move(s), Move(upd)));
+            let v = b.op(
+                "v",
+                Op::Load(
+                    View {
+                        param: pv,
+                        offset: vec![at(first.clone().shift(c.v_base), c.v_width)],
+                        shape: vec![rows],
+                    },
+                    vecr.clone(),
+                ),
+            );
+            let d = b.op("d", Op::Binary(BinOp::Sub, Move(v), Move(sk)));
+            let beta = b.op("beta", Op::Load(gate(pb), vecr.clone()));
+            let d = b.op("d", Op::Binary(BinOp::Mul, Move(d), Move(beta)));
+            let ones = b.op("ones", Op::Fill(tile.clone(), 1.0));
+            let kb = b.op("kb", Op::Binary(BinOp::Mul, Move(ones), Move(k)));
+            let upd = b.op("upd", Op::Binary(BinOp::Mul, Move(kb), Move(d)));
+            let s = b.op("s", Op::Binary(BinOp::Add, Move(s), Move(upd)));
 
-                let q = b.op("q", Op::Load(kv_row(pq), vecc.clone()));
-                let y = b.op("y", Op::Binary(BinOp::Mul, Borrow(s), Move(q)));
-                let y = b.op("y", Op::RowReduce(Reduce::Sum, Move(y)));
-                b.effect(Op::Store(Move(y), gate(py)));
-                // Borrowed, not moved: the tile carries on to the next
-                // token. The lowering reads the operand's location and
-                // does not care which it was; the checker does.
-                if let Some(psnap) = psnap {
-                    b.effect(Op::Store(
-                        Borrow(s),
-                        View {
-                            param: psnap,
-                            offset: vec![first.clone().plus(tok, hv * dv), IdxExpr::lit(0)],
-                            shape: vec![rows, dk],
-                        },
-                    ));
-                }
-                vec![s]
-            },
-        );
+            let q = b.op("q", Op::Load(kv_row(pq), vecc.clone()));
+            let y = b.op("y", Op::Binary(BinOp::Mul, Borrow(s), Move(q)));
+            let y = b.op("y", Op::RowReduce(Reduce::Sum, Move(y)));
+            b.effect(Op::Store(Move(y), gate(py)));
+            // Borrowed, not moved: the tile carries on to the next token.
+            // The lowering reads the operand's location and does not care
+            // which it was; the checker does.
+            if let (true, Some(psnap)) = (snapshot, psnap) {
+                b.effect(Op::Store(
+                    Borrow(s),
+                    View {
+                        param: psnap,
+                        offset: vec![at(first.clone(), hv * dv), IdxExpr::lit(0)],
+                        shape: vec![rows, dk],
+                    },
+                ));
+            }
+            s
+        };
+        // With snapshots, the last token is peeled off the loop and writes
+        // none: a rollback goes to a token *before* the last (after the last
+        // there is nothing to undo), and its state is what goes to `state`
+        // anyway. That write was 1/`tokens` of the snapshot traffic, 3.1 MB
+        // a layer -- 0.5 ms of a verify of three on an M4 Max.
+        let looped = if snap { tokens - 1 } else { tokens };
+        let mut s = s0;
+        if looped > 0 {
+            s = b.for_range(
+                0,
+                looped,
+                vec![s0],
+                vec![Ty::Tile(tile.clone())],
+                |b, tok, p| vec![step(b, &|e, stride| e.plus(tok, stride), p[0], snap)],
+            )[0];
+        }
+        if snap {
+            let last = tokens - 1;
+            s = step(&mut b, &|e, stride| e.shift(last * stride), s, false);
+        }
+        let out = [s];
         b.effect(Op::Store(Move(out[0]), state_at));
         Ok(b.finish())
     }
@@ -830,18 +848,29 @@ pub fn build_matvec_dense_rows(
 /// Parameters: `y [v_heads, v_dim]`, the norm weight `[1, v_dim]`,
 /// `z [v_heads, v_dim]`, and the output `[v_heads, v_dim]`.
 pub fn build_gated_norm(v_heads: usize, v_dim: usize, eps: f32) -> Program {
-    build_gated_norm_rows(1, v_heads, v_dim, eps)
+    build_gated_norm_rows(1, v_heads, v_dim, eps, DType::F32)
 }
 
 /// [`build_gated_norm`] over a batch: every tensor but the weight gains a
-/// token dimension, `[tokens * v_heads, v_dim]`.
-pub fn build_gated_norm_rows(tokens: usize, v_heads: usize, v_dim: usize, eps: f32) -> Program {
+/// token dimension, `[tokens * v_heads, v_dim]`. The output is written as
+/// `out`: a batch narrows it to f16, because the matvec reading it back
+/// holds every token's row in cache at once (see `lex_msl::few`).
+pub fn build_gated_norm_rows(
+    tokens: usize,
+    v_heads: usize,
+    v_dim: usize,
+    eps: f32,
+    out: DType,
+) -> Program {
     use Arg::{Borrow, Move};
-    let mut b = Builder::new(&format!("delta_gated_norm{tokens}_h{v_heads}x{v_dim}"));
+    let mut b = Builder::new(&format!(
+        "delta_gated_norm{tokens}_h{v_heads}x{v_dim}_{}",
+        out.suffix()
+    ));
     let py = b.param("y", DType::F32, &[tokens * v_heads, v_dim], false);
     let pw = b.param("w", DType::F32, &[1, v_dim], false);
     let pz = b.param("z", DType::F32, &[tokens * v_heads, v_dim], false);
-    let po = b.param("o", DType::F32, &[tokens * v_heads, v_dim], true);
+    let po = b.param("o", out, &[tokens * v_heads, v_dim], true);
     let head = b.grid(v_heads);
     let token = b.grid2(tokens);
     let tile = TileTy::new(DType::F32, &[1, v_dim], Space::Reg);
@@ -881,21 +910,28 @@ pub fn build_gated_norm_rows(tokens: usize, v_heads: usize, v_dim: usize, eps: f
     let sz = b.op("sz", Op::Unary(UnOp::Sigmoid, Borrow(z)));
     let sz = b.op("sz", Op::Binary(BinOp::Mul, Move(z), Move(sz)));
     let o = b.op("o", Op::Binary(BinOp::Mul, Move(y), Move(sz)));
+    let o = if out == DType::F32 {
+        o
+    } else {
+        b.op("o16", Op::Convert(Move(o), out))
+    };
     b.effect(Op::Store(Move(o), rows(po)));
     b.finish()
 }
 
 /// Elementwise `y = a * b` over `n` values, `chunk` per instance: the
-/// attention output meeting its gate before the output projection.
-pub fn build_mul(n: usize, chunk: usize) -> Result<Program, String> {
+/// attention output meeting its gate before the output projection. `y` is
+/// written as `out`, f16 in a batch for the reason
+/// [`build_gated_norm_rows`] gives.
+pub fn build_mul(n: usize, chunk: usize, out: DType) -> Result<Program, String> {
     use Arg::Move;
     if chunk == 0 || !n.is_multiple_of(chunk) {
         return Err(format!("{n} values do not split into chunks of {chunk}"));
     }
-    let mut b = Builder::new(&format!("mul_{n}x{chunk}"));
+    let mut b = Builder::new(&format!("mul_{n}x{chunk}_{}", out.suffix()));
     let pa = b.param("a", DType::F32, &[1, n], false);
     let pb = b.param("b", DType::F32, &[1, n], false);
-    let py = b.param("y", DType::F32, &[1, n], true);
+    let py = b.param("y", out, &[1, n], true);
     let i = b.grid(n / chunk);
     let span = |param| View {
         param,
@@ -906,6 +942,11 @@ pub fn build_mul(n: usize, chunk: usize) -> Result<Program, String> {
     let a = b.op("a", Op::Load(span(pa), t.clone()));
     let bb = b.op("b", Op::Load(span(pb), t));
     let y = b.op("y", Op::Binary(BinOp::Mul, Move(a), Move(bb)));
+    let y = if out == DType::F32 {
+        y
+    } else {
+        b.op("y16", Op::Convert(Move(y), out))
+    };
     b.effect(Op::Store(Move(y), span(py)));
     Ok(b.finish())
 }

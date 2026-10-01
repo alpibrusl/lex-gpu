@@ -71,7 +71,6 @@ const THREADS: usize = 128;
 
 pub fn fits(d: &DeltaChunk) -> bool {
     d.tokens > 0
-        && d.tokens.is_multiple_of(C)
         && d.k_dim.is_multiple_of(8)
         && d.v_dim.is_multiple_of(R)
         && d.v_base + d.v_heads * d.v_dim <= d.v_width
@@ -80,8 +79,8 @@ pub fn fits(d: &DeltaChunk) -> bool {
 pub fn delta_chunked(d: &DeltaChunk, backend: Backend) -> Result<Lowered, String> {
     if !fits(d) {
         return Err(format!(
-            "delta_chunked: {} tokens in chunks of {C}, {} key dims in 8s, {} rows in blocks of {R}",
-            d.tokens, d.k_dim, d.v_dim
+            "delta_chunked: {} key dims in 8s, {} rows in blocks of {R}",
+            d.k_dim, d.v_dim
         ));
     }
     let entry = format!(
@@ -165,26 +164,32 @@ kernel void $ENTRY(
     }
 
     for (uint t0 = 0; t0 < $TOKENSu; t0 += $Cu) {
+        // The chunk's real tokens; past them, the last chunk is padding
+        // that decays nothing (g = 1), updates nothing (beta = 0, k = 0)
+        // and writes nothing.
+        const uint nv = min($Cu, $TOKENSu - t0);
         // 1. The chunk: k and q rows, this block's v, the gates.
         for (uint e = tid; e < $Cu * DK / 4u; e += $Tu) {
             const uint j = e / (DK / 4u), c = (e % (DK / 4u)) * 4u;
             const size_t at = (size_t)((t0 + j) * HV + head) * DK + c;
-            *(threadgroup float4 *)(Ks + j * $LDu + c) = *(device const float4 *)(k + at);
-            *(threadgroup float4 *)(Qs + j * $LDu + c) = *(device const float4 *)(q + at);
+            *(threadgroup float4 *)(Ks + j * $LDu + c) = j < nv ? *(device const float4 *)(k + at) : float4(0.0f);
+            *(threadgroup float4 *)(Qs + j * $LDu + c) = j < nv ? *(device const float4 *)(q + at) : float4(0.0f);
         }
         for (uint e = tid; e < $Cu * $Ru; e += $Tu) {
             const uint j = e / $Ru, r = e % $Ru;
-            Vb[e] = v[(size_t)(t0 + j) * $VWu + $VBASEu + head * DV + row0 + r];
+            Vb[e] = j < nv ? v[(size_t)(t0 + j) * $VWu + $VBASEu + head * DV + row0 + r] : 0.0f;
         }
         if (sgid == 0u) {
             // g and beta are one value per head, spread over its rows.
             float lg = 0.0f;
-            if (lane < $Cu) {
+            if (lane < nv) {
                 const size_t at = (size_t)(t0 + lane) * GATES + head * DV + row0;
                 // A gate that underflowed to zero would make the running
                 // sum -inf and its differences NaN; e^-80 is zero anyway.
                 lg = max(log(g[at]), -80.0f);
                 B[lane] = beta[at];
+            } else if (lane < $Cu) {
+                B[lane] = 0.0f;
             }
             const float run = simd_prefix_inclusive_sum(lg);
             if (lane < $Cu) G[lane] = run;
@@ -248,7 +253,7 @@ kernel void $ENTRY(
             const float gi = G[i];
             float o = exp(gi) * QS[i * $Ru + r];
             for (uint l = 0; l <= i; ++l) o += exp(gi - G[l]) * QK[i * $Cu + l] * U[l * $Ru + r];
-            y[(size_t)(t0 + i) * GATES + head * DV + row0 + r] = o;
+            if (i < nv) y[(size_t)(t0 + i) * GATES + head * DV + row0 + r] = o;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -325,26 +330,33 @@ extern "C" __global__ void $ENTRY(
     }
 
     for (uint t0 = 0; t0 < $TOKENSu; t0 += $Cu) {
+        // The chunk's real tokens; past them, the last chunk is padding
+        // that decays nothing (g = 1), updates nothing (beta = 0, k = 0)
+        // and writes nothing.
+        const uint nv = min($Cu, $TOKENSu - t0);
         // 1. The chunk: k and q rows, this block's v, the gates.
         for (uint e = tid; e < $Cu * DK / 4u; e += $Tu) {
             const uint j = e / (DK / 4u), c = (e % (DK / 4u)) * 4u;
             const size_t at = (size_t)((t0 + j) * HV + head) * DK + c;
-            *reinterpret_cast<float4*>(Ks + j * $LDu + c) = *reinterpret_cast<const float4*>(k + at);
-            *reinterpret_cast<float4*>(Qs + j * $LDu + c) = *reinterpret_cast<const float4*>(q + at);
+            const float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            *reinterpret_cast<float4*>(Ks + j * $LDu + c) = j < nv ? *reinterpret_cast<const float4*>(k + at) : z4;
+            *reinterpret_cast<float4*>(Qs + j * $LDu + c) = j < nv ? *reinterpret_cast<const float4*>(q + at) : z4;
         }
         for (uint e = tid; e < $Cu * $Ru; e += $Tu) {
             const uint j = e / $Ru, r = e % $Ru;
-            Vb[e] = v[(size_t)(t0 + j) * $VWu + $VBASEu + head * DV + row0 + r];
+            Vb[e] = j < nv ? v[(size_t)(t0 + j) * $VWu + $VBASEu + head * DV + row0 + r] : 0.0f;
         }
         if (warp == 0u) {
             // g and beta are one value per head, spread over its rows.
             float lg = 0.0f;
-            if (lane < $Cu) {
+            if (lane < nv) {
                 const size_t at = (size_t)(t0 + lane) * GATES + head * DV + row0;
                 // A gate that underflowed to zero would make the running
                 // sum -inf and its differences NaN; e^-80 is zero anyway.
                 lg = fmaxf(logf(g[at]), -80.0f);
                 B[lane] = beta[at];
+            } else if (lane < $Cu) {
+                B[lane] = 0.0f;
             }
             for (uint d = 1u; d < 32u; d <<= 1u) {
                 const float o = __shfl_up_sync(0xffffffffu, lg, d);
@@ -405,7 +417,7 @@ extern "C" __global__ void $ENTRY(
             const float gi = G[i];
             float o = expf(gi) * QS[i * $Ru + r];
             for (uint l = 0; l <= i; ++l) o += expf(gi - G[l]) * QK[i * $Cu + l] * U[l * $Ru + r];
-            y[(size_t)(t0 + i) * GATES + head * DV + row0 + r] = o;
+            if (i < nv) y[(size_t)(t0 + i) * GATES + head * DV + row0 + r] = o;
         }
         __syncthreads();
 

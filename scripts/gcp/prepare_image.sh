@@ -12,6 +12,9 @@
 #                              baseline Llama models
 #   ~/.ollama/models           qwen3.8:27b-mlx, fetched from the registry
 #   ~/lex-src.sha256           the source the build was made from
+#   ~/vllm                     vLLM (nightly), its version in ~/vllm-version.txt
+#   ~/hf/Qwen3.8-27B-NVFP4     NVIDIA's NVFP4 checkpoint, for vLLM (48 GB+ cards)
+#   ~/hf/Qwen3.8-27B-INT4      Red Hat's W4A16 checkpoint, what vLLM fits on 24 GB
 #
 # The source itself is removed at the end: every run brings its own.
 set -euo pipefail
@@ -32,7 +35,9 @@ uname -r
 
 step "system packages"
 sudo apt-get update -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential python3 >/dev/null
+# python3-dev: Triton compiles a C helper against Python.h when vLLM
+# starts, and without the headers every vLLM configuration died there.
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential python3 python3-dev >/dev/null
 
 step "Rust toolchain"
 if ! command -v cargo >/dev/null; then
@@ -59,6 +64,61 @@ done
 
 step "qwen3.8:27b-mlx into ~/.ollama/models"
 python3 scripts/ollama_fetch.py qwen3.8:27b-mlx --root "$HOME/.ollama/models" 2>&1 | tail -3
+
+step "vLLM and NVIDIA's NVFP4 checkpoint -- the NVIDIA reference"
+# The engine NVIDIA's model card serves this checkpoint with, from vLLM's
+# nightly wheels (the releases lag the architecture), into a venv of its
+# own. This machine has no GPU, so the CUDA build is named rather than
+# detected -- `auto` would install the CPU one -- and the driver on the
+# GPU machines (580) runs it. Its version is kept, so a result says which
+# vLLM it was.
+if ! command -v uv >/dev/null && [ ! -x "$HOME/.local/bin/uv" ]; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+fi
+UV="$HOME/.local/bin/uv"
+rm -rf "$HOME/vllm"
+"$UV" venv -q --python 3.12 "$HOME/vllm"
+"$UV" pip install -q --python "$HOME/vllm/bin/python" -U vllm --pre \
+  --extra-index-url https://wheels.vllm.ai/nightly --torch-backend=cu130
+# FlashInfer compiles its attention kernels at the first request unless
+# its prebuilt ones are installed, and that needs ninja and a CUDA 13
+# compiler this image does not have: on the L4 the first request died
+# with "No such file or directory: 'ninja'". The prebuilt kernels for
+# exactly the FlashInfer vLLM pulled in, and ninja for anything else.
+FI=$("$HOME/vllm/bin/python" -c "import flashinfer; print(flashinfer.__version__)")
+"$UV" pip install -q --python "$HOME/vllm/bin/python" ninja "flashinfer-jit-cache==$FI" \
+  --extra-index-url https://flashinfer.ai/whl/cu130
+"$HOME/vllm/bin/python" -c "import flashinfer_jit_cache, ninja; print('flashinfer', '$FI', 'prebuilt kernels installed')"
+"$HOME/vllm/bin/python" -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda)" \
+  | tee "$HOME/vllm-version.txt"
+# Found here rather than on a GPU: every compiled extension vLLM ships
+# loads, every library it links resolved. The first image's torch was
+# built for CUDA 12.9 and the nightly vLLM for 13, and 'vllm serve' died
+# on the L4 importing vllm._C_stable_libtorch (libcudart.so.13 not
+# found). 'import vllm' alone does not reach them here: with no GPU it
+# picks the CPU platform. Loading needs no GPU, only the driver's
+# libraries, which this image has.
+"$HOME/vllm/bin/python" - <<'PY'
+import importlib, pathlib, torch, vllm
+root = pathlib.Path(vllm.__file__).parent
+names = sorted({"vllm." + ".".join(p.relative_to(root).parts[:-1] + (p.name.split(".")[0],))
+                for p in root.rglob("*.so")})
+assert names, "no compiled extensions found"
+for n in names:
+    importlib.import_module(n)
+print("loaded", len(names), "extensions:", " ".join(names))
+PY
+# And Triton's own helper, which vLLM builds at start with the system
+# compiler -- the step that failed on the L4 for want of Python.h. It
+# needs libcuda.so.1, which the driver packages put here, not a GPU.
+"$HOME/vllm/bin/python" -c "from triton.backends.nvidia.driver import CudaUtils; CudaUtils(); print('triton helper builds')"
+# NVIDIA's NVFP4 does not fit an L4 under vLLM: without FP4 hardware it
+# is repacked for Marlin, and that held 21.5 of 22 GB before any cache.
+# Red Hat's INT4 (W4A16, made for vLLM) is what a 24 GB card serves.
+for repo in nvidia/Qwen3.8-27B-NVFP4 RedHatAI/Qwen3.8-27B-INT4; do
+  "$HOME/vllm/bin/hf" download "$repo" --local-dir "$HOME/hf/${repo#*/}" >/dev/null
+done
+du -sh "$HOME"/hf/* "$HOME/vllm"
 
 step "leave the disk clean"
 # What the build was made from, so a run can tell which of its files are

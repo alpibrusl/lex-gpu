@@ -497,7 +497,7 @@ fn qwen_qk_rope_matches_the_interpreter() {
     let n = 24 * hd;
     same(
         &gpu,
-        &build_mul(n, 256).unwrap(),
+        &build_mul(n, 256, DType::F32).unwrap(),
         vec![
             Tensor::new(DType::F32, &[1, n], &pattern(n, 54)),
             Tensor::new(DType::F32, &[1, n], &pattern(n, 55)),

@@ -116,6 +116,74 @@ impl DepthController {
     }
 }
 
+/// Drafts from the context: the tokens that followed the most recent
+/// earlier occurrence of the context's last `n` tokens, for the longest
+/// `n` from `n_max` down to `n_min` that occurs; at most `k` of them.
+///
+/// A coding agent's reply copies spans of its prompt -- the file it is
+/// editing, the call it is repeating -- and there the model's own next
+/// tokens are already written down. Replayed over real requests
+/// (`scripts/lookup_replay.py`): on edits that return a whole file, 77-87%
+/// of the reply came from lookups at 3.3-3.7 tokens a round, 54 -> 74
+/// tok/s; on prose a match of four is rare enough to cost nothing, while
+/// matching on two fired on phrases like "of the" and cost 13%.
+///
+/// `context` ends with the token about to be fed; the drafts are what
+/// would follow it.
+pub fn lookup(context: &[u32], n_max: usize, n_min: usize, k: usize) -> Vec<u32> {
+    let len = context.len();
+    for n in (n_min.max(1)..=n_max).rev() {
+        if len <= n {
+            continue;
+        }
+        let pat = &context[len - n..];
+        // Most recent first, and never the suffix matching itself.
+        if let Some(s) = (0..len - n).rev().find(|&s| &context[s..s + n] == pat) {
+            let from = s + n;
+            return context[from..(from + k).min(len)].to_vec();
+        }
+    }
+    vec![]
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::lookup;
+
+    #[test]
+    fn it_proposes_what_followed_the_last_occurrence() {
+        // ... 1 2 3 4 [5 6 7] ... 1 2 3 4 -> 5 6 7
+        let c = [9, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4];
+        assert_eq!(lookup(&c, 6, 4, 3), vec![5, 6, 7]);
+        // The most recent occurrence wins over an older one.
+        let c = [1, 2, 3, 4, 10, 0, 1, 2, 3, 4, 20, 21, 1, 2, 3, 4];
+        assert_eq!(lookup(&c, 4, 4, 2), vec![20, 21]);
+    }
+
+    #[test]
+    fn it_takes_the_longest_match_and_stops_at_the_end() {
+        // Suffix [7, 1, 2, 3, 4] occurs once, at the start; a shorter
+        // [1, 2, 3, 4] occurs more recently with a different follower.
+        let c = [7, 1, 2, 3, 4, 50, 1, 2, 3, 4, 60, 7, 1, 2, 3, 4];
+        assert_eq!(lookup(&c, 5, 4, 1), vec![50]);
+        // Fewer than k tokens left after the match: what there is.
+        let c = [1, 2, 3, 4, 1, 2, 3, 4];
+        assert_eq!(lookup(&c, 4, 4, 8), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_short_or_absent_match_proposes_nothing() {
+        let c = [1, 2, 3, 9, 8, 1, 2, 3];
+        assert!(
+            lookup(&c, 6, 4, 3).is_empty(),
+            "only a match of three exists"
+        );
+        assert_eq!(lookup(&c, 6, 3, 3), vec![9, 8, 1]);
+        assert!(lookup(&[1, 2, 3], 6, 4, 3).is_empty());
+        assert!(lookup(&[], 6, 4, 3).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::DepthController;

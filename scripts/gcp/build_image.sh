@@ -20,6 +20,8 @@
 #   KEEP_IMAGES   how many images of the family to keep (default 1: each
 #                 is billed monthly, and a rebuild is cheap).
 #   MODELS        Ollama baseline models (default: llama3.2:1b llama3.1:8b).
+#   FROM=image    update the current image instead of starting from the
+#                 stock one: only what changed is done.
 #
 # The builder is deleted on exit, success or not, and by GCE after 2 hours.
 set -euo pipefail
@@ -38,10 +40,20 @@ OUT="$ROOT/results/gcp/${STAMP}-image"
 mkdir -p "$OUT"
 gc() { gcloud --project "$GCP_PROJECT" --quiet "$@"; }
 
-BASE="$(gcloud compute images list --project deeplearning-platform-release \
-  --filter='family~^common-cu12.*ubuntu' --format='value(family)' | sort | tail -1)"
-[ -n "$BASE" ] || { echo "no common-cu12 ubuntu image family found" >&2; exit 1; }
-echo "base: deeplearning-platform-release/$BASE"
+# FROM=image: start from the current image of the family instead of the
+# stock one -- an update then only does what changed (prepare_image.sh is
+# idempotent: a toolchain, build, model or checkpoint already there is
+# kept), minutes instead of most of an hour.
+if [ "${FROM:-}" = "image" ]; then
+  SRC=(--image-project "$GCP_PROJECT" --image-family "$IMAGE_FAMILY")
+  echo "base: $GCP_PROJECT/$(gc compute images describe-from-family "$IMAGE_FAMILY" --format='value(name)')"
+else
+  BASE="$(gcloud compute images list --project deeplearning-platform-release \
+    --filter='family~^common-cu12.*ubuntu' --format='value(family)' | sort | tail -1)"
+  [ -n "$BASE" ] || { echo "no common-cu12 ubuntu image family found" >&2; exit 1; }
+  SRC=(--image-project deeplearning-platform-release --image-family "$BASE")
+  echo "base: deeplearning-platform-release/$BASE"
+fi
 
 ZONE=""
 cleanup() {
@@ -57,7 +69,7 @@ for z in $ZONES; do
   if gc compute instances create "$NAME" --zone "$z" \
       --machine-type "$MACHINE" \
       --provisioning-model=SPOT --instance-termination-action DELETE --max-run-duration 2h \
-      --image-project deeplearning-platform-release --image-family "$BASE" \
+      "${SRC[@]}" \
       --boot-disk-size 150GB --boot-disk-type pd-balanced \
       --labels purpose=lex-image-build >/dev/null 2>"$OUT/create-$z.log"; then
     ZONE="$z"

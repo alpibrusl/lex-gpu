@@ -37,15 +37,19 @@ def get(url, out=None):
     A fresh VM's first lookups can fail: on 2026-09-29 two L4 runs in a row
     lost the whole Qwen block to "Temporary failure in name resolution" on
     this download, while runs in the same region the day before had not.
-    An HTTP error from the registry itself (a 404 for a tag that does not
-    exist) is an answer, not a hiccup, and is not retried.
+    A 404 (a tag that does not exist) is an answer and is not retried; a
+    5xx or a 429 is the registry being busy, and is -- an image build on
+    2026-09-30 lost its whole Qwen download to one 503.
     """
-    delays = [5, 10, 20, 40, 60]
+    delays = [5, 10, 20, 40, 60, 120, 180]
     for attempt in range(len(delays) + 1):
         try:
             return fetch(url, out)
-        except urllib.error.HTTPError:
-            raise
+        except urllib.error.HTTPError as e:
+            if not (e.code >= 500 or e.code == 429) or attempt == len(delays):
+                raise
+            print(f"  {url}: HTTP {e.code}; retrying in {delays[attempt]} s", file=sys.stderr, flush=True)
+            time.sleep(delays[attempt])
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
             if attempt == len(delays):
                 raise

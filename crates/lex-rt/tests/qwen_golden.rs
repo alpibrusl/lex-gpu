@@ -480,16 +480,16 @@ fn prefill_lands_where_the_same_tokens_land_one_by_one() {
     eprintln!("prefill vs stepping: worst {worst:e} of scale");
 }
 
-/// A prompt long enough for the prefill GEMM's big chunks: 150 tokens go
-/// 64 + 64 + 16 through the matrix units and the last 6 through the batched
-/// matvec, and the answer has to be the one stepping gives. The GEMM rounds
+/// A prompt long enough for the prefill GEMM's biggest chunk: 600 tokens go
+/// 512 + 64 + 16 through the matrix units and the last 8 through the
+/// batched matvec, and the answer has to be the one stepping gives. The GEMM rounds
 /// weights to half where the matvec keeps f32, so this is where that would
 /// show -- over 64 layers, not one kernel.
 #[test]
 fn a_long_prefill_through_the_gemm_lands_where_stepping_does() {
     let _lock = one_at_a_time();
     let (model, _) = parse(include_str!("data/qwen35_27b_golden.txt"));
-    let prompt: Vec<u32> = (0..150)
+    let prompt: Vec<u32> = (0..600)
         .map(|i| 1000 + (i as u32 * 7919) % 200000)
         .collect();
     let mut rt = match Runner::load(&model, prompt.len() + 16) {
@@ -514,7 +514,7 @@ fn a_long_prefill_through_the_gemm_lands_where_stepping_does() {
         .fold(0.0f32, f32::max)
         / scale;
     let top = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap();
-    eprintln!("150-token prefill vs stepping: worst {worst:e} of scale");
+    eprintln!("600-token prefill vs stepping: worst {worst:e} of scale");
     assert_eq!(top(&batched), top(&serial), "the next token changed");
     assert!(
         worst < 2e-3,
@@ -752,5 +752,133 @@ fn sampled_speculation_accepts_drafts_and_rejects_some() {
     assert!(
         short > 0,
         "no draft was ever rejected; the correction path never ran"
+    );
+}
+
+/// Drafts proposed from outside the model -- a context lookup's -- land
+/// exactly where greedy lands, right or wrong, and leave the draft head's
+/// cache as the head's own rounds would.
+///
+/// The second half is the one that can go quietly wrong. A head round's
+/// first draft writes the head's cache entry for the token it drafts from;
+/// a lookup round never runs the head, so that entry has to be written with
+/// the accepted rows afterwards. Miss it and nothing in the output changes
+/// -- the head just drafts from a cache with a hole in it, a little worse,
+/// forever. So the head's next draft after a mixed run is compared with
+/// its draft after a clean prefill of the same tokens.
+#[test]
+fn proposed_drafts_land_where_greedy_lands_and_keep_the_head_in_step() {
+    use lex_rt::sample::Sampler;
+    let _lock = one_at_a_time();
+    let (model, cases) = parse(include_str!("data/qwen35_27b_golden.txt"));
+    const STEPS: usize = 30;
+    let prompt = cases[0].prompt.clone();
+    let mut rt = match Runner::load(&model, prompt.len() + STEPS + 32) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+    if !rt.has_mtp() {
+        panic!("{model} has no draft head");
+    }
+    let top = |v: &[f32]| {
+        (0..v.len())
+            .max_by(|&a, &b| v[a].total_cmp(&v[b]))
+            .expect("logits") as u32
+    };
+
+    // Greedy, one token at a time, with a few spare for the proposals.
+    rt.reset();
+    let mut logits = rt.prefill(&prompt).expect("prefill");
+    let mut greedy = vec![];
+    for _ in 0..STEPS + 8 {
+        let t = top(&logits);
+        greedy.push(t);
+        logits = rt.step(t).expect("step");
+    }
+
+    // Mixed rounds: a right proposal, a proposal wrong at its second
+    // token, a head round -- over and over. The head's cache is first
+    // filled from another text, as a server's is by the last request: a
+    // position left unwritten then holds something the head attends to,
+    // where a never-written one holds zeros it all but ignores (the first
+    // version of this test passed with the fix deleted, for that reason).
+    let other: Vec<u32> = (0..prompt.len() + STEPS + 16)
+        .map(|i| 2000 + (i as u32 * 7919) % 100000)
+        .collect();
+    rt.reset();
+    rt.prefill(&other).expect("prefill other text");
+    rt.reset();
+    let logits = rt.prefill(&prompt).expect("prefill");
+    let mut greedy_s = Sampler::new(0.0, 1.0, 1, 0);
+    let mut next = top(&logits);
+    let mut out: Vec<u32> = vec![];
+    let (mut whole, mut cut, mut heads) = (0, 0, 0);
+    let mut round = 0;
+    while out.len() < STEPS {
+        let n = out.len();
+        let (committed, after) = match round % 3 {
+            0 | 1 => {
+                let mut p = greedy[n + 1..n + 4].to_vec();
+                if round % 3 == 1 {
+                    p[1] = (p[1] + 1) % 1000;
+                }
+                let r = rt
+                    .speculate_proposed(next, &p, &mut greedy_s)
+                    .expect("proposed");
+                if r.0.len() == 4 {
+                    whole += 1;
+                } else {
+                    cut += 1;
+                }
+                r
+            }
+            _ => {
+                heads += 1;
+                rt.speculate(next, 2).expect("head round")
+            }
+        };
+        out.extend(committed);
+        next = after;
+        round += 1;
+    }
+    assert!(
+        whole > 0 && cut > 0 && heads > 0,
+        "{whole} whole, {cut} cut, {heads} head rounds"
+    );
+    assert_eq!(
+        out[..STEPS],
+        greedy[..STEPS],
+        "proposed drafts changed the output"
+    );
+
+    // The head's cache after the mixed run against after a clean prefill of
+    // the same tokens, position by position up to the last one written.
+    // (Its next draft would not show a hole: the head leans on its input
+    // far more than on its cache, and a deleted fix moved the draft's
+    // probabilities by 1e-5.)
+    let mut all = prompt.clone();
+    all.extend(&out);
+    let n = all.len() - 1;
+    let mixed = rt.head_keys(n);
+    rt.reset();
+    rt.prefill(&all).expect("prefill");
+    let clean = rt.head_keys(n);
+    let scale = clean.iter().fold(1e-6f32, |a, x| a.max(x.abs()));
+    let worst = mixed
+        .iter()
+        .zip(&clean)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
+        / scale;
+    eprintln!(
+        "{whole} whole and {cut} cut proposals, {heads} head rounds; the head's cache after \
+         them vs after a clean prefill: worst key difference {worst:.2e} of scale"
+    );
+    assert!(
+        worst < 2e-2,
+        "the head's cache is out of step after lookup rounds ({worst:.2e} of scale)"
     );
 }

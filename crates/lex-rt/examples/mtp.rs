@@ -134,7 +134,17 @@ fn main() -> Result<(), String> {
         actual.push(next);
 
         let t = Instant::now();
-        drafts.push(rt.draft(depth, next)?);
+        if std::env::var_os("LEX_TOP2").is_some() {
+            // The head's first and second choice for the next token, from
+            // its top-20 nucleus: how often the second is right when the
+            // first is not decides whether a two-way tree pays (#28).
+            let mut s = lex_rt::sample::Sampler::new(1.0, 1.0, 20, 0);
+            let (_, dists) = rt.draft_with(1, next, Some(&mut s))?;
+            let idx = &dists[0].0;
+            drafts.push(vec![idx[0], *idx.get(1).unwrap_or(&idx[0])]);
+        } else {
+            drafts.push(rt.draft(depth, next)?);
+        }
         draft_ms += t.elapsed().as_secs_f64() * 1e3;
 
         let t = Instant::now();
@@ -148,6 +158,13 @@ fn main() -> Result<(), String> {
     // on the drafts at all, so two runs over the same ids predict exactly
     // the same positions. That makes the comparison paired, and a paired
     // test settles in 191 rounds what an unpaired one leaves at 1.5 sigma.
+    if std::env::var_os("LEX_TOP2").is_some() {
+        for (s, d) in drafts.iter().enumerate() {
+            if let Some(&want) = actual.get(s + 1) {
+                println!("TOP2 {s} {} {} {want}", d[0], d[1]);
+            }
+        }
+    }
     if std::env::var_os("LEX_PAIRS").is_some() {
         for (s, d) in drafts.iter().enumerate() {
             if let (Some(&g), Some(&want)) = (d.first(), actual.get(s + 1)) {

@@ -600,14 +600,13 @@ mod gpu {
 
     /// Whether the batched matmul for this shape reads f16 activations.
     ///
-    /// `res` marks the matmuls that accumulate into the residual -- down and
-    /// o_proj -- which read `ffn_a` and `gated`, not `h`. Every batched
-    /// matmul reads a narrowed buffer except o_proj, which reads `gated`,
-    /// and the draft head's `fc`, which reads a fused input built on the
-    /// host: the decode path's `fc` reads it in f32, the two write the same
-    /// cache, and handed f16 it reads the f32 bytes as half pairs.
-    fn batch_x_half(c: &Config, n_in: usize, res: bool) -> bool {
-        !(n_in == 2 * c.hidden || (res && n_in == c.heads * c.head_dim)) && X_DTYPE == DType::F16
+    /// Every batched matmul reads a narrowed buffer -- `h`, `ffn_a`, and
+    /// `mixed` and `gated` for out_proj and o_proj -- except the draft
+    /// head's `fc`, which reads a fused input built on the host: the decode
+    /// path's `fc` reads it in f32, the two write the same cache, and handed
+    /// f16 it reads the f32 bytes as half pairs.
+    fn batch_x_half(c: &Config, n_in: usize, _res: bool) -> bool {
+        n_in != 2 * c.hidden && X_DTYPE == DType::F16
     }
 
     /// Every pipeline a step dispatches.
@@ -642,15 +641,17 @@ mod gpu {
     /// the matmuls go through the matrix-unit GEMM (`lex_msl::gemm`), which
     /// keeps its accumulators in fragments and so does not spill -- and
     /// every token more in a chunk is one fewer read of the 14.5 GB of
-    /// weights over a prompt.
-    pub const PREFILL_MAX: usize = 128;
+    /// weights over a prompt, one fewer set of GEMM tails and one fewer
+    /// warm of the draft head. 512-token prefill on an M4 Max in chunks of
+    /// 128: 204 tok/s; of 256: 218; of 512: 221.
+    pub const PREFILL_MAX: usize = 512;
 
     /// The GEMM chunk sizes. A prompt is cut into these, largest first, and
     /// its last few tokens into one batched-matvec chunk of at most
     /// `MAX_BATCH`: a fixed set of sizes, so the kernels for each are
     /// compiled once at load -- on CUDA each size is seconds of NVRTC, and a
     /// set that grew with every new prompt length would pay them per prompt.
-    const GEMM_SIZES: [usize; 4] = [128, 64, 32, 16];
+    const GEMM_SIZES: [usize; 6] = [512, 256, 128, 64, 32, 16];
 
     /// Every pipeline a batch of `t` tokens dispatches, compiled on first
     /// use of that size.
@@ -684,8 +685,11 @@ mod gpu {
         kv_k: Pipeline,
         kv_v: Pipeline,
         attn: Pipeline,
-        attn_split: Pipeline,
-        attn_combine: Pipeline,
+        /// Split-KV attention, only for a batch that can split (`split_attn`):
+        /// unrolled over every token, a prefill chunk's took most of the
+        /// minute-plus a new cache size spent compiling, and never ran.
+        attn_split: Option<Pipeline>,
+        attn_combine: Option<Pipeline>,
         mul: Pipeline,
         silu: Pipeline,
         /// The batch's last row of the residual into the decode step's
@@ -882,7 +886,11 @@ mod gpu {
                 )?,
                 gates: compile(&gpu, &build_gates_rows(1, hv, dv), 64)?,
                 delta: compile(&gpu, &delta.build_step()?, 128)?,
-                gated_norm: compile(&gpu, &build_gated_norm_rows(1, hv, dv, cfg.eps), 128)?,
+                gated_norm: compile(
+                    &gpu,
+                    &build_gated_norm_rows(1, hv, dv, cfg.eps, DType::F32),
+                    128,
+                )?,
                 rope_q: compile(
                     &gpu,
                     &build_qk_rope_rows(
@@ -922,7 +930,11 @@ mod gpu {
                 attn: compile(&gpu, &attn.build_dynamic()?, 128)?,
                 attn_split: compile(&gpu, &attn.build_split(ATTN_BPS)?, 128)?,
                 attn_combine: compile(&gpu, &attn.build_combine(ATTN_BPS)?, 128)?,
-                mul: compile(&gpu, &build_mul(cfg.heads * cfg.head_dim, 256)?, THREADS)?,
+                mul: compile(
+                    &gpu,
+                    &build_mul(cfg.heads * cfg.head_dim, 256, DType::F32)?,
+                    THREADS,
+                )?,
                 silu: compile(
                     &gpu,
                     &lex_front::llama::silu_mul(cfg.ffn, THREADS, DType::F32)?,
@@ -1017,6 +1029,7 @@ mod gpu {
             let splits = cap.div_ceil(ATTN_BK * ATTN_BPS);
             let acts_for = |t: usize, narrow: bool| {
                 let f = |n: usize| gpu.zeroed::<f32>(t * n);
+                let z = |n: usize| gpu.zeroed::<f32>(t.min(MAX_BATCH) * n);
                 Acts {
                     x: f(cfg.hidden),
                     x2: f(cfg.hidden),
@@ -1036,7 +1049,15 @@ mod gpu {
                     g: f(hv * dv),
                     beta: f(hv * dv),
                     y: f(hv * dv),
-                    mixed: f(hv * dv),
+                    // Read back by out_proj and o_proj, every token's row
+                    // held in cache at once: f32 at four tokens was 96 KB
+                    // of it, and those two matvecs cost 3.5x a step's
+                    // (`lex_msl::few`).
+                    mixed: if narrow {
+                        gpu.zeroed::<f16>(t * hv * dv)
+                    } else {
+                        f(hv * dv)
+                    },
                     q32: f(2 * cfg.heads * cfg.head_dim),
                     k32: f(cfg.kv_heads * cfg.head_dim),
                     v32: f(cfg.kv_heads * cfg.head_dim),
@@ -1044,7 +1065,11 @@ mod gpu {
                     k16: gpu.zeroed::<f16>(t * cfg.kv_heads * cfg.head_dim),
                     gate: f(cfg.heads * cfg.head_dim),
                     attn: f(cfg.heads * cfg.head_dim),
-                    gated: f(cfg.heads * cfg.head_dim),
+                    gated: if narrow {
+                        gpu.zeroed::<f16>(t * cfg.heads * cfg.head_dim)
+                    } else {
+                        f(cfg.heads * cfg.head_dim)
+                    },
                     ffn_g: f(cfg.ffn),
                     ffn_u: f(cfg.ffn),
                     ffn_a: if narrow {
@@ -1059,9 +1084,13 @@ mod gpu {
                     scalars_attn: gpu.zeroed::<u32>(2),
                     scalars_len: gpu.zeroed::<u32>(1),
                     scalars_nsplit: gpu.zeroed::<u32>(2),
-                    part_m: f(splits * cfg.heads),
-                    part_l: f(splits * cfg.heads),
-                    part_acc: f(splits * cfg.heads * cfg.head_dim),
+                    // Split-KV attention's partials. Only a batch of up to
+                    // MAX_BATCH ever splits (`split_attn`), so only that
+                    // many rows: sized by the batch, at 16k of context and
+                    // a 512-token chunk they were 6.4 GB never touched.
+                    part_m: z(splits * cfg.heads),
+                    part_l: z(splits * cfg.heads),
+                    part_acc: z(splits * cfg.heads * cfg.head_dim),
                 }
             };
             let acts = acts_for(1, false);
@@ -1366,7 +1395,6 @@ mod gpu {
                 let logits = self.step(last)?;
                 return Ok((vec![last], sampler.pick(&logits)));
             }
-            let trace = std::env::var_os("LEX_SPEC_TRACE").is_some();
             let mark = std::time::Instant::now();
             let (drafts, dists) = self.draft_with(depth, last, Some(&mut *sampler))?;
             let t_draft = mark.elapsed().as_secs_f64() * 1e3;
@@ -1374,7 +1402,52 @@ mod gpu {
                 let logits = self.step(last)?;
                 return Ok((vec![last], sampler.pick(&logits)));
             }
+            self.verify_drafts(last, &drafts, &dists, sampler, None, t_draft)
+        }
 
+        /// A speculative round on drafts proposed from outside the model --
+        /// the tokens that followed an earlier occurrence of the context's
+        /// last few (`crate::spec::lookup`).
+        ///
+        /// A proposal is a distribution with all its weight on one token,
+        /// and [`Sampler::verify_proposal`] takes any distribution, so what
+        /// comes out is distributed exactly as without it, sampled or not.
+        /// At most [`MAX_DEPTH`] drafts are verified; more are dropped.
+        pub fn speculate_proposed(
+            &mut self,
+            last: u32,
+            drafts: &[u32],
+            sampler: &mut Sampler,
+        ) -> Result<(Vec<u32>, u32), String> {
+            let drafts = &drafts[..drafts.len().min(MAX_DEPTH)];
+            if drafts.is_empty() {
+                let logits = self.step(last)?;
+                return Ok((vec![last], sampler.pick(&logits)));
+            }
+            let dists: Vec<Nucleus> = drafts.iter().map(|&t| (vec![t], vec![1.0])).collect();
+            // The hidden state before `last`: the head never drafted from it
+            // this round, so its cache has no pair for `last` yet.
+            let before = self.spec_h.take().unwrap_or_else(|| self.hidden());
+            self.verify_drafts(last, drafts, &dists, sampler, Some(before), 0.0)
+        }
+
+        /// Feed `last` and the drafts in one pass, keep the drafts up to the
+        /// first the model disagrees with, and undo the rest.
+        ///
+        /// `unheaded` is the hidden state before `last` when the drafts did
+        /// not come from the head, so the head's cache is missing the pair
+        /// its own first draft would have written; it is written here with
+        /// the accepted rows'.
+        fn verify_drafts(
+            &mut self,
+            last: u32,
+            drafts: &[u32],
+            dists: &[Nucleus],
+            sampler: &mut Sampler,
+            unheaded: Option<Vec<f32>>,
+            t_draft: f64,
+        ) -> Result<(Vec<u32>, u32), String> {
+            let trace = std::env::var_os("LEX_SPEC_TRACE").is_some();
             // `save` exists for the replay path: restore the pre-batch
             // state, feed the accepted prefix again. With per-token
             // snapshots nothing reads it, so on that path it is 0.8 ms of
@@ -1391,7 +1464,7 @@ mod gpu {
             }
             let t_save = mark.elapsed().as_secs_f64() * 1e3;
             let mut fed = vec![last];
-            fed.extend(&drafts);
+            fed.extend(drafts);
             let mark = std::time::Instant::now();
             let logits = self.forward_with(&fed, Head::All, true)?;
             let t_verify = mark.elapsed().as_secs_f64() * 1e3;
@@ -1452,11 +1525,24 @@ mod gpu {
             // the model's hidden states: row i of the verify with the token
             // after it.
             if self.mtp.is_some() {
-                // The round's first token sat at `pos - kept - 1`; its pair
-                // is at the position before that, so the head resumes here.
-                self.mtp_pos = self.pos - kept - 1;
-                if kept > 0 {
-                    self.mtp_warm(&rows[..kept * h], &fed[1..=kept])?;
+                match unheaded {
+                    None => {
+                        // The round's first token sat at `pos - kept - 1`;
+                        // its pair is at the position before that, which
+                        // the first draft wrote, so the head resumes here.
+                        self.mtp_pos = self.pos - kept - 1;
+                        if kept > 0 {
+                            self.mtp_warm(&rows[..kept * h], &fed[1..=kept])?;
+                        }
+                    }
+                    Some(before) => {
+                        // No draft wrote that pair: one position further
+                        // back, with the state before `last` paired with it.
+                        self.mtp_pos = self.pos - kept - 2;
+                        let mut hs = before;
+                        hs.extend_from_slice(&rows[..kept * h]);
+                        self.mtp_warm(&hs, &fed[..=kept])?;
+                    }
                 }
             }
             self.spec_h = Some(carry);
@@ -1480,6 +1566,29 @@ mod gpu {
         /// Does this checkpoint carry a draft head?
         pub fn has_mtp(&self) -> bool {
             self.mtp.is_some()
+        }
+
+        /// The draft head's cached keys for positions `0..n`, head by head,
+        /// for the tests: a cache entry left unwritten changes the head's
+        /// drafts too little to see from outside (it leans on its input far
+        /// more than on its cache), so the tests compare the cache itself.
+        #[doc(hidden)]
+        pub fn head_keys(&self, n: usize) -> Vec<f32> {
+            let Some(m) = &self.mtp else { return vec![] };
+            let Mixer::Attn(at) = &m.layer.mixer else {
+                return vec![];
+            };
+            let (kh, d, cap) = (self.cfg.kv_heads, self.cfg.head_dim, self.cap);
+            let mut all = vec![f16::ZERO; kh * cap * d];
+            self.gpu.download(&at.kcache, &mut all);
+            let n = n.min(cap);
+            (0..kh)
+                .flat_map(|h| {
+                    all[h * cap * d..(h * cap + n) * d]
+                        .iter()
+                        .map(|x| x.to_f32())
+                })
+                .collect()
         }
 
         /// Draft the next `depth` tokens with the checkpoint's own
@@ -1818,7 +1927,9 @@ mod gpu {
             if split_attn(t, nsplit) {
                 d.push((
                     "mtp attention",
-                    &k.attn_split,
+                    k.attn_split
+                        .as_ref()
+                        .expect("split_attn: a batch that splits has them"),
                     vec![
                         &a.q16,
                         &at.kcache,
@@ -1832,7 +1943,9 @@ mod gpu {
                 ));
                 d.push((
                     "mtp attention",
-                    &k.attn_combine,
+                    k.attn_combine
+                        .as_ref()
+                        .expect("split_attn: a batch that splits has them"),
                     vec![
                         &a.part_m,
                         &a.part_l,
@@ -2226,7 +2339,7 @@ mod gpu {
             let want = std::env::var("LEX_PREFILL_CHUNK")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(128);
+                .unwrap_or(PREFILL_MAX);
             GEMM_SIZES
                 .into_iter()
                 .find(|&g| g <= want)
@@ -2275,12 +2388,9 @@ mod gpu {
             for key in want {
                 if let std::collections::hash_map::Entry::Vacant(slot) = mv.entry(key) {
                     let (n_in, n_out, res, layout) = key;
-                    // `res` marks the matmuls that accumulate into the
-                    // residual -- down and o_proj -- and those read ffn_a
-                    // and gated, not `h`, so they keep f32 inputs.
-                    // Every batched matmul now reads a narrowed buffer
-                    // except o_proj, which reads `gated`.
-                    // The draft head's `fc` is the exception: it reads a
+                    // Every batched matmul reads a narrowed buffer (see
+                    // `batch_x_half`). The draft head's `fc` is the
+                    // exception: it reads a
                     // fused input built on the host rather than a narrowed
                     // `h`, and the decode path's `fc` reads it in f32. The
                     // two write the same cache -- the batched one warming
@@ -2398,7 +2508,15 @@ mod gpu {
                 )?,
                 conv: compile(
                     gpu,
-                    &build_conv_silu_rows(t, ch, c.conv_kernel, 256)?,
+                    // A prefill chunk walks every token in each instance:
+                    // 128 channels an instance gives it 80 of them rather
+                    // than 40 (452 -> 334 us a call at 512 tokens).
+                    &build_conv_silu_rows(
+                        t,
+                        ch,
+                        c.conv_kernel,
+                        if t > MAX_BATCH { 128 } else { 256 },
+                    )?,
                     THREADS,
                 )?,
                 qk_q: compile(
@@ -2455,7 +2573,7 @@ mod gpu {
                         compile(gpu, &delta.build_steps(t)?, 128)?
                     }
                 },
-                gated_norm: compile(gpu, &build_gated_norm_rows(t, hv, dv, c.eps), 128)?,
+                gated_norm: compile(gpu, &build_gated_norm_rows(t, hv, dv, c.eps, X_DTYPE), 128)?,
                 rope_q: compile(
                     gpu,
                     &build_qk_rope_rows(t, c.heads, c.head_dim, c.rot, true, DType::F16, c.eps)?,
@@ -2484,13 +2602,78 @@ mod gpu {
                     &kv_append_rows(t, c.kv_heads, c.head_dim, self.cap, DType::F32),
                     64,
                 )?,
-                attn: compile(gpu, &attn.build_causal_blocks(t, attn_tq(t))?, 128)?,
-                attn_split: compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128)?,
-                attn_combine: compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128)?,
-                mul: compile(gpu, &build_mul(t * c.heads * c.head_dim, 256)?, THREADS)?,
+                attn: {
+                    // A prefill chunk's attention on the matrix units on
+                    // Metal (`lex_msl::attn`); verify batches and CUDA keep
+                    // the program. `LEX_ATTN_PROGRAM=1` keeps it everywhere.
+                    let mma = lex_msl::attn::Causal {
+                        tokens: t,
+                        kv_heads: c.kv_heads,
+                        group: c.heads / c.kv_heads,
+                        head_dim: c.head_dim,
+                        cap: self.cap,
+                    };
+                    if t > MAX_BATCH
+                        && crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
+                        && lex_msl::attn::fits(&mma)
+                        && std::env::var_os("LEX_ATTN_PROGRAM").is_none()
+                    {
+                        gpu.build_lowered(&lex_msl::attn::causal_mma(&mma)?)?
+                    } else {
+                        compile(gpu, &attn.build_causal_blocks(t, attn_tq(t))?, 128)?
+                    }
+                },
+                attn_split: (t <= MAX_BATCH)
+                    .then(|| {
+                        // A verify's tokens on the matrix units, every token
+                        // in one pass over each block (`lex_msl::attn`): the
+                        // program's per-token scalar accumulators made a
+                        // verify of four cost 1.60 steps at 8000 positions.
+                        // `LEX_ATTN_SPLIT_PROGRAM=1` keeps the program.
+                        let mma = lex_msl::attn::Causal {
+                            tokens: t,
+                            kv_heads: c.kv_heads,
+                            group: c.heads / c.kv_heads,
+                            head_dim: c.head_dim,
+                            cap: self.cap,
+                        };
+                        let span = ATTN_BK * ATTN_BPS;
+                        // From two tokens: one fills a quarter of the
+                        // tile, and at 8000 positions was 44.8 ms against
+                        // the program's 42.3.
+                        if t >= 2
+                            && crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
+                            && lex_msl::attn::fits_split(&mma, span)
+                            && std::env::var_os("LEX_ATTN_SPLIT_PROGRAM").is_none()
+                        {
+                            gpu.build_lowered(&lex_msl::attn::causal_mma_split(&mma, span)?)
+                        } else {
+                            compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128)
+                        }
+                    })
+                    .transpose()?,
+                attn_combine: (t <= MAX_BATCH)
+                    .then(|| compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128))
+                    .transpose()?,
+                mul: compile(
+                    gpu,
+                    &build_mul(t * c.heads * c.head_dim, 256, X_DTYPE)?,
+                    THREADS,
+                )?,
                 silu: compile(
                     gpu,
-                    &lex_front::llama::silu_mul(t * c.ffn, THREADS, X_DTYPE)?,
+                    // Four elements a thread where the size allows: one a
+                    // thread read 170 GB/s at a 512-token chunk on an M4
+                    // Max (530 us a call), four 560 (162 us).
+                    &lex_front::llama::silu_mul(
+                        t * c.ffn,
+                        if (t * c.ffn).is_multiple_of(4 * THREADS) {
+                            4 * THREADS
+                        } else {
+                            THREADS
+                        },
+                        X_DTYPE,
+                    )?,
                     THREADS,
                 )?,
                 last_row: compile(
@@ -2773,7 +2956,9 @@ mod gpu {
                         if split_attn(t, nsplit) {
                             d.push((
                                 "attention",
-                                &k.attn_split,
+                                k.attn_split
+                                    .as_ref()
+                                    .expect("split_attn: a batch that splits has them"),
                                 vec![
                                     &a.q16,
                                     &at.kcache,
@@ -2787,7 +2972,9 @@ mod gpu {
                             ));
                             d.push((
                                 "attention",
-                                &k.attn_combine,
+                                k.attn_combine
+                                    .as_ref()
+                                    .expect("split_attn: a batch that splits has them"),
                                 vec![
                                     &a.part_m,
                                     &a.part_l,
