@@ -78,6 +78,15 @@ CALL = {"role": "assistant", "content": "", "tool_calls": [
 
 CASES = {
     "plain":            {"messages": [U("hi")]},
+    # Ollama's `think: false`, which lex-code sends (OLLAMA_THINK=false).
+    "no_think":         {"messages": [U("hi")],
+                         "chat_template_kwargs": {"enable_thinking": False}},
+    "no_think_tools":   {"messages": [U("What is 17 + 25?")], "tools": [ADD],
+                         "chat_template_kwargs": {"enable_thinking": False}},
+    "no_think_tool_result": {"messages": [U("What is 17 + 25?"), CALL,
+                                          {"role": "tool", "content": "42"}],
+                             "tools": [ADD],
+                             "chat_template_kwargs": {"enable_thinking": False}},
     "system":           {"messages": [S("Be brief."), U("hi")]},
     "tools":            {"messages": [U("What is 17 + 25?")], "tools": [ADD]},
     "system_tools":     {"messages": [S("Be brief."), U("hi")], "tools": [ADD]},
@@ -241,7 +250,10 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     print(f"template from {path}")
     for name, req in sorted(CASES.items()):
-        kw = {k: v for k, v in req.items() if k != "messages"}
+        kw = {k: v for k, v in req.items() if k not in ("messages", "chat_template_kwargs")}
+        # What a server does with chat_template_kwargs: hand them to the
+        # template as variables.
+        kw.update(req.get("chat_template_kwargs", {}))
         want = t.render(messages=for_template(req["messages"]),
                         add_generation_prompt=True, **kw)
         # Key order is part of the prompt, so the request keeps its own.
