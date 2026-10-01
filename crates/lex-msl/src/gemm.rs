@@ -22,7 +22,8 @@
 //! memory, which is what makes NVFP4 and the matrix units compatible at
 //! all -- multiply-accumulate in fragments, and write back through shared
 //! memory so partial tiles can be guarded.
-//! - CUDA: `wmma` 16x16x16, 64x64 tiles, four warps of 32x32.
+//! - CUDA: `wmma` 16x16x16, 128x128 tiles at a full chunk on eight warps
+//!   of 64x32, 64 inputs a step, tiles loaded 16 bytes at a time.
 //! - Metal: `simdgroup_matrix` 8x8, 64x128 tiles at a full chunk on eight
 //!   simdgroups of 32x32, the next step's loads in registers while this
 //!   step multiplies, and each lane's accumulators written straight out.
@@ -95,13 +96,43 @@ fn cuda(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
             .and_then(|v| v.parse().ok())
             .unwrap_or(d)
     };
-    // A chunk of 16 or 32 tokens would spend most of a 64-row tile on
-    // padding; halve the tile instead.
-    let bm = pick("LEX_GEMM_CU_BM", if g.m <= 32 { 32 } else { 64 });
-    let bn = pick("LEX_GEMM_CU_BN", 64);
-    let bk = pick("LEX_GEMM_CU_BK", BK);
-    let (wgm, wgn) = (pick("LEX_GEMM_CU_WM", 2), pick("LEX_GEMM_CU_WN", 2));
-    let vec = pick("LEX_GEMM_CU_VEC", 0) == 1;
+    // Measured on an L4 at 512 tokens (`examples/gemm_bench`), TFLOPS for
+    // gate/up, down, qkv, out_proj:
+    //
+    //   64x64, BK 32, 4 warps, scalar loads (the first)   19 22 25 28
+    //   the same, 16-byte loads                           23 27 35 36
+    //   128x64, 16-byte loads                             32 32 47 42
+    //   128x128, BK 64, 8 warps, 16-byte loads            41 36 55 47
+    //
+    // Taller tiles decode each weight for more tokens -- the FP4 decode,
+    // not the multiply, is what a tile costs on Ada -- and a deeper K step
+    // halves the barriers. A chunk of 64 tokens or fewer keeps the smaller
+    // tile rather than spend most of one on padding.
+    let full = g.m > 64;
+    let bm = pick(
+        "LEX_GEMM_CU_BM",
+        if g.m <= 32 {
+            32
+        } else if full {
+            128
+        } else {
+            64
+        },
+    );
+    let bn = pick("LEX_GEMM_CU_BN", if full { 128 } else { 64 });
+    let bk = pick(
+        "LEX_GEMM_CU_BK",
+        if full && g.k.is_multiple_of(64) {
+            64
+        } else {
+            BK
+        },
+    );
+    let (wgm, wgn) = (
+        pick("LEX_GEMM_CU_WM", 2),
+        pick("LEX_GEMM_CU_WN", if full { 4 } else { 2 }),
+    );
+    let vec = pick("LEX_GEMM_CU_VEC", 1) == 1;
     let threads = 32 * wgm * wgn;
     // Each warp owns a (bm/wgm) x (bn/wgn) block of 16x16 fragments.
     let (wtm, wtn) = (bm / wgm, bn / wgn);
