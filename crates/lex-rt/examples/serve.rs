@@ -31,7 +31,7 @@ mod serve {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use lex_rt::chat::{self, Piece, Stream, Template};
-    use lex_rt::json::Json;
+    use lex_rt::json::{Json, Map};
     use lex_rt::qwen_run::{Checkpoint, MAX_DEPTH, Runner, evict_index};
     use lex_rt::sample::Sampler;
     use lex_rt::spec::DepthController;
@@ -293,7 +293,22 @@ mod serve {
                     quote(model)
                 ),
             ),
-            ("POST", "/v1/chat/completions") => chat(conn, rt, ctx, &body, cache),
+            ("POST", "/v1/chat/completions") => match Json::parse(&body) {
+                Ok(j) => chat(conn, rt, ctx, &j, cache, Api::OpenAi),
+                Err(e) => bad_request(conn, &e),
+            },
+            // Ollama's own API, so a client written for Ollama -- lex-code's
+            // `--ollama` path -- runs on lex by pointing OLLAMA_HOST here.
+            ("POST", "/api/chat") => match Json::parse(&body) {
+                Ok(o) => chat(conn, rt, ctx, &from_ollama(&o), cache, Api::Ollama),
+                Err(e) => bad_request(conn, &e),
+            },
+            ("GET", "/api/tags") => send(
+                conn,
+                200,
+                "application/json",
+                &format!(r#"{{"models":[{{"name":{0},"model":{0}}}]}}"#, quote(model)),
+            ),
             ("GET", "/health") => send(conn, 200, "text/plain", "ok\n"),
             _ => send(
                 conn,
@@ -304,12 +319,94 @@ mod serve {
         }
     }
 
+    /// Which wire a request came in on, and so which shape the reply takes.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Api {
+        OpenAi,
+        Ollama,
+    }
+
+    fn bad_request(conn: &mut TcpStream, e: &str) -> Result<(), String> {
+        send(
+            conn,
+            400,
+            "application/json",
+            &format!(r#"{{"error":{{"message":{}}}}}"#, quote(e)),
+        )
+    }
+
+    /// An Ollama `/api/chat` request as the OpenAI-shaped one the template
+    /// reads. Ollama's defaults where it has them: a stream unless asked
+    /// otherwise, and a reply bounded only by the context (`num_predict`
+    /// absent or negative). `think: false` turns thinking off as the
+    /// template's `enable_thinking` does; a level is a reasoning effort
+    /// (`high` is the template's `xhigh`). An assistant message's
+    /// `thinking` is its `reasoning_content`; tool-call arguments arrive as
+    /// objects, which the template takes as they are.
+    fn from_ollama(o: &Json) -> Json {
+        let mut m = Map::new();
+        let msgs: Vec<Json> = o
+            .get("messages")
+            .and_then(Json::arr)
+            .unwrap_or(&[])
+            .iter()
+            .map(|msg| match (msg, msg.get("thinking")) {
+                (Json::Obj(mm), Some(t)) => {
+                    let mut mm = mm.clone();
+                    mm.insert("reasoning_content".into(), t.clone());
+                    Json::Obj(mm)
+                }
+                _ => msg.clone(),
+            })
+            .collect();
+        m.insert("messages".into(), Json::Arr(msgs));
+        if let Some(t) = o.get("tools") {
+            m.insert("tools".into(), t.clone());
+        }
+        m.insert(
+            "stream".into(),
+            Json::Bool(!matches!(o.get("stream"), Some(Json::Bool(false)))),
+        );
+        let opt = |k: &str| o.get("options").and_then(|x| x.get(k)).cloned();
+        let predict = opt("num_predict").and_then(|n| n.num()).unwrap_or(-1.0);
+        let max = if predict > 0.0 { predict } else { 1e9 };
+        m.insert("max_tokens".into(), Json::Num(max));
+        for k in ["temperature", "top_p", "top_k", "seed"] {
+            if let Some(v) = opt(k) {
+                m.insert(k.into(), v);
+            }
+        }
+        match o.get("think") {
+            Some(Json::Bool(false)) => {
+                let mut kw = Map::new();
+                kw.insert("enable_thinking".into(), Json::Bool(false));
+                m.insert("chat_template_kwargs".into(), Json::Obj(kw));
+            }
+            Some(Json::Str(level)) => {
+                let effort = if level == "high" { "xhigh" } else { level };
+                m.insert("reasoning_effort".into(), Json::Str(effort.into()));
+            }
+            _ => {}
+        }
+        Json::Obj(m)
+    }
+
+    /// A tool call's arguments as Ollama sends them: the object itself, not
+    /// a string holding it.
+    fn args_object(arguments: &str) -> String {
+        match Json::parse(arguments) {
+            Ok(Json::Obj(_)) => arguments.to_string(),
+            _ => "{}".to_string(),
+        }
+    }
+
     fn chat(
         conn: &mut TcpStream,
         rt: &mut Runner,
         ctx: &Ctx,
-        body: &str,
+        j: &Json,
         cache: &mut Cache,
+        api: Api,
     ) -> Result<(), String> {
         let Ctx {
             tok,
@@ -320,17 +417,6 @@ mod serve {
             template,
             defaults,
         } = *ctx;
-        let j = match Json::parse(body) {
-            Ok(j) => j,
-            Err(e) => {
-                return send(
-                    conn,
-                    400,
-                    "application/json",
-                    &format!(r#"{{"error":{{"message":{}}}}}"#, quote(&e)),
-                );
-            }
-        };
         let stream = matches!(j.get("stream"), Some(Json::Bool(true)));
         let asked = j.get("max_tokens").and_then(Json::usize).unwrap_or(512);
         let num = |k: &str| j.get(k).and_then(Json::num);
@@ -350,7 +436,7 @@ mod serve {
         // generate nothing, which is a refusal by another name.
         let room = (max_seq / 4).min(1024);
         let (prompt, dropped) =
-            match template.render_within(&j, max_seq - room, &mut |t| tok.encode(t).len()) {
+            match template.render_within(j, max_seq - room, &mut |t| tok.encode(t).len()) {
                 Ok(p) => p,
                 Err(e) => {
                     return send(
@@ -409,6 +495,72 @@ mod serve {
         // the model writes `17` and only the schema knows it meant a number.
         let types: Vec<Json> = j.get("tools").and_then(Json::arr).unwrap_or(&[]).to_vec();
 
+        if stream && api == Api::Ollama {
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
+                        cache-control: no-cache\r\nconnection: close\r\n\r\n";
+            conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+            // Reasoning in `thinking`, as Ollama streams a thinking model.
+            let piece = |p: &Piece| {
+                let message = match p {
+                    Piece::Reasoning(t) => {
+                        format!(r#""content":"","thinking":{}"#, quote(t))
+                    }
+                    Piece::Content(t) => format!(r#""content":{}"#, quote(t)),
+                };
+                format!(
+                    r#"{{"model":{},"message":{{"role":"assistant",{message}}},"done":false}}"#,
+                    quote(model)
+                )
+            };
+            let mut split = Stream::for_request(template, j);
+            let (text, reason, n) = generate(
+                rt,
+                tok,
+                &ids,
+                stop,
+                depth,
+                want,
+                logits,
+                &mut sampler,
+                &mut |all| {
+                    for p in split.push(all) {
+                        ndjson(conn, &piece(&p))?;
+                    }
+                    Ok(())
+                },
+            )?;
+            let (last, reply) = split.finish(&text, &types);
+            for p in last {
+                ndjson(conn, &piece(&p))?;
+            }
+            let calls: Vec<String> = reply
+                .calls
+                .iter()
+                .map(|c| {
+                    format!(
+                        r#"{{"function":{{"name":{},"arguments":{}}}}}"#,
+                        quote(&c.name),
+                        args_object(&c.arguments)
+                    )
+                })
+                .collect();
+            ndjson(
+                conn,
+                &format!(
+                    r#"{{"model":{},"message":{{"role":"assistant","content":""{}}},"done":true,"done_reason":{},"prompt_eval_count":{},"eval_count":{n}}}"#,
+                    quote(model),
+                    if calls.is_empty() {
+                        String::new()
+                    } else {
+                        format!(r#","tool_calls":[{}]"#, calls.join(","))
+                    },
+                    quote(if reason == "length" { "length" } else { "stop" }),
+                    ids.len()
+                ),
+            )?;
+            return conn.flush().map_err(|e| e.to_string());
+        }
+
         if stream {
             let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
                         cache-control: no-cache\r\nconnection: close\r\n\r\n";
@@ -422,7 +574,7 @@ mod serve {
                 )
             };
             sse(conn, &chunk(r#"{"role":"assistant"}"#, "null".into()))?;
-            let mut split = Stream::new(template);
+            let mut split = Stream::for_request(template, j);
             let (text, reason, _) = generate(
                 rt,
                 tok,
@@ -486,7 +638,34 @@ mod serve {
             &mut sampler,
             &mut |_| Ok(()),
         )?;
-        let reply = template.parse_reply(&text, &types);
+        let reply = template.parse_reply_after(&text, &types, lex_rt::chat::thinks(j));
+        if api == Api::Ollama {
+            let calls: Vec<String> = reply
+                .calls
+                .iter()
+                .map(|c| {
+                    format!(
+                        r#"{{"function":{{"name":{},"arguments":{}}}}}"#,
+                        quote(&c.name),
+                        args_object(&c.arguments)
+                    )
+                })
+                .collect();
+            let payload = format!(
+                r#"{{"model":{},"message":{{"role":"assistant","content":{},"thinking":{}{}}},"done":true,"done_reason":{},"prompt_eval_count":{},"eval_count":{n}}}"#,
+                quote(model),
+                quote(&reply.content),
+                quote(&reply.reasoning),
+                if calls.is_empty() {
+                    String::new()
+                } else {
+                    format!(r#","tool_calls":[{}]"#, calls.join(","))
+                },
+                quote(if reason == "length" { "length" } else { "stop" }),
+                ids.len()
+            );
+            return send(conn, 200, "application/json", &payload);
+        }
         let calls: Vec<String> = reply
             .calls
             .iter()
@@ -675,6 +854,13 @@ mod serve {
         } else {
             "tool_calls"
         }
+    }
+
+    fn ndjson(conn: &mut TcpStream, line: &str) -> Result<(), String> {
+        conn.write_all(line.as_bytes())
+            .and_then(|()| conn.write_all(b"\n"))
+            .and_then(|()| conn.flush())
+            .map_err(|e| e.to_string())
     }
 
     fn sse(conn: &mut TcpStream, data: &str) -> Result<(), String> {
