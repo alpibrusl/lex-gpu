@@ -207,6 +207,21 @@ One request at a time, deliberately: there is one GPU and a 14.5 GB model
 on it, so a second caller queues rather than interleaving two sequences
 through one KV cache. `--port`, `--max-seq` and `--depth` are the knobs.
 
+**Two APIs, one server.** OpenAI's `POST /v1/chat/completions` and Ollama's
+`POST /api/chat` (with `GET /api/tags`), so a client written for Ollama
+runs on lex by pointing `OLLAMA_HOST` at it -- lex-code's own `--ollama`
+agent included, with the same prompt, tools and `think` setting it sends
+Ollama. Thinking is set per request: `reasoning_effort` (`xhigh`, the
+template's default, `medium`, `low`), or off with
+`chat_template_kwargs.enable_thinking: false` -- Ollama's `think: false`.
+
+**The window is `--max-seq`, 65536 by default.** A conversation longer than
+that keeps its system message, its first user message (the task) and the
+tools, and drops the oldest turns after them -- and says so: the reply
+carries `x-lex-dropped-messages: N`. An agent needs the room: at 16384 a
+lex-code session dropped 93 messages on 32 turns and went looking for what
+it had already found (#32).
+
 **It keeps the prefix.** An agent resends its whole history every turn —
 measured at 83–100% shared with the turn before, 92% overall — so the
 server resumes from the furthest point it has already read instead of

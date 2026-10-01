@@ -47,13 +47,14 @@ mod serve {
         let mut model = "qwen3.8:27b-mlx".to_string();
         // 4096 was a decode benchmark's window; an agent's transcript passes
         // it inside a few tool calls, and one of lex-code's tool results
-        // measured 10497 tokens on its own -- at 8192 that is elided on
-        // every turn. 16384 holds a big tool result and some history.
-        //
-        // Not larger, because prefill runs at 66-82 tok/s here and there is
-        // no prefix cache: every turn re-reads the whole transcript, so a
-        // 32k window costs about eight minutes a turn. Raise it with
-        // --max-seq when context matters more than latency.
+        // measured 10497 tokens on its own. 16384 then held a big tool result
+        // and some history, and was kept small because prefill ran at 66-82
+        // tok/s with no prefix cache. Neither holds now: prefill is ~200
+        // tok/s and the prefix cache re-reads only what is new (95% skipped
+        // through a lex-code session, #32). At 16384 that session dropped
+        // 93 messages on 32 turns and the agent looped rediscovering what it
+        // had dropped, so 65536: about 4 GB of cache over the weights, and a
+        // position costs nothing until it is used.
         // Depth 2, measured under sampling at temperature 1.0 on an M4:
         // 25.8 tok/s without speculation, 31.9 at depth 1, 34.9 at 2, 33.8
         // at 3. A sampled target accepts deep drafts less often than a
@@ -61,7 +62,7 @@ mod serve {
         // run each; the step from 1 to 2 is the robust part.
         // `auto` chooses each round from what drafting has been earning
         // (`lex_rt::spec`); a number fixes it, for measuring one depth.
-        let (mut port, mut max_seq, mut depth) = (8080u16, 16384usize, "auto".to_string());
+        let (mut port, mut max_seq, mut depth) = (8080u16, 65536usize, "auto".to_string());
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -447,6 +448,14 @@ mod serve {
                     );
                 }
             };
+        // Said to the client as well as here: a client whose history was cut
+        // has no other way to know (#32), and an agent that does not know
+        // goes looking for what it already found.
+        let dropped_header = if dropped > 0 {
+            format!("x-lex-dropped-messages: {dropped}\r\n")
+        } else {
+            String::new()
+        };
         if dropped > 0 {
             eprintln!("dropped {dropped} of the oldest messages to fit {max_seq} tokens");
         }
@@ -496,8 +505,10 @@ mod serve {
         let types: Vec<Json> = j.get("tools").and_then(Json::arr).unwrap_or(&[]).to_vec();
 
         if stream && api == Api::Ollama {
-            let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
-                        cache-control: no-cache\r\nconnection: close\r\n\r\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
+                 cache-control: no-cache\r\n{dropped_header}connection: close\r\n\r\n"
+            );
             conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
             // Reasoning in `thinking`, as Ollama streams a thinking model.
             let piece = |p: &Piece| {
@@ -562,8 +573,10 @@ mod serve {
         }
 
         if stream {
-            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
-                        cache-control: no-cache\r\nconnection: close\r\n\r\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 cache-control: no-cache\r\n{dropped_header}connection: close\r\n\r\n"
+            );
             conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
             let chunk = |delta: &str, finish: String| {
                 format!(
@@ -664,7 +677,7 @@ mod serve {
                 quote(if reason == "length" { "length" } else { "stop" }),
                 ids.len()
             );
-            return send(conn, 200, "application/json", &payload);
+            return send_with(conn, 200, "application/json", &dropped_header, &payload);
         }
         let calls: Vec<String> = reply
             .calls
@@ -695,7 +708,7 @@ mod serve {
             ids.len(),
             ids.len() + n
         );
-        send(conn, 200, "application/json", &payload)
+        send_with(conn, 200, "application/json", &dropped_header, &payload)
     }
 
     /// Prefill `ids[start..]`, stopping at turn boundaries to keep a
@@ -870,6 +883,17 @@ mod serve {
     }
 
     fn send(conn: &mut TcpStream, code: u16, ty: &str, body: &str) -> Result<(), String> {
+        send_with(conn, code, ty, "", body)
+    }
+
+    /// [`send`] with extra header lines, each ending in `\r\n`.
+    fn send_with(
+        conn: &mut TcpStream,
+        code: u16,
+        ty: &str,
+        extra: &str,
+        body: &str,
+    ) -> Result<(), String> {
         // A refusal the caller only sees as "HTTP 400" is a refusal nobody
         // can act on: the client library reports the status and drops the
         // body, so the reason has to reach this side's log too.
@@ -877,7 +901,7 @@ mod serve {
             eprintln!("{code}: {body}");
         }
         let head = format!(
-            "HTTP/1.1 {code} {}\r\ncontent-type: {ty}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            "HTTP/1.1 {code} {}\r\ncontent-type: {ty}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n",
             if code == 200 { "OK" } else { "Error" },
             body.len()
         );
