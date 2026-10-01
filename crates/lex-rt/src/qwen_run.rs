@@ -2624,7 +2624,33 @@ mod gpu {
                     }
                 },
                 attn_split: (t <= MAX_BATCH)
-                    .then(|| compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128))
+                    .then(|| {
+                        // A verify's tokens on the matrix units, every token
+                        // in one pass over each block (`lex_msl::attn`): the
+                        // program's per-token scalar accumulators made a
+                        // verify of four cost 1.60 steps at 8000 positions.
+                        // `LEX_ATTN_SPLIT_PROGRAM=1` keeps the program.
+                        let mma = lex_msl::attn::Causal {
+                            tokens: t,
+                            kv_heads: c.kv_heads,
+                            group: c.heads / c.kv_heads,
+                            head_dim: c.head_dim,
+                            cap: self.cap,
+                        };
+                        let span = ATTN_BK * ATTN_BPS;
+                        // From two tokens: one fills a quarter of the
+                        // tile, and at 8000 positions was 44.8 ms against
+                        // the program's 42.3.
+                        if t >= 2
+                            && crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
+                            && lex_msl::attn::fits_split(&mma, span)
+                            && std::env::var_os("LEX_ATTN_SPLIT_PROGRAM").is_none()
+                        {
+                            gpu.build_lowered(&lex_msl::attn::causal_mma_split(&mma, span)?)
+                        } else {
+                            compile(gpu, &attn.build_causal_split(t, ATTN_BPS)?, 128)
+                        }
+                    })
                     .transpose()?,
                 attn_combine: (t <= MAX_BATCH)
                     .then(|| compile(gpu, &attn.build_combine_rows(t, ATTN_BPS)?, 128))

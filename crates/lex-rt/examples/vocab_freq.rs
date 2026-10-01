@@ -30,11 +30,15 @@ fn main() -> Result<(), String> {
     let (mut files, mut tokens) = (0usize, 0u64);
     for path in std::io::stdin().lock().lines() {
         let path = path.map_err(|e| e.to_string())?;
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
         if meta.len() as usize > max_bytes {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         for id in tok.encode(&text) {
             let i = id as usize;
             if i >= counts.len() {

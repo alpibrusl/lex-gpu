@@ -16,21 +16,32 @@ model picks.
 
 Positions with no match fall back to the draft head, which is not
 replayed here: it is charged its rate as measured through the server
-(`--head-tokens` per `--head-ms`) a token at a time. Costs of a verify of t rows are the measured ones on an
-M4 Max (`examples/verify`); past four rows they are an assumption, printed
-as such, because nothing verifies more than four yet.
+(`--head-tokens` per `--head-ms`) a token at a time. Costs of a verify of t rows are the measured ones on an M4 Max
+(`examples/verify`) at the round's context length -- the first version took
+them at 300 positions and over-promised on 2000-token prompts, where a
+verify costs more. Past four rows they are an assumption, printed as such.
 """
 import argparse, json, statistics
 
-# ms for a verify of t rows at ~300 positions, M4 Max (M5f); >4 assumed.
-VERIFY_MS = {1: 35.5, 2: 37.5, 3: 38.5, 4: 43.3}
+# ms for a verify of t rows at a context of n positions, M4 Max, after the
+# split matrix-unit verify attention (examples/verify); interpolated
+# linearly in n. Past four rows nothing is measured yet: assumed.
+VERIFY_MS = {  # context: [t=1, 2, 3, 4]
+    300: [36.4, 37.1, 37.3, 42.5],
+    2300: [37.8, 39.5, 39.9, 45.0],
+    8000: [44.8, 46.6, 48.2, 51.9],
+}
 ASSUMED_PER_ROW = 4.5  # beyond 4 rows, until measured
 
 
-def verify_ms(t):
-    if t in VERIFY_MS:
-        return VERIFY_MS[t]
-    return VERIFY_MS[4] + ASSUMED_PER_ROW * (t - 4)
+def verify_ms(t, n):
+    pts = sorted(VERIFY_MS)
+    n = min(max(n, pts[0]), pts[-1])
+    lo = max(p for p in pts if p <= n)
+    hi = min(p for p in pts if p >= n)
+    f = 0.0 if hi == lo else (n - lo) / (hi - lo)
+    row = lambda p: VERIFY_MS[p][min(t, 4) - 1] + ASSUMED_PER_ROW * max(t - 4, 0)
+    return row(lo) + f * (row(hi) - row(lo))
 
 
 def lookup(hist, n_max, n_min, k):
@@ -63,7 +74,7 @@ def replay(prompt, reply, n_max, n_min, k, head_tokens, head_ms, min_accept_n):
             while acc < len(drafts) and acc < len(want) and drafts[acc] == want[acc]:
                 acc += 1
             adv = min(acc + 1, len(reply) - 1 - i)
-            ms += verify_ms(len(drafts) + 1)
+            ms += verify_ms(len(drafts) + 1, len(hist))
             stats["lookup_cycles"] += 1
             stats["lookup_tokens"] += adv
             b = stats["by_n"].setdefault(n, [0, 0, 0])
@@ -84,9 +95,9 @@ def replay(prompt, reply, n_max, n_min, k, head_tokens, head_ms, min_accept_n):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("log")
-    ap.add_argument("--head-tokens", type=float, default=2.61,
-                    help="tokens a head cycle commits, as measured through the server")
-    ap.add_argument("--head-ms", type=float, default=48.4, help="ms a head cycle takes")
+    ap.add_argument("--head-tokens", type=float, default=2.49,
+                    help="tokens a head round commits, as traced through the server")
+    ap.add_argument("--head-ms", type=float, default=50.7, help="ms a head round takes")
     a = ap.parse_args()
     rows = [json.loads(l) for l in open(a.log) if l.strip()]
     print(f"{len(rows)} requests; head alone: {1000 * a.head_tokens / a.head_ms:.1f} tok/s")

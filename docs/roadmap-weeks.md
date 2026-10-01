@@ -662,6 +662,53 @@ saving of ~1 ms a draft, about +1% net. Worth doing only with a ranking
 taken from the model's own output (the FR-Spec construction), a 32k-row
 head reordered to it.
 
+## M5h — drafting from the context, and a verify's attention on the matrix units (2026-10-01)
+
+Decode through the server on a small corpus of requests a coding agent
+makes (`LEX_REQUEST_LOG`, 1000-token replies, greedy, M4 Max, GPU idle):
+
+| decode tok/s | before | split verify attention | + context lookup |
+| --- | --- | --- | --- |
+| whole-file edit, 3.2k-token prompt | 49.1 | 54.4 | **60.8** (+24%) |
+| whole-file edit, 1.3k prompt | 58.1 | 61.2 | **66.7** (+15%) |
+| change one function, 3.2k prompt | 46.9 | 49.6 | **53.4** (+14%) |
+| prose essay | 46.9 | 47.5 | 47.6 |
+
+**Context lookup (#27).** A round whose last four or more tokens occur
+earlier in the prompt or reply drafts the tokens that followed them
+(`lex_rt::spec::lookup`); otherwise the head drafts. Lookup rounds are
+accepted 3.83 tokens of 4 on average; they cover ~64% of a whole-file
+edit's reply, the rest (the reasoning before the code) is prose and goes
+to the head. Verified like any other draft (`Runner::speculate_proposed`,
+a point-mass proposal), so sampled output keeps its distribution. The
+head never drafts in a lookup round, so its cache entry for that round's
+first token is written with the accepted rows afterwards -- a hole there
+changed the head's next draft by only 1e-5, so the golden test compares
+the head's key cache with a clean prefill's (1.2e-3 of scale, 0.50 with
+the fix deleted). `scripts/lookup_replay.py` replays logged requests to
+project a scheme before building it; its first version priced verifies at
+300 positions and promised 74 where 63 came, now it interpolates the
+measured costs by context and matches (66.6 projected, 66.7 measured).
+
+**The verify's attention (#29)** was the cost that grew with context: at
+8000 positions a verify of four tokens cost 1.60 steps (1.25 at 300) --
+the split-KV program carries a scalar accumulator per token and walks
+them one after another. `lex_msl::attn::causal_mma_split` puts every
+token of the verify in one tile of the matrix units, a threadgroup per
+(KV head, 32 positions), and writes the program's partials so the same
+combine merges them:
+
+| verify of 4, M4 Max | before | after |
+| --- | --- | --- |
+| 300 positions | 1.25 steps | 1.19 |
+| 2300 | 1.31 | 1.22 |
+| 8000 | 1.60 | 1.24 |
+
+Also: the batched delta kernel no longer writes the last token's snapshot
+(never rolled back to), and #26 (a frequency-ranked draft vocabulary) was
+measured and dropped -- on code the lookup now drafts most of the reply
+without the head, on prose the list missed 16% of tokens.
+
 ## M5g — vLLM on the L4: lex decodes faster, vLLM prefills 5x faster (2026-10-01)
 
 The same `scripts/engine_bench.py` through both servers on one L4, the
