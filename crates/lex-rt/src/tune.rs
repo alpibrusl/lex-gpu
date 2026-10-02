@@ -134,8 +134,12 @@ impl Tuner {
         if self.mode == Mode::Off {
             return Ok(default);
         }
+        // The default is a candidate too, whether or not the list has it.
         if let Some(c) = self.cache.get(key)
-            && let Some(hit) = candidates.iter().find(|x| name(x) == *c)
+            && let Some(hit) = candidates
+                .iter()
+                .chain(std::iter::once(&default))
+                .find(|x| name(x) == *c)
         {
             return Ok(hit.clone());
         }

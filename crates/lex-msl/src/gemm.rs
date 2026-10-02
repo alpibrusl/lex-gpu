@@ -94,7 +94,10 @@ pub fn gemm_nvfp4_with(
         Backend::Cuda => {
             let sched = schedule.unwrap_or_else(|| cuda_default(g));
             if !cuda_valid(g, &sched) {
-                return Err(format!("gemm {}x{}x{}: schedule {sched:?} does not fit", g.m, g.n, g.k));
+                return Err(format!(
+                    "gemm {}x{}x{}: schedule {sched:?} does not fit",
+                    g.m, g.n, g.k
+                ));
             }
             // The schedule is in the entry name, so two schedules of one
             // shape are two functions, however a loader keys them.

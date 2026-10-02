@@ -437,6 +437,99 @@ mod gpu {
         v
     }
 
+    /// The prefill GEMM for `g`. On CUDA with tuning on, its schedule is
+    /// chosen on this device (`crate::tune`) from `lex_msl::gemm::
+    /// cuda_candidates`, timed on up to four of the model's own matrices of
+    /// the shape and kept only if the output equals the default schedule's.
+    /// An explicit `LEX_GEMM_CU_*` schedule is left alone.
+    fn tuned_gemm(
+        gpu: &Gpu,
+        tuner: &mut crate::tune::Tuner,
+        g: Gemm,
+        mats: &[&QBuf],
+    ) -> Result<Pipeline, String> {
+        use lex_msl::gemm::{
+            Backend, CudaSchedule, cuda_candidates, cuda_default, cuda_overridden, gemm_nvfp4_with,
+        };
+        let backend = crate::dev::gemm_backend();
+        let candidates = cuda_candidates(&g);
+        if backend != Backend::Cuda
+            || tuner.mode() == crate::tune::Mode::Off
+            || mats.is_empty()
+            || cuda_overridden()
+            || candidates.len() < 2
+        {
+            return gpu.build_lowered(&gemm_nvfp4(&g, backend)?);
+        }
+        let def = cuda_default(&g);
+        let base = gemm_nvfp4_with(&g, backend, Some(def))?;
+        let key = format!(
+            "gemm/{}/{}x{}x{}{}{}",
+            crate::tune::digest(&base.source),
+            g.m,
+            g.n,
+            g.k,
+            if g.residual { "r" } else { "" },
+            if g.x_half { "h" } else { "" }
+        );
+        let (m, n, k) = (g.m, g.n, g.k);
+        let xs: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7) % 13) as f32 * 0.01 - 0.06)
+            .collect();
+        let x = if g.x_half {
+            gpu.upload(&xs.iter().map(|&v| f16::from_f32(v)).collect::<Vec<_>>())
+        } else {
+            gpu.upload(&xs)
+        };
+        let r = gpu.upload(&(0..m * n).map(|i| (i % 5) as f32 * 0.1).collect::<Vec<_>>());
+        let y = gpu.zeroed::<f32>(m * n);
+        let res = g.residual.then_some(&r);
+        // Pipelines built while measuring, so the chosen one is not
+        // compiled a second time (on CUDA a compile is the expensive part).
+        let built: std::cell::RefCell<std::collections::HashMap<String, Pipeline>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+        let want = {
+            let p = gpu.build_lowered(&base)?;
+            gpu.run_launches(&[(&p, mats[0].bind(&x, res, &y).as_slice(), None)]);
+            let mut v = vec![0.0f32; m * n];
+            gpu.download(&y, &mut v);
+            built.borrow_mut().insert(def.name(), p);
+            v
+        };
+        let scale = want.iter().fold(1e-6f32, |a, v| a.max(v.abs()));
+        let name = |s: &CudaSchedule| s.name();
+        let chosen = tuner.choose(&key, &candidates, def, name, |s| {
+            let p = gpu.build_lowered(&gemm_nvfp4_with(&g, backend, Some(*s))?)?;
+            gpu.run_launches(&[(&p, mats[0].bind(&x, res, &y).as_slice(), None)]);
+            let mut got = vec![0.0f32; m * n];
+            gpu.download(&y, &mut got);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+                / scale;
+            if err > 1e-3 {
+                return Ok(None);
+            }
+            let binds: Vec<Vec<&Buffer>> = (0..8)
+                .map(|i| mats[i % mats.len()].bind(&x, res, &y))
+                .collect();
+            let steps: Vec<Step<'_>> = binds.iter().map(|b| (&p, b.as_slice(), None)).collect();
+            gpu.run_launches(&steps);
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                best = best.min(gpu.run_launches(&steps).1 / steps.len() as f64);
+            }
+            built.borrow_mut().insert(s.name(), p);
+            Ok(Some(best))
+        })?;
+        match built.borrow_mut().remove(&chosen.name()) {
+            Some(p) => Ok(p),
+            None => gpu.build_lowered(&gemm_nvfp4_with(&g, backend, Some(chosen))?),
+        }
+    }
+
     /// The few-token NVFP4 matvec for `few`, its layout chosen on this
     /// device (`crate::tune`): every layout `lex_msl::few::layouts` offers,
     /// run on up to four of the model's own matrices of this shape -- so the
@@ -1230,11 +1323,9 @@ mod gpu {
             } else {
                 None
             };
-            let mut tuner = if crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal {
-                crate::tune::Tuner::open(&gpu.info().name, false)
-            } else {
-                crate::tune::Tuner::off()
-            };
+            // Off unless `LEX_TUNE=1`: neither backend has been measured to
+            // gain from it by default yet (`crate::tune`).
+            let mut tuner = crate::tune::Tuner::open(&gpu.info().name, false);
             let mats = all_mats(&layers, &lm_head, mtp.as_ref());
             let mats_of = |key: MvKey| -> Vec<&QBuf> {
                 mats.iter()
@@ -2561,8 +2652,14 @@ mod gpu {
                             residual: res,
                             x_half: xt == DType::F16,
                         };
-                        let l = gemm_nvfp4(&g, crate::dev::gemm_backend())?;
-                        slot.insert(gpu.build_lowered(&l)?);
+                        let mats: Vec<&QBuf> =
+                            all_mats(&self.layers, &self.lm_head, self.mtp.as_ref())
+                                .into_iter()
+                                .filter(|(m, r)| m.key(*r) == key)
+                                .map(|(m, _)| m)
+                                .take(4)
+                                .collect();
+                        slot.insert(tuned_gemm(gpu, &mut self.tune.borrow_mut(), g, &mats)?);
                         continue;
                     }
                     // A verify's 2-4 tokens on Metal: each weight decoded
