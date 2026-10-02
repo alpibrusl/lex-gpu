@@ -2427,17 +2427,38 @@ mod gpu {
         /// 151 MB and about 0.4 ms for this model, against the minutes a
         /// re-prefill costs.
         pub fn checkpoint(&self) -> Checkpoint {
+            self.checkpoint_into(None)
+        }
+
+        /// [`Self::checkpoint`] into the memory of one no longer wanted.
+        /// Fresh pages cost: 151 MB of them is 37 000 page faults, which is
+        /// most of what a checkpoint took on an L4 (94 ms, over a 150 MB
+        /// copy that is a few tens of ms at PCIe speed). A pool that drops
+        /// one for each it adds hands the dropped one back.
+        pub fn checkpoint_into(&self, spare: Option<Checkpoint>) -> Checkpoint {
             let n = self.cfg.v_heads * self.cfg.v_dim * self.cfg.k_dim;
             let w = (self.cfg.conv_kernel - 1) * self.cfg.conv_channels();
-            let (mut state, mut conv) = (vec![], vec![]);
-            for l in &self.layers {
+            let layers = self
+                .layers
+                .iter()
+                .filter(|l| matches!(l.mixer, Mixer::Linear(_)));
+            let (mut state, mut conv) = match spare {
+                Some(c)
+                    if c.state.len() == layers.clone().count()
+                        && c.state.iter().all(|x| x.len() == n)
+                        && c.conv.iter().all(|x| x.len() == w) =>
+                {
+                    (c.state, c.conv)
+                }
+                _ => (
+                    layers.clone().map(|_| vec![0.0f32; n]).collect::<Vec<_>>(),
+                    layers.clone().map(|_| vec![0.0f32; w]).collect::<Vec<_>>(),
+                ),
+            };
+            for (i, l) in layers.enumerate() {
                 if let Mixer::Linear(lin) = &l.mixer {
-                    let mut x = vec![0.0f32; n];
-                    self.gpu.download(&lin.state, &mut x);
-                    state.push(x);
-                    let mut c = vec![0.0f32; w];
-                    self.gpu.download(&lin.conv_state, &mut c);
-                    conv.push(c);
+                    self.gpu.download(&lin.state, &mut state[i]);
+                    self.gpu.download(&lin.conv_state, &mut conv[i]);
                 }
             }
             Checkpoint {
