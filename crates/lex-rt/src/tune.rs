@@ -127,10 +127,10 @@ impl Tuner {
         if self.mode == Mode::Off {
             return Ok(default);
         }
-        if let Some(c) = self.cache.get(key) {
-            if let Some(hit) = candidates.iter().find(|x| name(x) == *c) {
-                return Ok(hit.clone());
-            }
+        if let Some(c) = self.cache.get(key)
+            && let Some(hit) = candidates.iter().find(|x| name(x) == *c)
+        {
+            return Ok(hit.clone());
         }
         if Instant::now() > self.deadline {
             self.skipped += 1;
@@ -142,11 +142,11 @@ impl Tuner {
             if name(c) == name(&default) {
                 continue;
             }
-            if let Some(t) = measure(c)? {
-                if t < best_t {
-                    best = c.clone();
-                    best_t = t;
-                }
+            if let Some(t) = measure(c)?
+                && t < best_t
+            {
+                best = c.clone();
+                best_t = t;
             }
         }
         self.cache.insert(key.to_string(), name(&best));
