@@ -14,8 +14,12 @@
 //! budget; a shape it does not reach keeps its default and is not cached,
 //! so a later load finishes the job.
 //!
-//! `LEX_TUNE=0` turns it off (every kernel at its default), `LEX_TUNE=retune`
-//! ignores the cache, `LEX_TUNE_SECONDS` sets the budget (default 60).
+//! `LEX_TUNE=1` turns it on, `LEX_TUNE=0` off (every kernel at its default),
+//! `LEX_TUNE=retune` ignores the cache; `LEX_TUNE_SECONDS` sets the budget
+//! (default 60). Unset, a backend's own default applies -- on only where
+//! tuning has been measured to help: on an M4 Max the decode matvec's
+//! hand-chosen layout was already within noise of the tuned one (end to end,
+//! 51.8 against 51.9 tok/s), and the first load cost 22 s.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -44,11 +48,14 @@ pub struct Tuner {
 
 impl Tuner {
     /// The tuner for `device`, its cache under `~/.cache/lex-gpu/tune/`.
-    pub fn open(device: &str) -> Tuner {
+    /// `default_on` is what an unset `LEX_TUNE` means for this backend.
+    pub fn open(device: &str, default_on: bool) -> Tuner {
         let mode = match std::env::var("LEX_TUNE").as_deref() {
             Ok("0") | Ok("off") => Mode::Off,
             Ok("retune") => Mode::Retune,
-            _ => Mode::Use,
+            Ok("1") | Ok("on") => Mode::Use,
+            _ if default_on => Mode::Use,
+            _ => Mode::Off,
         };
         let budget = std::env::var("LEX_TUNE_SECONDS")
             .ok()

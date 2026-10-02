@@ -217,6 +217,16 @@ and it talks to Ollama without complaint). Thinking is set per request: `reasoni
 template's default, `medium`, `low`), or off with
 `chat_template_kwargs.enable_thinking: false` -- Ollama's `think: false`.
 
+**Kernels can be tuned on the device** (`lex_rt::tune`). A kernel offers
+candidate schedules; the first load on a machine times each on the model's
+own weights, keeps the fastest whose output matches the default schedule's,
+and caches the choice per device in `~/.cache/lex-gpu/tune/`. Today the
+Metal few-token matvec (decode and verify) has it, as `LEX_TUNE=1`; on an M4
+Max it changes nothing measurable, so it is off by default there.
+`LEX_TUNE=retune` ignores the cache, `LEX_TUNE_SECONDS` bounds the search
+(60 by default; a shape it does not reach keeps its default and is finished
+by a later load).
+
 **The window is `--max-seq`, 65536 by default.** A conversation longer than
 that keeps its system message, its first user message (the task) and the
 tools, and drops the oldest turns after them -- and says so: the reply

@@ -1231,7 +1231,7 @@ mod gpu {
                 None
             };
             let mut tuner = if crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal {
-                crate::tune::Tuner::open(&gpu.info().name)
+                crate::tune::Tuner::open(&gpu.info().name, false)
             } else {
                 crate::tune::Tuner::off()
             };
