@@ -151,6 +151,9 @@ mod serve {
     struct Cache {
         tokens: Vec<u32>,
         points: Vec<Checkpoint>,
+        /// Dropped checkpoints, kept for their memory: a new one is read
+        /// into one of these rather than into fresh pages.
+        spare: Vec<Checkpoint>,
     }
 
     /// Roughly a gigabyte of them, at 151 MB each for this model.
@@ -169,16 +172,27 @@ mod serve {
             self.points.push(c);
             while self.points.len() > KEEP {
                 let at: Vec<usize> = self.points.iter().map(Checkpoint::pos).collect();
-                match evict_index(&at) {
+                let gone = match evict_index(&at) {
                     Some(i) => self.points.remove(i),
                     None => self.points.remove(0),
                 };
+                self.spare.push(gone);
             }
         }
 
+        /// Drop every point after the `i`th.
+        fn truncate(&mut self, i: usize) {
+            self.spare.extend(self.points.drain(i..));
+            self.spare.truncate(2);
+        }
+
         fn clear(&mut self) {
-            self.points.clear();
+            self.truncate(0);
             self.tokens.clear();
+        }
+
+        fn checkpoint(&mut self, rt: &Runner) -> Checkpoint {
+            rt.checkpoint_into(self.spare.pop())
         }
     }
 
@@ -482,7 +496,7 @@ mod serve {
             // go through the model for its logits.
             Some(i) if cache.points[i].pos() > 0 && cache.points[i].pos() < ids.len() => {
                 rt.resume(&cache.points[i]);
-                cache.points.truncate(i + 1);
+                cache.truncate(i + 1);
                 cache.points[i].pos()
             }
             _ => {
@@ -744,22 +758,44 @@ mod serve {
         cache: &mut Cache,
     ) -> Result<Vec<f32>, String> {
         let turn = tok.id_of("<|im_start|>");
+        // With the cache off no checkpoint is kept, so the prompt is one
+        // prefill: cutting it at the boundaries would pay a checkpoint (94 ms
+        // on an L4, 151 MB over PCIe) and an extra pass over the weights for
+        // the tail (125 ms) for nothing.
+        let keep = std::env::var_os("LEX_NO_PREFIX_CACHE").is_none();
         let bounds: Vec<usize> = match turn {
-            Some(t) => (start + 1..ids.len()).filter(|&i| ids[i] == t).collect(),
-            None => vec![],
+            Some(t) if keep => (start + 1..ids.len()).filter(|&i| ids[i] == t).collect(),
+            _ => vec![],
         };
+        let trace = std::env::var_os("LEX_PREFILL_TRACE").is_some();
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
         let mut at = start;
         let mut logits = vec![];
         for &b in &bounds {
             if b <= at {
                 continue;
             }
+            let t = std::time::Instant::now();
             logits = rt.prefill(&ids[at..b])?;
+            let took = ms(t);
+            let seg = b - at;
             at = b;
-            cache.push(rt.checkpoint());
+            let t = std::time::Instant::now();
+            let c = cache.checkpoint(rt);
+            cache.push(c);
+            if trace {
+                eprintln!(
+                    "segment {seg} tokens: {took:.0} ms, checkpoint {:.0} ms",
+                    ms(t)
+                );
+            }
         }
         if at < ids.len() {
+            let t = std::time::Instant::now();
             logits = rt.prefill(&ids[at..])?;
+            if trace {
+                eprintln!("last segment {} tokens: {:.0} ms", ids.len() - at, ms(t));
+            }
         }
         Ok(logits)
     }

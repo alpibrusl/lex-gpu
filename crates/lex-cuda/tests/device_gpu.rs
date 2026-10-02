@@ -518,3 +518,109 @@ fn chunked_delta_rule_matches_the_step_program() {
         assert!(ey < 1e-4 && es < 1e-4, "{d:?}: y {ey:e}, state {es:e}");
     }
 }
+
+/// The padded-prefill kernels (`lex_msl::pad`): the a/b projections must
+/// match a host dot product on the real rows and be exactly the no-op gate
+/// value past them, and the convolution window must come from the last real
+/// rows. A wrong row count here is silent -- the state is just a little off
+/// after every prompt that was padded.
+#[test]
+fn the_padding_kernels_compute_the_projections_and_leave_no_trace() {
+    use lex_msl::pad::{NOOP, ab_rows, conv_restore};
+    let Some(g) = gpu() else { return };
+    // Tokens that are, and are not, a whole block of 16; counts of real
+    // rows that cut a block, a warp and a K step.
+    for (tokens, n_in, n_out, nreal, x_half) in [
+        (48usize, 256usize, 48usize, 37usize, true),
+        (48, 256, 48, 48, false),
+        (16, 5120, 48, 9, true),
+        (64, 5120, 48, 47, false),
+    ] {
+        let x = fill(tokens * n_in, 5);
+        let wa = fill(n_out * n_in, 7);
+        let wb = fill(n_out * n_in, 9);
+        // What the kernel reads: x rounded to f16 when it is stored as one.
+        let xr: Vec<f32> = if x_half {
+            x.iter().map(|&v| f16::from_f32(v).to_f32()).collect()
+        } else {
+            x.clone()
+        };
+        let xb = if x_half {
+            g.upload(&x.iter().map(|&v| f16::from_f32(v)).collect::<Vec<_>>())
+        } else {
+            g.upload(&x)
+        };
+        let (wab, wbb) = (g.upload(&wa), g.upload(&wb));
+        let (yab, ybb) = (
+            g.upload(&vec![7.0f32; tokens * n_out]),
+            g.upload(&vec![7.0f32; tokens * n_out]),
+        );
+        let sc = g.upload(&[nreal as u32]);
+        let pipe = g
+            .build_lowered(&ab_rows(tokens, n_in, n_out, x_half).expect("ab_rows"))
+            .expect("compile");
+        g.run(&pipe, &[&xb, &wab, &wbb, &yab, &ybb, &sc])
+            .expect("run");
+        let (mut ya, mut yb) = (vec![0.0f32; tokens * n_out], vec![0.0f32; tokens * n_out]);
+        g.download(&yab, &mut ya);
+        g.download(&ybb, &mut yb);
+        for (got, w) in [(&ya, &wa), (&yb, &wb)] {
+            let mut scale = 1e-6f64;
+            let want: Vec<f64> = (0..tokens * n_out)
+                .map(|i| {
+                    let (t, o) = (i / n_out, i % n_out);
+                    let d: f64 = (0..n_in)
+                        .map(|k| xr[t * n_in + k] as f64 * w[o * n_in + k] as f64)
+                        .sum();
+                    if t < nreal {
+                        scale = scale.max(d.abs());
+                    }
+                    d
+                })
+                .collect();
+            for (i, (&got, &want)) in got.iter().zip(&want).enumerate() {
+                let t = i / n_out;
+                if t >= nreal {
+                    assert_eq!(
+                        got, NOOP,
+                        "{tokens}x{n_in} real {nreal}: row {t} is not padded"
+                    );
+                } else {
+                    let err = (got as f64 - want).abs() / scale;
+                    assert!(
+                        err < 1e-4,
+                        "{tokens}x{n_in} real {nreal} f16 {x_half}: row {t} off by {err:e} of scale"
+                    );
+                }
+            }
+        }
+        eprintln!("ab_rows {tokens}x{n_in}, {nreal} real, x_half {x_half}: agrees");
+    }
+
+    for (tokens, ch, nreal) in [
+        (48usize, 1000usize, 37usize),
+        (16, 10240, 9),
+        (64, 10240, 64),
+    ] {
+        let qkv = fill(tokens * ch, 13);
+        let state = g.upload(&vec![-9.0f32; 3 * ch]);
+        let qb = g.upload(&qkv);
+        let sc = g.upload(&[nreal as u32]);
+        let pipe = g
+            .build_lowered(&conv_restore(tokens, ch, 3).expect("conv_restore"))
+            .expect("compile");
+        g.run(&pipe, &[&state, &qb, &sc]).expect("run");
+        let mut got = vec![0.0f32; 3 * ch];
+        g.download(&state, &mut got);
+        for r in 0..3 {
+            for c in 0..ch {
+                assert_eq!(
+                    got[r * ch + c],
+                    qkv[(nreal - 3 + r) * ch + c],
+                    "{tokens} tokens, {nreal} real: state[{r}][{c}]"
+                );
+            }
+        }
+        eprintln!("conv_restore {tokens}x{ch}, {nreal} real: agrees");
+    }
+}
