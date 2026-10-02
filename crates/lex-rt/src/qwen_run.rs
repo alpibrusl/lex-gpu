@@ -2001,7 +2001,9 @@ mod gpu {
             let mut done = 0;
             // The pieces and the size each runs at: the same when a prompt
             // is cut, a larger size for the last when it is padded.
+            let trace = std::env::var_os("LEX_PREFILL_TRACE").is_some();
             for (t, size) in self.prefill_plan(n) {
+                let t0 = std::time::Instant::now();
                 // Logits for the prompt's last token only: every other row's
                 // are never read, and no chunk before the last has it.
                 let head = if done + t == n {
@@ -2014,12 +2016,21 @@ mod gpu {
                     logits = last;
                 }
                 let hs = self.batch_hidden_all(t);
+                let t_pass = t0.elapsed().as_secs_f64() * 1e3;
                 // The last prompt position pairs with a token the prompt
                 // does not have -- the one the model is about to generate.
                 // That row is the first real draft's, so it is left for it.
                 let warm = t.min(n - 1 - done);
+                let t1 = std::time::Instant::now();
                 if self.mtp.is_some() && warm > 0 {
                     self.mtp_warm(&hs, &tokens[done + 1..done + 1 + warm])?;
+                }
+                if trace {
+                    eprintln!(
+                        "  prefill piece {t} rows as {size}: pass + hidden {t_pass:.0} ms, \
+                         draft-head warm {:.0} ms",
+                        t1.elapsed().as_secs_f64() * 1e3
+                    );
                 }
                 // `forward` leaves the state in `bacts`, and `draft` reads
                 // the single-row `acts`. Handing the last row over is what

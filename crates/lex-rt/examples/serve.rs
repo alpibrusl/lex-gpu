@@ -748,18 +748,34 @@ mod serve {
             Some(t) => (start + 1..ids.len()).filter(|&i| ids[i] == t).collect(),
             None => vec![],
         };
+        let trace = std::env::var_os("LEX_PREFILL_TRACE").is_some();
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
         let mut at = start;
         let mut logits = vec![];
         for &b in &bounds {
             if b <= at {
                 continue;
             }
+            let t = std::time::Instant::now();
             logits = rt.prefill(&ids[at..b])?;
+            let took = ms(t);
             at = b;
+            let t = std::time::Instant::now();
             cache.push(rt.checkpoint());
+            if trace {
+                eprintln!(
+                    "segment {} tokens: {took:.0} ms, checkpoint {:.0} ms",
+                    b - (at - (b - at)).min(b),
+                    ms(t)
+                );
+            }
         }
         if at < ids.len() {
+            let t = std::time::Instant::now();
             logits = rt.prefill(&ids[at..])?;
+            if trace {
+                eprintln!("last segment {} tokens: {:.0} ms", ids.len() - at, ms(t));
+            }
         }
         Ok(logits)
     }
