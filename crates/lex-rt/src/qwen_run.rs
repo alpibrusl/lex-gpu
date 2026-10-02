@@ -748,14 +748,17 @@ mod gpu {
     /// What one prefill pass costs, in rows of compute: the rows it runs,
     /// plus a fixed cost for reading the weights, launching ~700 kernels and
     /// the host's per-pass work. `LEX_PAD_OVERHEAD` sets the fixed part, for
-    /// calibration (`examples/qwen_profile --prefill N` over the sizes).
+    /// calibration. Server prefill on an L4 (tokens per second at 431 / 855
+    /// prompt tokens): fixed 0 195 / 314, 32 301 / 366, 64 321 / 379, 96
+    /// 321 / 389, 192 320 / 354 -- a plateau from 64 to 96, and cutting
+    /// (no padding) 266 / 356.
     fn pass_cost(rows: usize) -> usize {
         static OVERHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let fixed = *OVERHEAD.get_or_init(|| {
             std::env::var("LEX_PAD_OVERHEAD")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(32)
+                .unwrap_or(96)
         });
         rows + fixed
     }
