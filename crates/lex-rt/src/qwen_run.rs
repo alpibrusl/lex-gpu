@@ -2525,10 +2525,11 @@ mod gpu {
         pub fn tune_report(&self) {
             let mut t = self.tune.borrow_mut();
             if !t.measured.is_empty() {
+                // A shape whose default was fastest has a gain of exactly 0.
                 let changed: Vec<String> = t
                     .measured
                     .iter()
-                    .filter(|(_, c, _)| c != "r2s2")
+                    .filter(|(_, _, g)| *g > 0.0)
                     .map(|(k, c, g)| {
                         format!(
                             "{} -> {c} ({:+.1}%)",
@@ -2538,8 +2539,9 @@ mod gpu {
                     })
                     .collect();
                 eprintln!(
-                    "tuned {} shapes on this device, {} changed from the default{}{}",
+                    "tuned {} shapes in {:.0} s, {} changed from the default{}{}",
                     t.measured.len(),
+                    t.elapsed(),
                     changed.len(),
                     if changed.is_empty() { "" } else { ": " },
                     changed.join(", ")

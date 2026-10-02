@@ -38,6 +38,7 @@ pub struct Tuner {
     path: Option<PathBuf>,
     cache: BTreeMap<String, String>,
     deadline: Instant,
+    started: Instant,
     dirty: bool,
     /// What this load measured, for the log: (key, chosen, gain over the
     /// default as a fraction).
@@ -96,6 +97,7 @@ impl Tuner {
             path,
             cache,
             deadline: Instant::now() + Duration::from_secs(budget),
+            started: Instant::now(),
             dirty: false,
             measured: vec![],
             skipped: 0,
@@ -109,10 +111,17 @@ impl Tuner {
             path: None,
             cache: BTreeMap::new(),
             deadline: Instant::now(),
+            started: Instant::now(),
             dirty: false,
             measured: vec![],
             skipped: 0,
         }
+    }
+
+    /// Seconds since this tuner was opened: what a load spent, tuning
+    /// included.
+    pub fn elapsed(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
     }
 
     pub fn mode(&self) -> Mode {
