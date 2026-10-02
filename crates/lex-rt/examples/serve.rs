@@ -31,7 +31,7 @@ mod serve {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use lex_rt::chat::{self, Piece, Stream, Template};
-    use lex_rt::json::Json;
+    use lex_rt::json::{Json, Map};
     use lex_rt::qwen_run::{Checkpoint, MAX_DEPTH, Runner, evict_index};
     use lex_rt::sample::Sampler;
     use lex_rt::spec::DepthController;
@@ -47,13 +47,14 @@ mod serve {
         let mut model = "qwen3.8:27b-mlx".to_string();
         // 4096 was a decode benchmark's window; an agent's transcript passes
         // it inside a few tool calls, and one of lex-code's tool results
-        // measured 10497 tokens on its own -- at 8192 that is elided on
-        // every turn. 16384 holds a big tool result and some history.
-        //
-        // Not larger, because prefill runs at 66-82 tok/s here and there is
-        // no prefix cache: every turn re-reads the whole transcript, so a
-        // 32k window costs about eight minutes a turn. Raise it with
-        // --max-seq when context matters more than latency.
+        // measured 10497 tokens on its own. 16384 then held a big tool result
+        // and some history, and was kept small because prefill ran at 66-82
+        // tok/s with no prefix cache. Neither holds now: prefill is ~200
+        // tok/s and the prefix cache re-reads only what is new (95% skipped
+        // through a lex-code session, #32). At 16384 that session dropped
+        // 93 messages on 32 turns and the agent looped rediscovering what it
+        // had dropped, so 65536: about 4 GB of cache over the weights, and a
+        // position costs nothing until it is used.
         // Depth 2, measured under sampling at temperature 1.0 on an M4:
         // 25.8 tok/s without speculation, 31.9 at depth 1, 34.9 at 2, 33.8
         // at 3. A sampled target accepts deep drafts less often than a
@@ -61,7 +62,7 @@ mod serve {
         // run each; the step from 1 to 2 is the robust part.
         // `auto` chooses each round from what drafting has been earning
         // (`lex_rt::spec`); a number fixes it, for measuring one depth.
-        let (mut port, mut max_seq, mut depth) = (8080u16, 16384usize, "auto".to_string());
+        let (mut port, mut max_seq, mut depth) = (8080u16, 65536usize, "auto".to_string());
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -293,7 +294,22 @@ mod serve {
                     quote(model)
                 ),
             ),
-            ("POST", "/v1/chat/completions") => chat(conn, rt, ctx, &body, cache),
+            ("POST", "/v1/chat/completions") => match Json::parse(&body) {
+                Ok(j) => chat(conn, rt, ctx, &j, cache, Api::OpenAi),
+                Err(e) => bad_request(conn, &e),
+            },
+            // Ollama's own API, so a client written for Ollama -- lex-code's
+            // `--ollama` path -- runs on lex by pointing OLLAMA_HOST here.
+            ("POST", "/api/chat") => match Json::parse(&body) {
+                Ok(o) => chat(conn, rt, ctx, &from_ollama(&o), cache, Api::Ollama),
+                Err(e) => bad_request(conn, &e),
+            },
+            ("GET", "/api/tags") => send(
+                conn,
+                200,
+                "application/json",
+                &format!(r#"{{"models":[{{"name":{0},"model":{0}}}]}}"#, quote(model)),
+            ),
             ("GET", "/health") => send(conn, 200, "text/plain", "ok\n"),
             _ => send(
                 conn,
@@ -304,12 +320,94 @@ mod serve {
         }
     }
 
+    /// Which wire a request came in on, and so which shape the reply takes.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Api {
+        OpenAi,
+        Ollama,
+    }
+
+    fn bad_request(conn: &mut TcpStream, e: &str) -> Result<(), String> {
+        send(
+            conn,
+            400,
+            "application/json",
+            &format!(r#"{{"error":{{"message":{}}}}}"#, quote(e)),
+        )
+    }
+
+    /// An Ollama `/api/chat` request as the OpenAI-shaped one the template
+    /// reads. Ollama's defaults where it has them: a stream unless asked
+    /// otherwise, and a reply bounded only by the context (`num_predict`
+    /// absent or negative). `think: false` turns thinking off as the
+    /// template's `enable_thinking` does; a level is a reasoning effort
+    /// (`high` is the template's `xhigh`). An assistant message's
+    /// `thinking` is its `reasoning_content`; tool-call arguments arrive as
+    /// objects, which the template takes as they are.
+    fn from_ollama(o: &Json) -> Json {
+        let mut m = Map::new();
+        let msgs: Vec<Json> = o
+            .get("messages")
+            .and_then(Json::arr)
+            .unwrap_or(&[])
+            .iter()
+            .map(|msg| match (msg, msg.get("thinking")) {
+                (Json::Obj(mm), Some(t)) => {
+                    let mut mm = mm.clone();
+                    mm.insert("reasoning_content".into(), t.clone());
+                    Json::Obj(mm)
+                }
+                _ => msg.clone(),
+            })
+            .collect();
+        m.insert("messages".into(), Json::Arr(msgs));
+        if let Some(t) = o.get("tools") {
+            m.insert("tools".into(), t.clone());
+        }
+        m.insert(
+            "stream".into(),
+            Json::Bool(!matches!(o.get("stream"), Some(Json::Bool(false)))),
+        );
+        let opt = |k: &str| o.get("options").and_then(|x| x.get(k)).cloned();
+        let predict = opt("num_predict").and_then(|n| n.num()).unwrap_or(-1.0);
+        let max = if predict > 0.0 { predict } else { 1e9 };
+        m.insert("max_tokens".into(), Json::Num(max));
+        for k in ["temperature", "top_p", "top_k", "seed"] {
+            if let Some(v) = opt(k) {
+                m.insert(k.into(), v);
+            }
+        }
+        match o.get("think") {
+            Some(Json::Bool(false)) => {
+                let mut kw = Map::new();
+                kw.insert("enable_thinking".into(), Json::Bool(false));
+                m.insert("chat_template_kwargs".into(), Json::Obj(kw));
+            }
+            Some(Json::Str(level)) => {
+                let effort = if level == "high" { "xhigh" } else { level };
+                m.insert("reasoning_effort".into(), Json::Str(effort.into()));
+            }
+            _ => {}
+        }
+        Json::Obj(m)
+    }
+
+    /// A tool call's arguments as Ollama sends them: the object itself, not
+    /// a string holding it.
+    fn args_object(arguments: &str) -> String {
+        match Json::parse(arguments) {
+            Ok(Json::Obj(_)) => arguments.to_string(),
+            _ => "{}".to_string(),
+        }
+    }
+
     fn chat(
         conn: &mut TcpStream,
         rt: &mut Runner,
         ctx: &Ctx,
-        body: &str,
+        j: &Json,
         cache: &mut Cache,
+        api: Api,
     ) -> Result<(), String> {
         let Ctx {
             tok,
@@ -320,17 +418,6 @@ mod serve {
             template,
             defaults,
         } = *ctx;
-        let j = match Json::parse(body) {
-            Ok(j) => j,
-            Err(e) => {
-                return send(
-                    conn,
-                    400,
-                    "application/json",
-                    &format!(r#"{{"error":{{"message":{}}}}}"#, quote(&e)),
-                );
-            }
-        };
         let stream = matches!(j.get("stream"), Some(Json::Bool(true)));
         let asked = j.get("max_tokens").and_then(Json::usize).unwrap_or(512);
         let num = |k: &str| j.get(k).and_then(Json::num);
@@ -350,7 +437,7 @@ mod serve {
         // generate nothing, which is a refusal by another name.
         let room = (max_seq / 4).min(1024);
         let (prompt, dropped) =
-            match template.render_within(&j, max_seq - room, &mut |t| tok.encode(t).len()) {
+            match template.render_within(j, max_seq - room, &mut |t| tok.encode(t).len()) {
                 Ok(p) => p,
                 Err(e) => {
                     return send(
@@ -361,6 +448,14 @@ mod serve {
                     );
                 }
             };
+        // Said to the client as well as here: a client whose history was cut
+        // has no other way to know (#32), and an agent that does not know
+        // goes looking for what it already found.
+        let dropped_header = if dropped > 0 {
+            format!("x-lex-dropped-messages: {dropped}\r\n")
+        } else {
+            String::new()
+        };
         if dropped > 0 {
             eprintln!("dropped {dropped} of the oldest messages to fit {max_seq} tokens");
         }
@@ -409,9 +504,79 @@ mod serve {
         // the model writes `17` and only the schema knows it meant a number.
         let types: Vec<Json> = j.get("tools").and_then(Json::arr).unwrap_or(&[]).to_vec();
 
+        if stream && api == Api::Ollama {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
+                 cache-control: no-cache\r\n{dropped_header}connection: close\r\n\r\n"
+            );
+            conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+            // Reasoning in `thinking`, as Ollama streams a thinking model.
+            let piece = |p: &Piece| {
+                let message = match p {
+                    Piece::Reasoning(t) => {
+                        format!(r#""content":"","thinking":{}"#, quote(t))
+                    }
+                    Piece::Content(t) => format!(r#""content":{}"#, quote(t)),
+                };
+                format!(
+                    r#"{{"model":{},"message":{{"role":"assistant",{message}}},"done":false}}"#,
+                    quote(model)
+                )
+            };
+            let mut split = Stream::for_request(template, j);
+            let (text, reason, n) = generate(
+                rt,
+                tok,
+                &ids,
+                stop,
+                depth,
+                want,
+                logits,
+                &mut sampler,
+                &mut |all| {
+                    for p in split.push(all) {
+                        ndjson(conn, &piece(&p))?;
+                    }
+                    Ok(())
+                },
+            )?;
+            let (last, reply) = split.finish(&text, &types);
+            for p in last {
+                ndjson(conn, &piece(&p))?;
+            }
+            let calls: Vec<String> = reply
+                .calls
+                .iter()
+                .map(|c| {
+                    format!(
+                        r#"{{"function":{{"name":{},"arguments":{}}}}}"#,
+                        quote(&c.name),
+                        args_object(&c.arguments)
+                    )
+                })
+                .collect();
+            ndjson(
+                conn,
+                &format!(
+                    r#"{{"model":{},"message":{{"role":"assistant","content":""{}}},"done":true,"done_reason":{},"prompt_eval_count":{},"eval_count":{n}}}"#,
+                    quote(model),
+                    if calls.is_empty() {
+                        String::new()
+                    } else {
+                        format!(r#","tool_calls":[{}]"#, calls.join(","))
+                    },
+                    quote(if reason == "length" { "length" } else { "stop" }),
+                    ids.len()
+                ),
+            )?;
+            return conn.flush().map_err(|e| e.to_string());
+        }
+
         if stream {
-            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
-                        cache-control: no-cache\r\nconnection: close\r\n\r\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 cache-control: no-cache\r\n{dropped_header}connection: close\r\n\r\n"
+            );
             conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
             let chunk = |delta: &str, finish: String| {
                 format!(
@@ -422,8 +587,8 @@ mod serve {
                 )
             };
             sse(conn, &chunk(r#"{"role":"assistant"}"#, "null".into()))?;
-            let mut split = Stream::new(template);
-            let (text, reason, _) = generate(
+            let mut split = Stream::for_request(template, j);
+            let (text, reason, n) = generate(
                 rt,
                 tok,
                 &ids,
@@ -470,6 +635,25 @@ mod serve {
             }
             let reason = finish_reason(reason, &reply);
             sse(conn, &chunk("{}", quote(reason)))?;
+            // OpenAI's `stream_options.include_usage`: one last chunk with
+            // no choices and the token counts, so a client timing a stream
+            // knows how many tokens it received -- with speculation a chunk
+            // carries several, and counting chunks undercounts.
+            let usage = j.get("stream_options").and_then(|o| o.get("include_usage"))
+                == Some(&Json::Bool(true));
+            if usage {
+                sse(
+                    conn,
+                    &format!(
+                        r#"{{"id":{},"object":"chat.completion.chunk","created":{},"model":{},"choices":[],"usage":{{"prompt_tokens":{},"completion_tokens":{n},"total_tokens":{}}}}}"#,
+                        quote(&id),
+                        now(),
+                        quote(model),
+                        ids.len(),
+                        ids.len() + n
+                    ),
+                )?;
+            }
             conn.write_all(b"data: [DONE]\n\n")
                 .map_err(|e| e.to_string())?;
             return conn.flush().map_err(|e| e.to_string());
@@ -486,7 +670,34 @@ mod serve {
             &mut sampler,
             &mut |_| Ok(()),
         )?;
-        let reply = template.parse_reply(&text, &types);
+        let reply = template.parse_reply_after(&text, &types, lex_rt::chat::thinks(j));
+        if api == Api::Ollama {
+            let calls: Vec<String> = reply
+                .calls
+                .iter()
+                .map(|c| {
+                    format!(
+                        r#"{{"function":{{"name":{},"arguments":{}}}}}"#,
+                        quote(&c.name),
+                        args_object(&c.arguments)
+                    )
+                })
+                .collect();
+            let payload = format!(
+                r#"{{"model":{},"message":{{"role":"assistant","content":{},"thinking":{}{}}},"done":true,"done_reason":{},"prompt_eval_count":{},"eval_count":{n}}}"#,
+                quote(model),
+                quote(&reply.content),
+                quote(&reply.reasoning),
+                if calls.is_empty() {
+                    String::new()
+                } else {
+                    format!(r#","tool_calls":[{}]"#, calls.join(","))
+                },
+                quote(if reason == "length" { "length" } else { "stop" }),
+                ids.len()
+            );
+            return send_with(conn, 200, "application/json", &dropped_header, &payload);
+        }
         let calls: Vec<String> = reply
             .calls
             .iter()
@@ -516,7 +727,7 @@ mod serve {
             ids.len(),
             ids.len() + n
         );
-        send(conn, 200, "application/json", &payload)
+        send_with(conn, 200, "application/json", &dropped_header, &payload)
     }
 
     /// Prefill `ids[start..]`, stopping at turn boundaries to keep a
@@ -677,6 +888,13 @@ mod serve {
         }
     }
 
+    fn ndjson(conn: &mut TcpStream, line: &str) -> Result<(), String> {
+        conn.write_all(line.as_bytes())
+            .and_then(|()| conn.write_all(b"\n"))
+            .and_then(|()| conn.flush())
+            .map_err(|e| e.to_string())
+    }
+
     fn sse(conn: &mut TcpStream, data: &str) -> Result<(), String> {
         conn.write_all(format!("data: {data}\n\n").as_bytes())
             .and_then(|()| conn.flush())
@@ -684,6 +902,17 @@ mod serve {
     }
 
     fn send(conn: &mut TcpStream, code: u16, ty: &str, body: &str) -> Result<(), String> {
+        send_with(conn, code, ty, "", body)
+    }
+
+    /// [`send`] with extra header lines, each ending in `\r\n`.
+    fn send_with(
+        conn: &mut TcpStream,
+        code: u16,
+        ty: &str,
+        extra: &str,
+        body: &str,
+    ) -> Result<(), String> {
         // A refusal the caller only sees as "HTTP 400" is a refusal nobody
         // can act on: the client library reports the status and drops the
         // body, so the reason has to reach this side's log too.
@@ -691,7 +920,7 @@ mod serve {
             eprintln!("{code}: {body}");
         }
         let head = format!(
-            "HTTP/1.1 {code} {}\r\ncontent-type: {ty}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            "HTTP/1.1 {code} {}\r\ncontent-type: {ty}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n",
             if code == 200 { "OK" } else { "Error" },
             body.len()
         );

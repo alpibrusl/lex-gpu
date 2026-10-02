@@ -207,6 +207,33 @@ One request at a time, deliberately: there is one GPU and a 14.5 GB model
 on it, so a second caller queues rather than interleaving two sequences
 through one KV cache. `--port`, `--max-seq` and `--depth` are the knobs.
 
+**Two APIs, one server.** OpenAI's `POST /v1/chat/completions` and Ollama's
+`POST /api/chat` (with `GET /api/tags`), so a client written for Ollama
+runs on lex by pointing it at the server -- lex-code's own `--ollama`
+agent included, with the same prompt, tools and `think` setting it sends
+Ollama: `OLLAMA_BASE_URL=http://127.0.0.1:8080 lex-code --ollama` (lex-code
+reads `OLLAMA_BASE_URL`, not Ollama's own `OLLAMA_HOST`; set the wrong one
+and it talks to Ollama without complaint). Thinking is set per request: `reasoning_effort` (`xhigh`, the
+template's default, `medium`, `low`), or off with
+`chat_template_kwargs.enable_thinking: false` -- Ollama's `think: false`.
+
+**Kernels can be tuned on the device** (`lex_rt::tune`). A kernel offers
+candidate schedules; the first load on a machine times each on the model's
+own weights, keeps the fastest whose output matches the default schedule's,
+and caches the choice per device in `~/.cache/lex-gpu/tune/`. Today the
+Metal few-token matvec (decode and verify) has it, as `LEX_TUNE=1`; on an M4
+Max it changes nothing measurable, so it is off by default there.
+`LEX_TUNE=retune` ignores the cache, `LEX_TUNE_SECONDS` bounds the search
+(60 by default; a shape it does not reach keeps its default and is finished
+by a later load).
+
+**The window is `--max-seq`, 65536 by default.** A conversation longer than
+that keeps its system message, its first user message (the task) and the
+tools, and drops the oldest turns after them -- and says so: the reply
+carries `x-lex-dropped-messages: N`. An agent needs the room: at 16384 a
+lex-code session dropped 93 messages on 32 turns and went looking for what
+it had already found (#32).
+
 **It keeps the prefix.** An agent resends its whole history every turn —
 measured at 83–100% shared with the turn before, 92% overall — so the
 server resumes from the furthest point it has already read instead of

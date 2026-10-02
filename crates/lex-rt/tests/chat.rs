@@ -79,7 +79,15 @@ fn the_rust_template_matches_the_models_own() {
     matches_its_fixtures(
         Template::Qwen38,
         "chatml",
-        &["tools", "tool_result", "two_tool_results", "odd_chars"],
+        &[
+            "tools",
+            "tool_result",
+            "two_tool_results",
+            "odd_chars",
+            "no_think",
+            "no_think_tools",
+            "no_think_tool_result",
+        ],
     );
 }
 
@@ -595,4 +603,48 @@ fn trimming_keeps_the_start_of_the_prompt_still_while_history_grows() {
         );
         eprintln!("{t:?}: the start moved {jumps} times over {trimmed} trimmed turns");
     }
+}
+
+/// `enable_thinking: false` (Ollama's `think: false`, which lex-code sends
+/// as `OLLAMA_THINK=false`) closes the reasoning block in the prompt, as
+/// the checkpoint's template does:
+/// `{%- if enable_thinking is defined and enable_thinking is false %}
+/// {{- '<think>\n\n</think>\n\n' }}`. The reply then holds no `</think>`,
+/// and must not be read as all reasoning -- that would hide its tool calls.
+#[test]
+fn thinking_off_closes_the_block_and_the_reply_is_content() {
+    use lex_rt::chat::{Piece, Stream, thinks};
+    let on = Json::parse(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+    let off = Json::parse(
+        r#"{"messages":[{"role":"user","content":"hi"}],
+            "chat_template_kwargs":{"enable_thinking":false}}"#,
+    )
+    .unwrap();
+    assert!(thinks(&on) && !thinks(&off));
+    assert!(
+        render(&on)
+            .unwrap()
+            .ends_with("<|im_start|>assistant\n<think>\n")
+    );
+    assert!(
+        render(&off)
+            .unwrap()
+            .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    );
+
+    let reply = "Let me add them.\n\n<tool_call>\n<function=add>\n<parameter=a>\n17\n\
+                 </parameter>\n<parameter=b>\n25\n</parameter>\n</function>\n</tool_call>";
+    let r = Template::Qwen38.parse_reply_after(reply, &tool_types(), false);
+    assert_eq!(r.reasoning, "");
+    assert_eq!(r.content, "Let me add them.");
+    assert_eq!(r.calls.len(), 1, "the call was read as reasoning");
+    // Read as if thinking were on, the same reply is all reasoning.
+    assert!(parse_reply(reply, &tool_types()).calls.is_empty());
+
+    // Streamed, the first piece is content, not reasoning.
+    let mut s = Stream::for_request(Template::Qwen38, &off);
+    assert_eq!(
+        s.push("Let me add"),
+        vec![Piece::Content("Let me add".into())]
+    );
 }

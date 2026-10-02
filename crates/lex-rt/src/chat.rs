@@ -92,6 +92,28 @@ impl Template {
             Template::Mimo => split_reply(text, &|b| parse_json_call(b, types)),
         }
     }
+
+    /// [`Template::parse_reply`] for a reply the prompt may already have
+    /// closed the reasoning block for. With thinking off the prompt ends
+    /// past `</think>`, so the reply holds no close tag, and read as one
+    /// that is still thinking it is all reasoning -- its tool calls never
+    /// looked for.
+    pub fn parse_reply_after(self, text: &str, types: &[Json], thinking: bool) -> Reply {
+        if thinking {
+            self.parse_reply(text, types)
+        } else {
+            self.parse_reply(&format!("</think>{text}"), types)
+        }
+    }
+}
+
+/// Whether the request leaves thinking on: only an explicit
+/// `chat_template_kwargs.enable_thinking: false` turns it off, as in both
+/// templates (`enable_thinking is defined and enable_thinking is false`).
+pub fn thinks(req: &Json) -> bool {
+    req.get("chat_template_kwargs")
+        .and_then(|k| k.get("enable_thinking"))
+        != Some(&Json::Bool(false))
 }
 
 const XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, \
@@ -144,7 +166,10 @@ fn render_qwen(req: &Json) -> Result<String, String> {
         return Err("`messages` is empty".into());
     }
     let tools = req.get("tools").and_then(Json::arr).unwrap_or(&[]);
+    // With thinking off the template sets no reasoning instruction and
+    // does not look at `reasoning_effort` at all.
     let instr = match req.get("reasoning_effort").and_then(Json::str) {
+        _ if !thinks(req) => "",
         None | Some("xhigh") => XHIGH,
         Some("low") => LOW,
         // The template accepts `medium` and then says nothing at all about
@@ -267,8 +292,13 @@ fn render_qwen(req: &Json) -> Result<String, String> {
         }
     }
     // The template opens the reasoning block itself rather than leaving the
-    // model to remember the tag.
-    s.push_str("<|im_start|>assistant\n<think>\n");
+    // model to remember the tag -- or, with thinking off, opens and closes
+    // it empty.
+    s.push_str(if thinks(req) {
+        "<|im_start|>assistant\n<think>\n"
+    } else {
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    });
     Ok(s)
 }
 
@@ -368,12 +398,7 @@ fn render_mimo(req: &Json) -> Result<String, String> {
         }
     }
     s.push_str("<|im_start|>assistant\n");
-    // `enable_thinking is false`: only an explicit false turns it off.
-    let thinking = req
-        .get("chat_template_kwargs")
-        .and_then(|k| k.get("enable_thinking"))
-        != Some(&Json::Bool(false));
-    s.push_str(if thinking {
+    s.push_str(if thinks(req) {
         "<think>\n"
     } else {
         "<think></think>"
@@ -667,12 +692,24 @@ pub struct Stream {
     template: Template,
     reasoning: usize,
     content: usize,
+    /// The prompt closed the reasoning block (thinking off): the reply is
+    /// content from its first token.
+    closed: bool,
 }
 
 impl Stream {
     pub fn new(template: Template) -> Stream {
         Stream {
             template,
+            ..Stream::default()
+        }
+    }
+
+    /// A stream for a request, thinking or not ([`thinks`]).
+    pub fn for_request(template: Template, req: &Json) -> Stream {
+        Stream {
+            template,
+            closed: !thinks(req),
             ..Stream::default()
         }
     }
@@ -685,11 +722,14 @@ impl Stream {
     /// The last pieces, plus the finished reply.
     pub fn finish(&mut self, all: &str, types: &[Json]) -> (Vec<Piece>, Reply) {
         let pieces = self.advance(all);
-        (pieces, self.template.parse_reply(all, types))
+        (
+            pieces,
+            self.template.parse_reply_after(all, types, !self.closed),
+        )
     }
 
     fn advance(&mut self, text: &str) -> Vec<Piece> {
-        let r = self.template.parse_reply(text, &[]);
+        let r = self.template.parse_reply_after(text, &[], !self.closed);
         let mut out = vec![];
         if r.reasoning.len() > self.reasoning {
             out.push(Piece::Reasoning(r.reasoning[self.reasoning..].to_string()));
