@@ -882,3 +882,65 @@ fn proposed_drafts_land_where_greedy_lands_and_keep_the_head_in_step() {
         "the head's cache is out of step after lookup rounds ({worst:.2e} of scale)"
     );
 }
+
+/// A prompt padded up to a compiled size leaves the model's whole state --
+/// the gated-delta layers' recurrence, the convolution windows, the KV
+/// cache -- where stepping through it one token at a time leaves it.
+///
+/// The final logits alone would not show a wrong state: a padded row that
+/// nudged the recurrence changes what comes *after*, a little more with
+/// every token. So each prompt is followed by several decode steps, and
+/// every logit row is compared with the stepping reference. The lengths are
+/// chosen to force padding of different amounts (47 -> 64, 300 as 256 +
+/// 64, 431 as 256 + 128 + 64): on CUDA, where prompts are padded, these
+/// exercise `lex_msl::pad`; elsewhere they run the cut path.
+#[test]
+fn a_padded_prefill_leaves_the_state_where_stepping_leaves_it() {
+    let _lock = one_at_a_time();
+    let (model, _) = parse(include_str!("data/qwen35_27b_golden.txt"));
+    const AFTER: usize = 6;
+    let mut rt = match Runner::load(&model, 431 + AFTER + 16) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("SKIPPED: {model} ({e})");
+            return;
+        }
+    };
+    let top = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap() as u32;
+    let rel = |a: &[f32], b: &[f32]| {
+        let scale = b.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+            / scale
+    };
+    for n in [47usize, 300, 431] {
+        let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i as u32 * 7919) % 200000).collect();
+        let plan = rt.prefill_plan(n);
+        rt.reset();
+        let mut rows = vec![rt.prefill(&prompt).expect("prefill")];
+        let mut fed = vec![];
+        for _ in 0..AFTER {
+            let t = top(rows.last().unwrap());
+            fed.push(t);
+            rows.push(rt.step(t).expect("step"));
+        }
+        rt.reset();
+        let mut serial = vec![];
+        for &t in &prompt {
+            serial = rt.step(t).expect("step");
+        }
+        let mut worst = rel(&rows[0], &serial);
+        assert_eq!(top(&rows[0]), top(&serial), "{n}: the next token changed");
+        for (i, &t) in fed.iter().enumerate() {
+            serial = rt.step(t).expect("step");
+            worst = worst.max(rel(&rows[i + 1], &serial));
+        }
+        eprintln!("{n}-token prefill as {plan:?} then {AFTER} steps: worst {worst:e} of scale");
+        assert!(
+            worst < 2e-3,
+            "{n} tokens as {plan:?}: state differs from stepping by {worst:e} of scale"
+        );
+    }
+}

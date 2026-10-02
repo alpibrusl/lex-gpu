@@ -745,6 +745,149 @@ mod gpu {
     /// set that grew with every new prompt length would pay them per prompt.
     const GEMM_SIZES: [usize; 6] = [512, 256, 128, 64, 32, 16];
 
+    /// What one prefill pass costs, in rows of compute: the rows it runs,
+    /// plus a fixed cost for reading the weights, launching ~700 kernels and
+    /// the host's per-pass work. `LEX_PAD_OVERHEAD` sets the fixed part, for
+    /// calibration (`examples/qwen_profile --prefill N` over the sizes).
+    fn pass_cost(rows: usize) -> usize {
+        static OVERHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let fixed = *OVERHEAD.get_or_init(|| {
+            std::env::var("LEX_PAD_OVERHEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32)
+        });
+        rows + fixed
+    }
+
+    /// The pieces of a prefill of `n` tokens at cache position `pos`, as
+    /// `(real rows, size)`: exact pieces -- one of `sizes`, or up to
+    /// `MAX_BATCH` rows through the batched matvec -- and at most one
+    /// padded last piece, whichever way is cheapest by `cost`. A padded
+    /// piece must fit under `cap`. `sizes` is descending.
+    fn plan_pieces(
+        n: usize,
+        pos: usize,
+        cap: usize,
+        sizes: &[usize],
+        cost: impl Fn(usize) -> usize,
+    ) -> Vec<(usize, usize)> {
+        let exact: Vec<usize> = sizes.iter().copied().chain(1..=MAX_BATCH).collect();
+        // f[i]: the cheapest way to cover i tokens in exact pieces.
+        let mut f = vec![usize::MAX; n + 1];
+        let mut from = vec![0usize; n + 1];
+        f[0] = 0;
+        for i in 1..=n {
+            for &j in &exact {
+                if j <= i && f[i - j] != usize::MAX {
+                    let c = f[i - j] + cost(j);
+                    if c < f[i] {
+                        f[i] = c;
+                        from[i] = j;
+                    }
+                }
+            }
+        }
+        // The best split into exact pieces and one last piece, which may be
+        // padded up to the smallest size that holds it.
+        let (mut best, mut best_i, mut best_size) = (usize::MAX, 0, 0);
+        for (i, &fi) in f.iter().enumerate() {
+            if fi == usize::MAX {
+                continue;
+            }
+            let r = n - i;
+            let (c, size) = if r == 0 {
+                (fi, 0)
+            } else if r <= MAX_BATCH {
+                (fi + cost(r), r)
+            } else {
+                match sizes.iter().rev().find(|&&g| g >= r) {
+                    Some(&g) if pos + i + g <= cap => (fi + cost(g), g),
+                    _ => continue,
+                }
+            };
+            if c < best || (c == best && size < best_size) {
+                (best, best_i, best_size) = (c, i, size);
+            }
+        }
+        let mut pieces = vec![];
+        let mut i = best_i;
+        while i > 0 {
+            pieces.push((from[i], from[i]));
+            i -= from[i];
+        }
+        pieces.sort_unstable_by(|a, b| b.cmp(a));
+        if best_i < n {
+            pieces.push((n - best_i, best_size));
+        }
+        debug_assert_eq!(pieces.iter().map(|p| p.0).sum::<usize>(), n);
+        pieces
+    }
+
+    #[cfg(test)]
+    mod plan_tests {
+        use super::{GEMM_SIZES, MAX_BATCH, plan_pieces};
+
+        fn plan(n: usize, pos: usize, cap: usize) -> Vec<(usize, usize)> {
+            plan_pieces(n, pos, cap, &GEMM_SIZES, |rows| rows + 32)
+        }
+
+        #[test]
+        fn a_prompt_runs_in_few_passes_and_only_the_last_is_padded() {
+            for n in 1..=1500 {
+                let p = plan(n, 0, 1 << 20);
+                assert_eq!(p.iter().map(|x| x.0).sum::<usize>(), n, "{n}: {p:?}");
+                for (i, &(real, size)) in p.iter().enumerate() {
+                    assert!(real <= size && real > 0, "{n}: {p:?}");
+                    if real < size {
+                        assert_eq!(i, p.len() - 1, "{n}: only the last may be padded: {p:?}");
+                        assert!(real > MAX_BATCH, "{n}: padded {real} rows: {p:?}");
+                        assert!(GEMM_SIZES.contains(&size), "{n}: {p:?}");
+                    } else {
+                        assert!(
+                            GEMM_SIZES.contains(&size) || size <= MAX_BATCH,
+                            "{n}: {p:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn the_shapes_that_cost_the_server_most() {
+            // Exactly a size: one pass. A whole chunk and a short tail: the
+            // tail padded to the size above it, not cut into five.
+            assert_eq!(plan(512, 0, 1 << 20), vec![(512, 512)]);
+            assert_eq!(plan(500, 0, 1 << 20), vec![(500, 512)]);
+            // 431 was 256 + 128 + 32 + 15 (five passes through the server).
+            let p = plan(431, 0, 1 << 20);
+            assert!(p.len() <= 3, "{p:?}");
+            assert_eq!(p.last().map(|x| x.1), p.last().map(|x| x.1.max(1)));
+            // Long prompts: full chunks, then the tail.
+            let p = plan(2048 + 300, 0, 1 << 20);
+            assert_eq!(&p[..4], &[(512, 512); 4], "{p:?}");
+            assert!(p.len() <= 6, "{p:?}");
+        }
+
+        #[test]
+        fn nothing_pads_past_the_cache() {
+            // 500 tokens at position 100 in a cache of 600: a padded 512
+            // would write to 612.
+            let p = plan(500, 100, 600);
+            assert!(p.iter().all(|&(r, s)| r == s), "{p:?}");
+            assert_eq!(p.iter().map(|x| x.0).sum::<usize>(), 500);
+        }
+
+        #[test]
+        fn a_higher_pass_cost_pads_more_and_a_lower_one_cuts_more() {
+            let cheap = plan_pieces(431, 0, 1 << 20, &GEMM_SIZES, |r| r + 1);
+            let dear = plan_pieces(431, 0, 1 << 20, &GEMM_SIZES, |r| r + 4096);
+            assert!(dear.len() <= cheap.len(), "{cheap:?} {dear:?}");
+            let waste = |p: &[(usize, usize)]| p.iter().map(|x| x.1 - x.0).sum::<usize>();
+            assert!(waste(&dear) >= waste(&cheap), "{cheap:?} {dear:?}");
+        }
+    }
+
     /// Every pipeline a batch of `t` tokens dispatches, compiled on first
     /// use of that size.
     /// Which rows of a batch go through `lm_head`.
@@ -791,6 +934,12 @@ mod gpu {
         /// Only for batches a speculative verify can use.
         delta_snap: Option<Pipeline>,
         conv_snap: Option<Pipeline>,
+        /// The a/b projections of a CUDA prefill pass, writing no-op gate
+        /// inputs for rows past the real count, and the convolution window
+        /// rewritten from the last real rows (`lex_msl::pad`): what lets a
+        /// pass run on more rows than the prompt has.
+        ab: Option<Pipeline>,
+        conv_restore: Option<Pipeline>,
     }
 
     /// Activation buffers, reused every step.
@@ -826,6 +975,9 @@ mod gpu {
         scalars_pos: Buffer,
         scalars_attn: Buffer,
         scalars_len: Buffer,
+        /// The rows of a batched pass that are real, when it runs on more
+        /// (`forward_pass`): what `lex_msl::pad`'s kernels read.
+        scalars_real: Buffer,
         scalars_nsplit: Buffer,
         /// Per-split partial softmax: max, denominator, accumulator.
         part_m: Buffer,
@@ -1178,6 +1330,7 @@ mod gpu {
                     scalars_pos: gpu.zeroed::<u32>(1),
                     scalars_attn: gpu.zeroed::<u32>(2),
                     scalars_len: gpu.zeroed::<u32>(1),
+                    scalars_real: gpu.zeroed::<u32>(1),
                     scalars_nsplit: gpu.zeroed::<u32>(2),
                     // Split-KV attention's partials. Only a batch of up to
                     // MAX_BATCH ever splits (`split_attn`), so only that
@@ -1846,8 +1999,9 @@ mod gpu {
             let c = self.cfg.clone();
             let mut logits = vec![];
             let mut done = 0;
-            while done < n {
-                let t = self.chunk(n - done);
+            // The pieces and the size each runs at: the same when a prompt
+            // is cut, a larger size for the last when it is padded.
+            for (t, size) in self.prefill_plan(n) {
                 // Logits for the prompt's last token only: every other row's
                 // are never read, and no chunk before the last has it.
                 let head = if done + t == n {
@@ -1855,7 +2009,7 @@ mod gpu {
                 } else {
                     Head::Skip
                 };
-                let out = self.forward_with(&tokens[done..done + t], head, false)?;
+                let out = self.forward_pass(&tokens[done..done + t], size, head, false)?;
                 if let Some(last) = out.into_iter().last() {
                     logits = last;
                 }
@@ -1877,6 +2031,42 @@ mod gpu {
                 done += t;
             }
             Ok(logits)
+        }
+
+        /// Whether a prompt may be padded up to a compiled size: on CUDA,
+        /// where `lex_msl::pad`'s kernels exist. `LEX_PAD_PREFILL=0` cuts
+        /// prompts into exact pieces instead, to measure one against the
+        /// other.
+        fn pad_ok(&self) -> bool {
+            self.gemm_ok
+                && crate::dev::gemm_backend() == lex_msl::gemm::Backend::Cuda
+                && std::env::var_os("LEX_NO_PAD_KERNELS").is_none()
+                && std::env::var("LEX_PAD_PREFILL").map_or(true, |v| v != "0")
+        }
+
+        /// How a prompt of `n` tokens is run, as `(real rows, size)` pieces
+        /// in order; they sum to `n`.
+        ///
+        /// Each pass reads every weight once, so a prompt in fewer passes is
+        /// faster even when the last runs some rows it does not need: the
+        /// plan covers it with exact pieces (the compiled GEMM sizes, or up
+        /// to `MAX_BATCH` rows through the batched matvec) and at most one
+        /// padded last piece, whichever is cheapest by [`pass_cost`]. A
+        /// padded piece must fit the cache, as its extra rows write
+        /// positions past the prompt.
+        pub fn prefill_plan(&self, n: usize) -> Vec<(usize, usize)> {
+            if !self.pad_ok() {
+                let (mut v, mut left) = (vec![], n);
+                while left > 0 {
+                    let t = self.chunk(left);
+                    v.push((t, t));
+                    left -= t;
+                }
+                return v;
+            }
+            let limit = self.prefill_limit();
+            let sizes: Vec<usize> = GEMM_SIZES.into_iter().filter(|&g| g <= limit).collect();
+            plan_pieces(n, self.pos, self.cap, &sizes, pass_cost)
         }
 
         /// Advance the head's cache over `next.len()` positions at once.
@@ -2334,18 +2524,55 @@ mod gpu {
             head: Head,
             snap: bool,
         ) -> Result<Vec<Vec<f32>>, String> {
-            let t = tokens.len();
+            self.forward_pass(tokens, tokens.len(), head, snap)
+        }
+
+        /// One pass over `size` rows of which the first `tokens.len()` are
+        /// the prompt's: a prompt padded up to a size the load compiled and
+        /// run in one pass over the weights, where cutting it into the sizes
+        /// that fit re-reads them once a piece (a 431-token prompt as 256 +
+        /// 128 + 32 + 15 prefilled at 260 tok/s through the server, against
+        /// 490 for one chunk of 512).
+        ///
+        /// What makes extra rows harmless is in `lex_msl::pad`: a padded
+        /// row repeats the last token, writes a KV position the next real
+        /// token overwrites, is seen by no real row (attention is causal),
+        /// and leaves the gated-delta state alone -- its gate inputs are a
+        /// no-op, and the convolution's window is rewritten from the last
+        /// real rows. The position advances by the real rows only, and a
+        /// [`Head::Last`] head reads the last real row.
+        fn forward_pass(
+            &mut self,
+            tokens: &[u32],
+            size: usize,
+            head: Head,
+            snap: bool,
+        ) -> Result<Vec<Vec<f32>>, String> {
+            let (real, t) = (tokens.len(), size);
+            let padded = t > real;
             let most = if self.gemm_ok { PREFILL_MAX } else { MAX_BATCH };
-            if t == 0 || t > most {
-                return Err(format!("a batch is 1..={most} tokens, not {t}"));
+            if real == 0 || t > most || t < real {
+                return Err(format!("a batch is 1..={most} tokens, not {real} in {t}"));
             }
             if self.pos + t > self.cap {
                 return Err(format!("the cache is full ({} positions)", self.cap));
             }
             self.batch(t)?;
+            if padded {
+                // Only a pass the kernels were built for: a prefill chunk's
+                // size, not a verify's, with one head row and no snapshots.
+                if snap
+                    || head == Head::All
+                    || real <= MAX_BATCH
+                    || self.batches[&t].conv_restore.is_none()
+                {
+                    return Err(format!("{real} rows cannot be padded to {t}"));
+                }
+            }
             let c = self.cfg.clone();
             let pos0 = self.pos;
-            for (i, &tok) in tokens.iter().enumerate() {
+            for i in 0..t {
+                let tok = tokens[i.min(real - 1)];
                 let row = tok as usize * c.hidden;
                 self.gpu.write(
                     &self.bacts.x,
@@ -2357,6 +2584,7 @@ mod gpu {
                 self.gpu.write(&self.bacts.sin, i * c.rot / 2, &sin);
             }
             self.gpu.write(&self.bacts.scalars_pos, 0, &[pos0 as u32]);
+            self.gpu.write(&self.bacts.scalars_real, 0, &[real as u32]);
             self.gpu.write(
                 &self.bacts.scalars_attn,
                 0,
@@ -2372,7 +2600,10 @@ mod gpu {
                 &[nsplit as u32, nsplit.div_ceil(COMBINE_CHUNK) as u32],
             );
 
-            let mut plan = self.batch_plan_with(t, snap, head);
+            // A padded pass takes its head row from the host afterwards: the
+            // plan's own copies row `t - 1`.
+            let plan_head = if padded { Head::Skip } else { head };
+            let mut plan = self.batch_plan_with(t, snap, plan_head, padded);
             if !self.skip.is_empty() {
                 // Exact labels, not prefixes. `"matvec qkv"` starts with
                 // `"matvec q"`, so a prefix match silently ablates two call
@@ -2389,9 +2620,39 @@ mod gpu {
             // more than the one below it and not enough to say why.
             self.dispatch(&plan);
             drop(plan);
-            self.pos += t;
+            self.pos += real;
 
             let v = c.vocab;
+            if padded && head == Head::Last {
+                // The last real row's residual, through the decode step's
+                // own norm and head, as `Head::Last` does for an unpadded one.
+                let h = c.hidden;
+                let mut row = vec![0.0f32; h];
+                self.gpu
+                    .download_at(&self.bacts.x, (real - 1) * h, &mut row);
+                self.gpu.write(&self.acts.x, 0, &row);
+                let one = &self.acts;
+                let out = &self.lm_head;
+                let plan: Vec<Dispatch<'_>> = vec![
+                    (
+                        "rmsnorm",
+                        &self.k.rms,
+                        vec![&one.x, &self.out_norm, &one.h],
+                        None,
+                    ),
+                    (
+                        "matvec lm head",
+                        self.mv(out, false),
+                        out.bind(&one.h, None, &one.logits),
+                        None,
+                    ),
+                ];
+                self.dispatch(&plan);
+                drop(plan);
+                let mut last = vec![0.0f32; v];
+                self.gpu.download(&self.acts.logits, &mut last);
+                return Ok(vec![last]);
+            }
             match head {
                 Head::All => {
                     let mut flat = vec![0.0f32; t * v];
@@ -2644,6 +2905,28 @@ mod gpu {
                     }
                 }
             }
+            // CUDA only, and only for the sizes a prompt is padded up to.
+            let (ab, conv_restore) = if crate::dev::gemm_backend() == lex_msl::gemm::Backend::Cuda
+                && t > MAX_BATCH
+                && lex_msl::pad::ab_fits(t, c.hidden, hv)
+                && std::env::var_os("LEX_NO_PAD_KERNELS").is_none()
+            {
+                (
+                    Some(gpu.build_lowered(&lex_msl::pad::ab_rows(
+                        t,
+                        c.hidden,
+                        hv,
+                        X_DTYPE == DType::F16,
+                    )?)?),
+                    Some(gpu.build_lowered(&lex_msl::pad::conv_restore(
+                        t,
+                        ch,
+                        c.conv_kernel - 1,
+                    )?)?),
+                )
+            } else {
+                (None, None)
+            };
             let b = Batch {
                 rms: compile(
                     gpu,
@@ -2837,6 +3120,8 @@ mod gpu {
                 delta_snap: (want_snap)
                     .then(|| compile(gpu, &delta.build_steps_snap(t)?, 128))
                     .transpose()?,
+                ab,
+                conv_restore,
                 conv_snap: (want_snap)
                     .then(|| {
                         compile(
@@ -2959,7 +3244,15 @@ mod gpu {
         /// It falls back to the ordinary kernels when the batch is larger
         /// than `SPEC_MAX` or the checkpoint has no draft head, and the
         /// caller then pays the replay as before.
-        fn batch_plan_with(&self, t: usize, snap: bool, head: Head) -> Vec<Dispatch<'_>> {
+        /// `padded`: the pass runs on more rows than the prompt has, so the
+        /// convolution's window is rewritten from the last real rows.
+        fn batch_plan_with(
+            &self,
+            t: usize,
+            snap: bool,
+            head: Head,
+            padded: bool,
+        ) -> Vec<Dispatch<'_>> {
             let a = &self.bacts;
             let k = &self.batches[&t];
             // The gated-delta layers in order, for indexing the snapshots.
@@ -2990,8 +3283,18 @@ mod gpu {
                             l.z.bind(&a.h, None, &a.z),
                             None,
                         ));
-                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.a, &a.a], None));
-                        d.push(("matvec a/b", &k.dense, vec![&a.h, &l.b, &a.b], None));
+                        match &k.ab {
+                            Some(ab) => d.push((
+                                "matvec a/b",
+                                ab,
+                                vec![&a.h, &l.a, &l.b, &a.a, &a.b, &a.scalars_real],
+                                None,
+                            )),
+                            None => {
+                                d.push(("matvec a/b", &k.dense, vec![&a.h, &l.a, &a.a], None));
+                                d.push(("matvec a/b", &k.dense, vec![&a.h, &l.b, &a.b], None));
+                            }
+                        }
                         d.push(match snap {
                             Some(s) => (
                                 "conv",
@@ -3006,6 +3309,15 @@ mod gpu {
                                 None,
                             ),
                         });
+                        if padded {
+                            let r = k.conv_restore.as_ref().expect("padded pass: checked");
+                            d.push((
+                                "conv",
+                                r,
+                                vec![&l.conv_state, &a.qkv, &a.scalars_real],
+                                None,
+                            ));
+                        }
                         d.push(("delta q/k", &k.qk_q, vec![&a.conv, &a.qe], None));
                         d.push(("delta q/k", &k.qk_k, vec![&a.conv, &a.ke], None));
                         d.push((
