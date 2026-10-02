@@ -624,3 +624,86 @@ fn the_padding_kernels_compute_the_projections_and_leave_no_trace() {
         eprintln!("conv_restore {tokens}x{ch}, {nreal} real: agrees");
     }
 }
+
+/// The CUDA causal attention kernel against a host softmax: every token's
+/// query heads over the cache up to its position, with the rest of the cache
+/// (random, so a mask that leaks shows) hidden. The kernel keeps its output
+/// in `wmma` accumulators and rescales and writes them by the documented
+/// fragment layout, which would be wrong silently -- hence the whole kernel.
+#[test]
+fn the_wmma_attention_matches_a_host_softmax() {
+    use lex_msl::attn::{Causal, causal_wmma};
+    let Some(g) = gpu() else { return };
+    // (tokens, kv heads, group, head dim, cache rows, pos0): a tile that
+    // hangs past the last token, a different group, a position that cuts a
+    // key block, and the model's own shape.
+    for (tokens, kv_heads, group, head_dim, cap, pos0) in [
+        (37usize, 2usize, 6usize, 64usize, 256usize, 100usize),
+        (48, 2, 4, 128, 256, 0),
+        (70, 4, 6, 256, 512, 300),
+        (5, 1, 6, 64, 128, 63),
+    ] {
+        let hg = kv_heads * group;
+        let q = fill(tokens * hg * head_dim, 11);
+        let k = fill(kv_heads * cap * head_dim, 13);
+        let v = fill(kv_heads * cap * head_dim, 17);
+        let h16 = |x: &[f32]| x.iter().map(|&a| f16::from_f32(a)).collect::<Vec<_>>();
+        let (q16, k16, v16) = (h16(&q), h16(&k), h16(&v));
+        let up = |x: &[f16]| x.iter().map(|a| a.to_f32() as f64).collect::<Vec<_>>();
+        let (qr, kr, vr) = (up(&q16), up(&k16), up(&v16));
+        let c = Causal {
+            tokens,
+            kv_heads,
+            group,
+            head_dim,
+            cap,
+        };
+        let pipe = g
+            .build_lowered(&causal_wmma(&c).expect("causal_wmma"))
+            .expect("compile");
+        let (qb, kb, vb) = (g.upload(&q16), g.upload(&k16), g.upload(&v16));
+        let ob = g.upload(&vec![9.0f32; tokens * hg * head_dim]);
+        let sc = g.upload(&[pos0 as u32]);
+        g.run(&pipe, &[&qb, &kb, &vb, &ob, &sc]).expect("run");
+        let mut got = vec![0.0f32; tokens * hg * head_dim];
+        g.download(&ob, &mut got);
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut worst = 0.0f64;
+        let mut peak = 1e-9f64;
+        for t in 0..tokens {
+            for hh in 0..hg {
+                let kvh = hh / group;
+                let n = pos0 + t + 1;
+                let qv = &qr[(t * hg + hh) * head_dim..][..head_dim];
+                let s: Vec<f64> = (0..n)
+                    .map(|j| {
+                        let kk = &kr[(kvh * cap + j) * head_dim..][..head_dim];
+                        scale * qv.iter().zip(kk).map(|(a, b)| a * b).sum::<f64>()
+                    })
+                    .collect();
+                let m = s.iter().cloned().fold(f64::MIN, f64::max);
+                let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+                let l: f64 = e.iter().sum();
+                for d in 0..head_dim {
+                    let want: f64 = (0..n)
+                        .map(|j| e[j] * vr[(kvh * cap + j) * head_dim + d])
+                        .sum::<f64>()
+                        / l;
+                    peak = peak.max(want.abs());
+                    let got = got[(t * hg + hh) * head_dim + d] as f64;
+                    worst = worst.max((got - want).abs());
+                }
+            }
+        }
+        eprintln!(
+            "wmma attention {tokens} tokens, {kv_heads}x{group} heads, d{head_dim}, pos0 {pos0}: \
+             worst {:.2e} of scale",
+            worst / peak
+        );
+        assert!(
+            worst / peak < 5e-3,
+            "attention off by {:.2e} of scale",
+            worst / peak
+        );
+    }
+}

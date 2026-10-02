@@ -3,6 +3,7 @@
 //!
 //!     cargo run --release -p lex-rt --example qwen_profile -- --tokens 32
 //!     cargo run --release -p lex-rt --example qwen_profile -- --context 1024 --verify 3
+//!     cargo run --release -p lex-rt --example qwen_profile -- --prefill-only --context 16000
 //!
 //! Three passes over the same positions:
 //!
@@ -30,6 +31,7 @@ fn main() -> Result<(), String> {
 
     use lex_rt::qwen_run::Runner;
 
+    let mut prefill_only = false;
     let (mut model, mut tokens, mut context, mut verify, mut pre) = (
         "qwen3.8:27b-mlx".to_string(),
         32usize,
@@ -46,6 +48,7 @@ fn main() -> Result<(), String> {
             "--context" => context = val()?.parse().map_err(|_| "bad --context")?,
             "--verify" => verify = val()?.parse().map_err(|_| "bad --verify")?,
             "--prefill" => pre = val()?.parse().map_err(|_| "bad --prefill")?,
+            "--prefill-only" => prefill_only = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -53,7 +56,7 @@ fn main() -> Result<(), String> {
     // Room for the context, three passes of steps, and the verify rounds.
     let mut rt = Runner::load(
         &model,
-        (context + 3 * tokens + 16 * verify + 64).max(pre + 16),
+        (context + 3 * tokens + 16 * verify + 64).max(context + pre + 16),
     )?;
     println!(
         "{model}: loaded in {:.1} s on {}",
@@ -69,110 +72,117 @@ fn main() -> Result<(), String> {
         }
         Ok(())
     };
-    // One untimed step first: the first dispatch of a pipeline pays for
-    // things the rest do not.
-    start(&mut rt)?;
-    rt.step(1000)?;
+    'decode: {
+        if prefill_only {
+            break 'decode;
+        }
+        // One untimed step first: the first dispatch of a pipeline pays for
+        // things the rest do not.
+        start(&mut rt)?;
+        rt.step(1000)?;
 
-    // 1. The speed.
-    rt.sync = false;
-    start(&mut rt)?;
-    let t = Instant::now();
-    for i in 0..tokens {
-        rt.step((1000 + i) as u32)?;
-    }
-    let step_s = t.elapsed().as_secs_f64() / tokens as f64;
-    println!(
-        "\ndecode at context {context}: {:.2} ms/token ({:.1} tok/s)",
-        1e3 * step_s,
-        1.0 / step_s
-    );
-
-    // 2. Where it goes.
-    rt.sync = true;
-    start(&mut rt)?;
-    rt.clear_profile();
-    for i in 0..tokens {
-        rt.step((1000 + i) as u32)?;
-    }
-    table(&rt.profile(), tokens, step_s);
-
-    // 3. The verify.
-    rt.sync = false;
-    start(&mut rt)?;
-    let rounds = 8;
-    let batch: Vec<u32> = (0..verify).map(|i| (2000 + i) as u32).collect();
-    // A batch size's kernels compile the first time it is used -- on CUDA
-    // an NVRTC compile of every kernel, seconds of it -- so the first
-    // forward is not a forward. Timing it made a verify of three look like
-    // 5.27 steps on an L4 whose kernels summed to less than one.
-    rt.forward(&batch, true)?;
-    let (mut one, mut many) = (0.0, 0.0);
-    for _ in 0..rounds {
+        // 1. The speed.
+        rt.sync = false;
+        start(&mut rt)?;
         let t = Instant::now();
-        rt.step(1500)?;
-        one += t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        rt.forward(&batch, true)?;
-        many += t.elapsed().as_secs_f64();
-    }
-    println!(
-        "\nverify of {verify}: {:.2} ms against a step's {:.2} ms = {:.2} steps",
-        1e3 * many / rounds as f64,
-        1e3 * one / rounds as f64,
-        many / one
-    );
-    rt.sync = true;
-    rt.clear_profile();
-    for _ in 0..rounds {
-        rt.forward(&batch, true)?;
-    }
-    table(&rt.profile(), rounds, many / rounds as f64);
+        for i in 0..tokens {
+            rt.step((1000 + i) as u32)?;
+        }
+        let step_s = t.elapsed().as_secs_f64() / tokens as f64;
+        println!(
+            "\ndecode at context {context}: {:.2} ms/token ({:.1} tok/s)",
+            1e3 * step_s,
+            1.0 / step_s
+        );
 
-    // 4. Decode, one token at a time, through the batch path.
-    rt.sync = false;
-    start(&mut rt)?;
-    rt.forward(&[1000], false)?;
-    start(&mut rt)?;
-    let t = Instant::now();
-    for i in 0..tokens {
-        rt.forward(&[(1000 + i) as u32], false)?;
+        // 2. Where it goes.
+        rt.sync = true;
+        start(&mut rt)?;
+        rt.clear_profile();
+        for i in 0..tokens {
+            rt.step((1000 + i) as u32)?;
+        }
+        table(&rt.profile(), tokens, step_s);
+
+        // 3. The verify.
+        rt.sync = false;
+        start(&mut rt)?;
+        let rounds = 8;
+        let batch: Vec<u32> = (0..verify).map(|i| (2000 + i) as u32).collect();
+        // A batch size's kernels compile the first time it is used -- on CUDA
+        // an NVRTC compile of every kernel, seconds of it -- so the first
+        // forward is not a forward. Timing it made a verify of three look like
+        // 5.27 steps on an L4 whose kernels summed to less than one.
+        rt.forward(&batch, true)?;
+        let (mut one, mut many) = (0.0, 0.0);
+        for _ in 0..rounds {
+            let t = Instant::now();
+            rt.step(1500)?;
+            one += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            rt.forward(&batch, true)?;
+            many += t.elapsed().as_secs_f64();
+        }
+        println!(
+            "\nverify of {verify}: {:.2} ms against a step's {:.2} ms = {:.2} steps",
+            1e3 * many / rounds as f64,
+            1e3 * one / rounds as f64,
+            many / one
+        );
+        rt.sync = true;
+        rt.clear_profile();
+        for _ in 0..rounds {
+            rt.forward(&batch, true)?;
+        }
+        table(&rt.profile(), rounds, many / rounds as f64);
+
+        // 4. Decode, one token at a time, through the batch path.
+        rt.sync = false;
+        start(&mut rt)?;
+        rt.forward(&[1000], false)?;
+        start(&mut rt)?;
+        let t = Instant::now();
+        for i in 0..tokens {
+            rt.forward(&[(1000 + i) as u32], false)?;
+        }
+        let one_s = t.elapsed().as_secs_f64() / tokens as f64;
+        println!(
+            "\ndecode via the batch path: {:.2} ms/token ({:.1} tok/s) against step's {:.2} = {:.2}x",
+            1e3 * one_s,
+            1.0 / one_s,
+            1e3 * step_s,
+            step_s / one_s
+        );
+        rt.sync = true;
+        start(&mut rt)?;
+        rt.clear_profile();
+        for i in 0..tokens {
+            rt.forward(&[(1000 + i) as u32], false)?;
+        }
+        table(&rt.profile(), tokens, one_s);
     }
-    let one_s = t.elapsed().as_secs_f64() / tokens as f64;
-    println!(
-        "\ndecode via the batch path: {:.2} ms/token ({:.1} tok/s) against step's {:.2} = {:.2}x",
-        1e3 * one_s,
-        1.0 / one_s,
-        1e3 * step_s,
-        step_s / one_s
-    );
-    rt.sync = true;
-    start(&mut rt)?;
-    rt.clear_profile();
-    for i in 0..tokens {
-        rt.forward(&[(1000 + i) as u32], false)?;
-    }
-    table(&rt.profile(), tokens, one_s);
 
     // 5. Prefill, warmed: the first chunk of each size compiles.
+    // After `--context` tokens, so the attention reads that much cache: a
+    // lex-code turn is a few hundred to a few thousand new tokens at 10-30K.
     rt.sync = false;
     rt.reset();
     rt.compile_batches()?;
     let ids: Vec<u32> = (0..pre).map(|i| (700 + (i * 37) % 20000) as u32).collect();
     rt.prefill(&ids[..16.min(pre)])?;
-    rt.reset();
+    start(&mut rt)?;
     let t = Instant::now();
     rt.prefill(&ids)?;
     let s = t.elapsed().as_secs_f64();
     println!(
-        "\nprefill of {pre}: {:.0} ms = {:.1} tok/s",
+        "\nprefill of {pre} after {context}: {:.0} ms = {:.1} tok/s",
         1e3 * s,
         pre as f64 / s
     );
     // And where it goes: the chunk size changes every kernel's shape, not
     // only the matmuls', so a size that is slower has to be taken apart.
     rt.sync = true;
-    rt.reset();
+    start(&mut rt)?;
     rt.clear_profile();
     rt.prefill(&ids)?;
     table(&rt.profile(), 1, s);

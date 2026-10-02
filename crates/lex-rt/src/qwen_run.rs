@@ -3071,9 +3071,12 @@ mod gpu {
                     64,
                 )?,
                 attn: {
-                    // A prefill chunk's attention on the matrix units on
-                    // Metal (`lex_msl::attn`); verify batches and CUDA keep
-                    // the program. `LEX_ATTN_PROGRAM=1` keeps it everywhere.
+                    // A prefill chunk's attention on the matrix units
+                    // (`lex_msl::attn`: simdgroup matrices on Metal, `wmma`
+                    // on CUDA); verify batches keep the program.
+                    // `LEX_ATTN_PROGRAM=1` keeps it everywhere. On an L4 the
+                    // program was 70% of a 512-token chunk at 12K positions
+                    // and 82% at 24K, where a coding agent's turns are.
                     let mma = lex_msl::attn::Causal {
                         tokens: t,
                         kv_heads: c.kv_heads,
@@ -3081,12 +3084,17 @@ mod gpu {
                         head_dim: c.head_dim,
                         cap: self.cap,
                     };
-                    if t > MAX_BATCH
+                    let mma_ok = t > MAX_BATCH && std::env::var_os("LEX_ATTN_PROGRAM").is_none();
+                    if mma_ok
                         && crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal
                         && lex_msl::attn::fits(&mma)
-                        && std::env::var_os("LEX_ATTN_PROGRAM").is_none()
                     {
                         gpu.build_lowered(&lex_msl::attn::causal_mma(&mma)?)?
+                    } else if mma_ok
+                        && crate::dev::gemm_backend() == lex_msl::gemm::Backend::Cuda
+                        && lex_msl::attn::fits_cuda(&mma)
+                    {
+                        gpu.build_lowered(&lex_msl::attn::causal_wmma(&mma)?)?
                     } else {
                         compile(gpu, &attn.build_causal_blocks(t, attn_tq(t))?, 128)?
                     }
