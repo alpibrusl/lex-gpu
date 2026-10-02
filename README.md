@@ -25,7 +25,7 @@ Decode, tok/s, against Ollama on the same machine:
 | `qwen3.8:27b-mlx` | NVIDIA L4, plain / speculating | 15.1 / 24.4 | — (MLX build) |
 
 Prefill, `qwen3.8:27b-mlx`, 512 tokens: **229 tok/s** on the M4 Max
-(221 at 2048) against Ollama's 250–260, and **245** on the L4.
+(221 at 2048) against Ollama's 250–260, and **489** on the L4 (vLLM 828).
 
 On the L4 the bar is vLLM (Ollama cannot run the MLX build there). Same
 prompt, through both servers: decode **lex 22.8** against vLLM's 16.1

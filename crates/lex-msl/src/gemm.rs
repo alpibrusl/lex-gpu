@@ -22,7 +22,8 @@
 //! memory, which is what makes NVFP4 and the matrix units compatible at
 //! all -- multiply-accumulate in fragments, and write back through shared
 //! memory so partial tiles can be guarded.
-//! - CUDA: `wmma` 16x16x16, 64x64 tiles, four warps of 32x32.
+//! - CUDA: `wmma` 16x16x16, 128x128 tiles at a full chunk on eight warps
+//!   of 64x32, 64 inputs a step, tiles loaded 16 bytes at a time.
 //! - Metal: `simdgroup_matrix` 8x8, 64x128 tiles at a full chunk on eight
 //!   simdgroups of 32x32, the next step's loads in registers while this
 //!   step multiplies, and each lane's accumulators written straight out.
@@ -86,31 +87,129 @@ pub fn gemm_nvfp4(g: &Gemm, backend: Backend) -> Result<Lowered, String> {
 }
 
 fn cuda(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
-    let (bn, threads) = (64usize, 128usize);
-    // A chunk of 16 or 32 tokens would spend most of a 64-row tile on
-    // padding; halve the tile instead.
-    let bm = if g.m <= 32 { 32 } else { 64 };
-    // Four warps as 2x2, each owning a (bm/2) x (bn/2) block of 16x16
-    // fragments.
-    let (wtm, wtn) = (bm / 2, bn / 2);
+    // `LEX_GEMM_CU_*` measure other schedules (`examples/gemm_bench`):
+    // BM tokens by BN rows a block, BK inputs a step, WM x WN warps, and
+    // VEC=1 for 16-byte loads and stores into shared memory.
+    let pick = |var: &str, d: usize| {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    // Measured on an L4 at 512 tokens (`examples/gemm_bench`), TFLOPS for
+    // gate/up, down, qkv, out_proj:
+    //
+    //   64x64, BK 32, 4 warps, scalar loads (the first)   19 22 25 28
+    //   the same, 16-byte loads                           23 27 35 36
+    //   128x64, 16-byte loads                             32 32 47 42
+    //   128x128, BK 64, 8 warps, 16-byte loads            41 36 55 47
+    //
+    // Taller tiles decode each weight for more tokens -- the FP4 decode,
+    // not the multiply, is what a tile costs on Ada -- and a deeper K step
+    // halves the barriers. A chunk of 64 tokens or fewer keeps the smaller
+    // tile rather than spend most of one on padding.
+    let full = g.m > 64;
+    let bm = pick(
+        "LEX_GEMM_CU_BM",
+        if g.m <= 32 {
+            32
+        } else if full {
+            128
+        } else {
+            64
+        },
+    );
+    let bn = pick("LEX_GEMM_CU_BN", if full { 128 } else { 64 });
+    let bk = pick(
+        "LEX_GEMM_CU_BK",
+        if full && g.k.is_multiple_of(64) {
+            64
+        } else {
+            BK
+        },
+    );
+    let (wgm, wgn) = (
+        pick("LEX_GEMM_CU_WM", 2),
+        pick("LEX_GEMM_CU_WN", if full { 4 } else { 2 }),
+    );
+    let vec = pick("LEX_GEMM_CU_VEC", 1) == 1;
+    let threads = 32 * wgm * wgn;
+    // Each warp owns a (bm/wgm) x (bn/wgn) block of 16x16 fragments.
+    let (wtm, wtn) = (bm / wgm, bn / wgn);
     let (fm, fnn) = (wtm / 16, wtn / 16);
     // Rows padded by 8 halves (16 bytes): off the bank a column read would
     // otherwise hit every time, and still a multiple of the 16 bytes
     // `load_matrix_sync` requires of its stride.
-    let (bkp, bnp) = (BK + 8, bn + 4);
+    let bkp = bk + 8;
     let xt = if g.x_half { "__half" } else { "float" };
     let to_half = if g.x_half { "{v}" } else { "__float2half({v})" };
     let xload = to_half.replace("{v}", "x[(m0 + rr) * K + k0 + c]");
+    // The two tile loads, scalar or 16 bytes at a time.
+    let aload = if vec {
+        let eight = if g.x_half {
+            "*reinterpret_cast<const uint4*>(&x[(m0 + rr) * K + k0 + c])".to_string()
+        } else {
+            "pack8(*reinterpret_cast<const float4*>(&x[(m0 + rr) * K + k0 + c]), \
+             *reinterpret_cast<const float4*>(&x[(m0 + rr) * K + k0 + c + 4u]))"
+                .to_string()
+        };
+        format!(
+            "for (uint e = tid; e < {bm}u * {bk}u / 8u; e += {threads}u) {{\n\
+             \x20           const uint rr = e / ({bk}u / 8u), c = (e % ({bk}u / 8u)) * 8u;\n\
+             \x20           *reinterpret_cast<uint4*>(&As[rr][c]) = (m0 + rr < M) ? {eight} : make_uint4(0u, 0u, 0u, 0u);\n\
+             \x20       }}"
+        )
+    } else {
+        format!(
+            "for (uint e = tid; e < {bm}u * {bk}u; e += {threads}u) {{\n\
+             \x20           const uint rr = e / {bk}u, c = e % {bk}u;\n\
+             \x20           As[rr][c] = (m0 + rr < M) ? {xload} : __float2half(0.0f);\n\
+             \x20       }}"
+        )
+    };
+    let bstore = if vec {
+        "__half2 h[8];
+                for (uint b = 0; b < 8u; ++b) {
+                    const float2 v = fp4_pair(((b < 4u ? w.x : w.y) >> (8u * (b & 3u))) & 0xFFu);
+                    h[b] = __floats2half2_rn(v.x * sc, v.y * sc);
+                }
+                *reinterpret_cast<uint4*>(&Bs[rr][c0]) = *reinterpret_cast<uint4*>(&h[0]);
+                *reinterpret_cast<uint4*>(&Bs[rr][c0 + 8u]) = *reinterpret_cast<uint4*>(&h[4]);"
+    } else {
+        "for (uint b = 0; b < 8u; ++b) {
+                    const float2 v = fp4_pair(((b < 4u ? w.x : w.y) >> (8u * (b & 3u))) & 0xFFu);
+                    Bs[rr][c0 + 2u * b] = __float2half(v.x * sc);
+                    Bs[rr][c0 + 2u * b + 1u] = __float2half(v.y * sc);
+                }"
+    };
+    let pack8 = if vec && !g.x_half {
+        "__device__ __forceinline__ uint4 pack8(float4 a, float4 b) {
+    __half2 h[4] = {__floats2half2_rn(a.x, a.y), __floats2half2_rn(a.z, a.w),
+                    __floats2half2_rn(b.x, b.y), __floats2half2_rn(b.z, b.w)};
+    return *reinterpret_cast<uint4*>(&h[0]);
+}
+"
+    } else {
+        ""
+    };
     let rparam = if g.residual {
         "    const float* __restrict__ r,\n"
     } else {
         ""
     };
-    let radd = if g.residual {
-        " + r[(m0 + rr) * N + n0 + c]"
+    let radd_t = if g.residual {
+        " + r[(row + rr) * N + col + c]"
     } else {
         ""
     };
+    let rfrag = if g.residual {
+        "wmma::fragment<wmma::accumulator, 16, 16, 16, float> rf;
+                wmma::load_matrix_sync(rf, &r[row * N + col], N, wmma::mem_row_major);
+                for (int t = 0; t < rf.num_elements; ++t) acc[i][j].x[t] += rf.x[t];"
+    } else {
+        ""
+    };
+    let warps = wgm * wgn;
     let (m, n, k) = (g.m, g.n, g.k);
     let source = format!(
         r#"// Generated by lex-msl::gemm. Hand-scheduled, not lowered from a program.
@@ -119,7 +218,7 @@ fn cuda(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
 {includes}#include <mma.h>
 
 {fp4}
-extern "C" __global__ void {entry}(
+{pack8}extern "C" __global__ void {entry}(
     const {xt}* __restrict__ x,
     const char* __restrict__ q,
     const char* __restrict__ s,
@@ -131,10 +230,12 @@ extern "C" __global__ void {entry}(
     const uint M = {m}u, N = {n}u, K = {k}u;
     const uint tid = threadIdx.x, warp = tid / 32u;
     const uint n0 = blockIdx.x * {bn}u, m0 = blockIdx.y * {bm}u;
-    const uint wm = warp / 2u, wn = warp % 2u;
+    const uint wm = warp / {wgn}u, wn = warp % {wgn}u;
     __shared__ __align__(32) __half As[{bm}][{bkp}];
     __shared__ __align__(32) __half Bs[{bn}][{bkp}];
-    __shared__ __align__(32) float Cs[{bm}][{bnp}];
+    // One 16x16 tile a warp, for a fragment that hangs past the last
+    // token or row; whole ones go straight to `y`.
+    __shared__ __align__(32) float Ct[{warps}][16 * 16];
 
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[{fm}][{fnn}];
     for (int i = 0; i < {fm}; ++i)
@@ -142,10 +243,7 @@ extern "C" __global__ void {entry}(
 
     for (uint k0 = 0; k0 < K; k0 += {bk}u) {{
         // Activations: a {bm} x {bk} tile, zero past the last token.
-        for (uint e = tid; e < {bm}u * {bk}u; e += {threads}u) {{
-            const uint rr = e / {bk}u, c = e % {bk}u;
-            As[rr][c] = (m0 + rr < M) ? {xload} : __float2half(0.0f);
-        }}
+        {aload}
         // Weights, dequantised: one thread per group of 16, so the FP8
         // scale is decoded once per group, and its 8 bytes are one load.
         // `fp4_pair` leaves values 2^14 small; the 2^14 rides on the scale.
@@ -156,11 +254,7 @@ extern "C" __global__ void {entry}(
                 const float sc = fp8_e4m3((uint)(uchar)s[j * (K / 16u) + (k0 + c0) / 16u])
                     * gs[j] * 16384.0f;
                 const uint2 w = *reinterpret_cast<const uint2*>(&q[j * (K / 2u) + (k0 + c0) / 2u]);
-                for (uint b = 0; b < 8u; ++b) {{
-                    const float2 v = fp4_pair(((b < 4u ? w.x : w.y) >> (8u * (b & 3u))) & 0xFFu);
-                    Bs[rr][c0 + 2u * b] = __float2half(v.x * sc);
-                    Bs[rr][c0 + 2u * b + 1u] = __float2half(v.y * sc);
-                }}
+                {bstore}
             }} else {{
                 for (uint c = 0; c < 16u; ++c) Bs[rr][c0 + c] = __float2half(0.0f);
             }}
@@ -180,23 +274,36 @@ extern "C" __global__ void {entry}(
         __syncthreads();
     }}
 
-    // Through shared memory, so ragged tokens and rows can be left out.
+    // Each warp writes its own fragments: whole ones straight to `y`, the
+    // residual added fragment-wise (an accumulator loaded from `r` holds
+    // its elements in the same places), ragged ones through the warp's
+    // tile with each element guarded.
+    const uint lane = tid % 32u;
     for (int i = 0; i < {fm}; ++i)
-        for (int j = 0; j < {fnn}; ++j)
-            wmma::store_matrix_sync(&Cs[wm * {wtm}u + i * 16u][wn * {wtn}u + j * 16u],
-                                    acc[i][j], {bnp}, wmma::mem_row_major);
-    __syncthreads();
-    for (uint e = tid; e < {bm}u * {bn}u; e += {threads}u) {{
-        const uint rr = e / {bn}u, c = e % {bn}u;
-        if (m0 + rr < M && n0 + c < N) y[(m0 + rr) * N + n0 + c] = Cs[rr][c]{radd};
-    }}
+        for (int j = 0; j < {fnn}; ++j) {{
+            const uint row = m0 + wm * {wtm}u + i * 16u, col = n0 + wn * {wtn}u + j * 16u;
+            if (row + 16u <= M && col + 16u <= N) {{
+                {rfrag}
+                wmma::store_matrix_sync(&y[row * N + col], acc[i][j], N, wmma::mem_row_major);
+            }} else {{
+                wmma::store_matrix_sync(Ct[warp], acc[i][j], 16, wmma::mem_row_major);
+                __syncwarp();
+                for (uint e = lane; e < 256u; e += 32u) {{
+                    const uint rr = e / 16u, c = e % 16u;
+                    if (row + rr < M && col + c < N)
+                        y[(row + rr) * N + col + c] = Ct[warp][e]{radd_t};
+                }}
+                __syncwarp();
+            }}
+        }}
 }}
 "#,
         includes = Cuda.includes(),
         fp4 = Cuda.fp4_preamble(),
         gx = n.div_ceil(bn),
         gy = m.div_ceil(bm),
-        bk = BK,
+        bk = bk,
+        wgn = wgn,
     );
     Lowered {
         entry,
@@ -204,7 +311,7 @@ extern "C" __global__ void {entry}(
         grid: n.div_ceil(bn),
         grid2: m.div_ceil(bm),
         threads,
-        threadgroup_bytes: 2 * bm * bkp + 2 * bn * bkp + 4 * bm * bnp,
+        threadgroup_bytes: 2 * bm * bkp + 2 * bn * bkp + 4 * warps * 256,
         arena_bytes: 0,
         scratch_bytes: 0,
         barriers: 3,
