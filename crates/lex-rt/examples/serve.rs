@@ -588,7 +588,7 @@ mod serve {
             };
             sse(conn, &chunk(r#"{"role":"assistant"}"#, "null".into()))?;
             let mut split = Stream::for_request(template, j);
-            let (text, reason, _) = generate(
+            let (text, reason, n) = generate(
                 rt,
                 tok,
                 &ids,
@@ -635,6 +635,25 @@ mod serve {
             }
             let reason = finish_reason(reason, &reply);
             sse(conn, &chunk("{}", quote(reason)))?;
+            // OpenAI's `stream_options.include_usage`: one last chunk with
+            // no choices and the token counts, so a client timing a stream
+            // knows how many tokens it received -- with speculation a chunk
+            // carries several, and counting chunks undercounts.
+            let usage = j.get("stream_options").and_then(|o| o.get("include_usage"))
+                == Some(&Json::Bool(true));
+            if usage {
+                sse(
+                    conn,
+                    &format!(
+                        r#"{{"id":{},"object":"chat.completion.chunk","created":{},"model":{},"choices":[],"usage":{{"prompt_tokens":{},"completion_tokens":{n},"total_tokens":{}}}}}"#,
+                        quote(&id),
+                        now(),
+                        quote(model),
+                        ids.len(),
+                        ids.len() + n
+                    ),
+                )?;
+            }
             conn.write_all(b"data: [DONE]\n\n")
                 .map_err(|e| e.to_string())?;
             return conn.flush().map_err(|e| e.to_string());

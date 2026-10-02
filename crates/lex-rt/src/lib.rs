@@ -20,3 +20,4 @@ pub mod qwen_source;
 pub mod sample;
 pub mod spec;
 pub mod tokenizer;
+pub mod tune;
