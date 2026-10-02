@@ -917,8 +917,10 @@ fn a_padded_prefill_leaves_the_state_where_stepping_leaves_it() {
     };
     for n in [47usize, 300, 431] {
         let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i as u32 * 7919) % 200000).collect();
-        let plan = rt.prefill_plan(n);
+        // After the reset: the plan depends on where the cache stands, and
+        // a padded piece has to fit under it.
         rt.reset();
+        let plan = rt.prefill_plan(n);
         let mut rows = vec![rt.prefill(&prompt).expect("prefill")];
         let mut fed = vec![];
         for _ in 0..AFTER {
