@@ -11,7 +11,7 @@ use lex_front::{Tensor, run};
 use lex_ir::DType;
 use lex_ir::reference::fill_pattern_f32;
 use lex_metal::{Buffer, Gpu};
-use lex_msl::few::{Few, matvec_few_nvfp4};
+use lex_msl::few::{Few, layouts, matvec_few_nvfp4_with};
 
 fn upload(gpu: &Gpu, t: &Tensor) -> Buffer {
     match t.dtype {
@@ -71,14 +71,19 @@ fn the_few_token_matvec_matches_the_matmul_it_replaces() {
         tensors.push(Tensor::zeros(DType::F32, &[tokens, n]));
         let out = tensors.len() - 1;
 
-        let pipe = gpu
-            .build_lowered(&matvec_few_nvfp4(&f).expect("few"))
-            .expect("compile");
+        // Every layout a tuner may pick, each against the interpreter.
         let bufs: Vec<Buffer> = tensors.iter().map(|t| upload(&gpu, t)).collect();
         let refs: Vec<&Buffer> = bufs.iter().collect();
-        gpu.run(&pipe, &refs);
-        let mut got = vec![0.0f32; tokens * n];
-        gpu.download(&bufs[out], &mut got);
+        let mut outs = vec![];
+        for layout in layouts() {
+            let pipe = gpu
+                .build_lowered(&matvec_few_nvfp4_with(&f, layout).expect("few"))
+                .expect("compile");
+            gpu.run(&pipe, &refs);
+            let mut got = vec![0.0f32; tokens * n];
+            gpu.download(&bufs[out], &mut got);
+            outs.push((layout, got));
+        }
 
         run(&prog, &mut tensors).expect("interpret");
         let want = &tensors[out].data;
@@ -87,16 +92,18 @@ fn the_few_token_matvec_matches_the_matmul_it_replaces() {
             scale > 1.0,
             "{f:?}: the reference is all but zero ({scale})"
         );
-        let err = got
-            .iter()
-            .zip(want)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max)
-            / scale;
-        eprintln!("{f:?}: {err:e} of scale");
-        assert!(
-            err < 1e-5,
-            "{f:?}: few-token matvec vs interpreter {err:e} of scale"
-        );
+        for (layout, got) in &outs {
+            let err = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+                / scale;
+            assert!(
+                err < 1e-5,
+                "{f:?} {layout:?}: few-token matvec vs interpreter {err:e} of scale"
+            );
+        }
+        eprintln!("{f:?}: {} layouts agree with the interpreter", outs.len());
     }
 }

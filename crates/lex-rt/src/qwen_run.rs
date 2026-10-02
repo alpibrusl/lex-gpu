@@ -394,33 +394,125 @@ mod gpu {
     /// is Q6_K in some layers and Q4_K in others -- and a pipeline compiled
     /// for the wrong one reads the right bytes as the wrong numbers.
     fn mv_keys(layers: &[Layer], lm_head: &QBuf, mtp: Option<&Mtp>) -> Vec<MvKey> {
-        fn layer(l: &Layer, v: &mut Vec<MvKey>) {
-            v.push(l.ffn.gate.key(false));
-            v.push(l.ffn.up.key(false));
-            v.push(l.ffn.down.key(true));
+        all_mats(layers, lm_head, mtp)
+            .into_iter()
+            .map(|(m, res)| m.key(res))
+            .collect()
+    }
+
+    /// Every quantised matrix the model multiplies by, with whether its
+    /// product goes into the residual: what `mv_keys` keys, and what the
+    /// tuner times a shape on.
+    fn all_mats<'a>(
+        layers: &'a [Layer],
+        lm_head: &'a QBuf,
+        mtp: Option<&'a Mtp>,
+    ) -> Vec<(&'a QBuf, bool)> {
+        fn layer<'a>(l: &'a Layer, v: &mut Vec<(&'a QBuf, bool)>) {
+            v.push((&l.ffn.gate, false));
+            v.push((&l.ffn.up, false));
+            v.push((&l.ffn.down, true));
             match &l.mixer {
                 Mixer::Linear(x) => {
-                    v.push(x.qkv.key(false));
-                    v.push(x.z.key(false));
-                    v.push(x.out.key(true));
+                    v.push((&x.qkv, false));
+                    v.push((&x.z, false));
+                    v.push((&x.out, true));
                 }
                 Mixer::Attn(a) => {
-                    v.push(a.q.key(false));
-                    v.push(a.k.key(false));
-                    v.push(a.v.key(false));
-                    v.push(a.o.key(true));
+                    v.push((&a.q, false));
+                    v.push((&a.k, false));
+                    v.push((&a.v, false));
+                    v.push((&a.o, true));
                 }
             }
         }
-        let mut v = vec![lm_head.key(false)];
+        let mut v = vec![(lm_head, false)];
         for l in layers {
             layer(l, &mut v);
         }
         if let Some(m) = mtp {
-            v.push(m.fc.key(false));
+            v.push((&m.fc, false));
             layer(&m.layer, &mut v);
         }
         v
+    }
+
+    /// The few-token NVFP4 matvec for `few`, its layout chosen on this
+    /// device (`crate::tune`): every layout `lex_msl::few::layouts` offers,
+    /// run on up to four of the model's own matrices of this shape -- so the
+    /// weights stream from memory as in a step, not from cache -- and kept
+    /// only if its output is the default layout's.
+    fn tuned_few(
+        gpu: &Gpu,
+        tuner: &mut crate::tune::Tuner,
+        few: lex_msl::few::Few,
+        mats: &[&QBuf],
+    ) -> Result<Pipeline, String> {
+        use lex_msl::few::{Layout, layouts, matvec_few_nvfp4_with};
+        let def = Layout::default();
+        let base = matvec_few_nvfp4_with(&few, def)?;
+        if tuner.mode() == crate::tune::Mode::Off || mats.is_empty() {
+            return gpu.build_lowered(&base);
+        }
+        let key = format!(
+            "few/{}/{}x{}x{}{}{}",
+            crate::tune::digest(&base.source),
+            few.tokens,
+            few.n,
+            few.k,
+            if few.residual { "r" } else { "" },
+            if few.x_half { "h" } else { "" }
+        );
+        let (t, n, k) = (few.tokens, few.n, few.k);
+        let xs: Vec<f32> = (0..t * k)
+            .map(|i| ((i * 7) % 13) as f32 * 0.01 - 0.06)
+            .collect();
+        let x = if few.x_half {
+            gpu.upload(&xs.iter().map(|&v| f16::from_f32(v)).collect::<Vec<_>>())
+        } else {
+            gpu.upload(&xs)
+        };
+        let r = gpu.upload(&(0..t * n).map(|i| (i % 5) as f32 * 0.1).collect::<Vec<_>>());
+        let y = gpu.zeroed::<f32>(t * n);
+        let res = few.residual.then_some(&r);
+        let want = {
+            let p = gpu.build_lowered(&base)?;
+            gpu.run_launches(&[(&p, mats[0].bind(&x, res, &y).as_slice(), None)]);
+            let mut v = vec![0.0f32; t * n];
+            gpu.download(&y, &mut v);
+            v
+        };
+        let scale = want.iter().fold(1e-6f32, |a, v| a.max(v.abs()));
+        let name = |l: &Layout| format!("r{}s{}", l.rows, l.simdgroups);
+        let chosen = tuner.choose(&key, &layouts(), def, name, |l| {
+            let p = match matvec_few_nvfp4_with(&few, *l) {
+                Ok(lw) => gpu.build_lowered(&lw)?,
+                Err(_) => return Ok(None),
+            };
+            gpu.run_launches(&[(&p, mats[0].bind(&x, res, &y).as_slice(), None)]);
+            let mut got = vec![0.0f32; t * n];
+            gpu.download(&y, &mut got);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+                / scale;
+            if err > 1e-5 {
+                return Ok(None);
+            }
+            let binds: Vec<Vec<&Buffer>> = (0..8)
+                .map(|i| mats[i % mats.len()].bind(&x, res, &y))
+                .collect();
+            let steps: Vec<Step<'_>> = binds.iter().map(|b| (&p, b.as_slice(), None)).collect();
+            gpu.run_launches(&steps);
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                best = best.min(gpu.run_launches(&steps).1 / steps.len() as f64);
+            }
+            Ok(Some(best))
+        })?;
+        gpu.build_lowered(&matvec_few_nvfp4_with(&few, chosen)?)
     }
 
     /// RMSNorm on the host, for the draft head's two pre-norms: 5120
@@ -762,6 +854,9 @@ mod gpu {
         /// The draft head's own cache length.
         mtp_pos: usize,
         snap: Option<Snapshot>,
+        /// Schedules chosen on this device (`crate::tune`), for the
+        /// pipelines `batch` builds after load.
+        tune: std::cell::RefCell<crate::tune::Tuner>,
         /// The hidden state a verify left, for the next draft.
         spec_h: Option<Vec<f32>>,
         /// Call sites to leave out, by label prefix.
@@ -1135,6 +1230,19 @@ mod gpu {
             } else {
                 None
             };
+            let mut tuner = if crate::dev::gemm_backend() == lex_msl::gemm::Backend::Metal {
+                crate::tune::Tuner::open(&gpu.info().name)
+            } else {
+                crate::tune::Tuner::off()
+            };
+            let mats = all_mats(&layers, &lm_head, mtp.as_ref());
+            let mats_of = |key: MvKey| -> Vec<&QBuf> {
+                mats.iter()
+                    .filter(|(m, r)| m.key(*r) == key)
+                    .map(|(m, _)| *m)
+                    .take(4)
+                    .collect()
+            };
             for key in mv_keys(&layers, &lm_head, mtp.as_ref()) {
                 if let std::collections::hash_map::Entry::Vacant(slot) = k.mv.entry(key) {
                     let (n_in, n_out, res, layout) = key;
@@ -1154,7 +1262,7 @@ mod gpu {
                         && lex_msl::few::fits(&few)
                         && std::env::var("LEX_FEW").map_or(true, |v| v != "0")
                     {
-                        slot.insert(gpu.build_lowered(&lex_msl::few::matvec_few_nvfp4(&few)?)?);
+                        slot.insert(tuned_few(&gpu, &mut tuner, few, &mats_of(key))?);
                         continue;
                     }
                     let p = matvec_q(n_in, n_out, bo(gpu.target()), n_in, layout, res)?;
@@ -1216,6 +1324,7 @@ mod gpu {
                 mtp_in_b,
                 mtp_pos: 0,
                 snap,
+                tune: std::cell::RefCell::new(tuner),
                 spec_h: None,
                 skip: vec![],
                 acts,
@@ -2317,7 +2426,41 @@ mod gpu {
                     }
                 }
             }
+            self.tune_report();
             Ok(())
+        }
+
+        /// Log what the tuner measured this load, and cache it.
+        pub fn tune_report(&self) {
+            let mut t = self.tune.borrow_mut();
+            if !t.measured.is_empty() {
+                let changed: Vec<String> = t
+                    .measured
+                    .iter()
+                    .filter(|(_, c, _)| c != "r2s2")
+                    .map(|(k, c, g)| {
+                        format!(
+                            "{} -> {c} ({:+.1}%)",
+                            k.rsplit('/').next().unwrap_or(k),
+                            100.0 * g
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "tuned {} shapes on this device, {} changed from the default{}{}",
+                    t.measured.len(),
+                    changed.len(),
+                    if changed.is_empty() { "" } else { ": " },
+                    changed.join(", ")
+                );
+            }
+            if t.skipped > 0 {
+                eprintln!(
+                    "{} shapes past the tuning budget kept their default",
+                    t.skipped
+                );
+            }
+            t.save();
         }
 
         /// The batch sizes compiled so far, ascending.
@@ -2439,7 +2582,14 @@ mod gpu {
                         && lex_msl::few::fits(&few)
                         && std::env::var("LEX_FEW").map_or(true, |v| v != "0")
                     {
-                        slot.insert(gpu.build_lowered(&lex_msl::few::matvec_few_nvfp4(&few)?)?);
+                        let mats: Vec<&QBuf> =
+                            all_mats(&self.layers, &self.lm_head, self.mtp.as_ref())
+                                .into_iter()
+                                .filter(|(m, r)| m.key(*r) == key)
+                                .map(|(m, _)| m)
+                                .take(4)
+                                .collect();
+                        slot.insert(tuned_few(gpu, &mut self.tune.borrow_mut(), few, &mats)?);
                         continue;
                     }
                     let p = matmul_q_x(t, n_in, n_out, bo, n_in, layout, res, xt)?;
