@@ -61,6 +61,16 @@ pub fn fits(g: &Gemm) -> bool {
 }
 
 pub fn gemm_nvfp4(g: &Gemm, backend: Backend) -> Result<Lowered, String> {
+    gemm_nvfp4_with(g, backend, None)
+}
+
+/// [`gemm_nvfp4`] with a CUDA schedule chosen by the caller (`None`: the
+/// default for the shape, [`cuda_default`]). Metal ignores it.
+pub fn gemm_nvfp4_with(
+    g: &Gemm,
+    backend: Backend,
+    schedule: Option<CudaSchedule>,
+) -> Result<Lowered, String> {
     if !fits(g) {
         return Err(format!(
             "gemm {}x{}x{}: the reduction must be a multiple of {BK}",
@@ -81,15 +91,95 @@ pub fn gemm_nvfp4(g: &Gemm, backend: Backend) -> Result<Lowered, String> {
     }
     writes.push(true);
     Ok(match backend {
-        Backend::Cuda => cuda(g, entry, writes),
+        Backend::Cuda => {
+            let sched = schedule.unwrap_or_else(|| cuda_default(g));
+            if !cuda_valid(g, &sched) {
+                return Err(format!("gemm {}x{}x{}: schedule {sched:?} does not fit", g.m, g.n, g.k));
+            }
+            // The schedule is in the entry name, so two schedules of one
+            // shape are two functions, however a loader keys them.
+            let entry = format!("{entry}_c{}", sched.name());
+            cuda(g, entry, writes, sched)
+        }
         Backend::Metal => metal(g, entry, writes),
     })
 }
 
-fn cuda(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
-    // `LEX_GEMM_CU_*` measure other schedules (`examples/gemm_bench`):
-    // BM tokens by BN rows a block, BK inputs a step, WM x WN warps, and
-    // VEC=1 for 16-byte loads and stores into shared memory.
+/// How a CUDA block is cut: `bm` tokens by `bn` rows, `bk` inputs a step,
+/// `wgm` x `wgn` warps each owning a block of 16x16 fragments, and whether
+/// the tile loads and stores are 16 bytes wide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CudaSchedule {
+    pub bm: usize,
+    pub bn: usize,
+    pub bk: usize,
+    pub wgm: usize,
+    pub wgn: usize,
+    pub vec: bool,
+}
+
+impl CudaSchedule {
+    /// A short stable name, for cache keys and entry names.
+    pub fn name(&self) -> String {
+        format!(
+            "{}x{}k{}w{}x{}{}",
+            self.bm,
+            self.bn,
+            self.bk,
+            self.wgm,
+            self.wgn,
+            if self.vec { "v" } else { "s" }
+        )
+    }
+}
+
+/// Whether `s` is a schedule the kernel can run for `g`: warps tile the
+/// block in whole fragments, `bk` divides the reduction, the block fits in
+/// the 48 KB of static shared memory, and it is not mostly padding.
+pub fn cuda_valid(g: &Gemm, s: &CudaSchedule) -> bool {
+    let warps = s.wgm * s.wgn;
+    let smem = 2 * s.bm * (s.bk + 8) + 2 * s.bn * (s.bk + 8) + 4 * warps * 256;
+    s.wgm > 0
+        && s.wgn > 0
+        && s.bm.is_multiple_of(16 * s.wgm)
+        && s.bn.is_multiple_of(16 * s.wgn)
+        && s.bk.is_multiple_of(16)
+        && g.k.is_multiple_of(s.bk)
+        && 32 * warps <= 1024
+        && smem <= 48 * 1024
+        && (s.bm < 2 * g.m || s.bm == 32)
+}
+
+/// The schedules worth timing for `g`. All run the same sums in the same
+/// order, so they agree with the default's output.
+pub fn cuda_candidates(g: &Gemm) -> Vec<CudaSchedule> {
+    [
+        (32, 64, 32, 2, 2),
+        (64, 64, 32, 2, 2),
+        (64, 64, 64, 2, 2),
+        (64, 128, 32, 2, 4),
+        (64, 128, 64, 2, 4),
+        (128, 64, 32, 2, 2),
+        (128, 64, 64, 4, 2),
+        (128, 128, 32, 2, 4),
+        (128, 128, 64, 2, 4),
+    ]
+    .into_iter()
+    .map(|(bm, bn, bk, wgm, wgn)| CudaSchedule {
+        bm,
+        bn,
+        bk,
+        wgm,
+        wgn,
+        vec: true,
+    })
+    .filter(|s| cuda_valid(g, s))
+    .collect()
+}
+
+/// The default schedule for `g`, with `LEX_GEMM_CU_{BM,BN,BK,WM,WN,VEC}`
+/// overriding it (`examples/gemm_bench` sweeps with them).
+pub fn cuda_default(g: &Gemm) -> CudaSchedule {
     let pick = |var: &str, d: usize| {
         std::env::var(var)
             .ok()
@@ -109,30 +199,47 @@ fn cuda(g: &Gemm, entry: String, writes: Vec<bool>) -> Lowered {
     // halves the barriers. A chunk of 64 tokens or fewer keeps the smaller
     // tile rather than spend most of one on padding.
     let full = g.m > 64;
-    let bm = pick(
-        "LEX_GEMM_CU_BM",
-        if g.m <= 32 {
-            32
-        } else if full {
-            128
-        } else {
-            64
-        },
-    );
-    let bn = pick("LEX_GEMM_CU_BN", if full { 128 } else { 64 });
-    let bk = pick(
-        "LEX_GEMM_CU_BK",
-        if full && g.k.is_multiple_of(64) {
-            64
-        } else {
-            BK
-        },
-    );
-    let (wgm, wgn) = (
-        pick("LEX_GEMM_CU_WM", 2),
-        pick("LEX_GEMM_CU_WN", if full { 4 } else { 2 }),
-    );
-    let vec = pick("LEX_GEMM_CU_VEC", 1) == 1;
+    CudaSchedule {
+        bm: pick(
+            "LEX_GEMM_CU_BM",
+            if g.m <= 32 {
+                32
+            } else if full {
+                128
+            } else {
+                64
+            },
+        ),
+        bn: pick("LEX_GEMM_CU_BN", if full { 128 } else { 64 }),
+        bk: pick(
+            "LEX_GEMM_CU_BK",
+            if full && g.k.is_multiple_of(64) {
+                64
+            } else {
+                BK
+            },
+        ),
+        wgm: pick("LEX_GEMM_CU_WM", 2),
+        wgn: pick("LEX_GEMM_CU_WN", if full { 4 } else { 2 }),
+        vec: pick("LEX_GEMM_CU_VEC", 1) == 1,
+    }
+}
+
+/// Whether any `LEX_GEMM_CU_*` knob is set: an explicit schedule, which a
+/// tuner leaves alone.
+pub fn cuda_overridden() -> bool {
+    std::env::vars().any(|(k, _)| k.starts_with("LEX_GEMM_CU_"))
+}
+
+fn cuda(g: &Gemm, entry: String, writes: Vec<bool>, sched: CudaSchedule) -> Lowered {
+    let CudaSchedule {
+        bm,
+        bn,
+        bk,
+        wgm,
+        wgn,
+        vec,
+    } = sched;
     let threads = 32 * wgm * wgn;
     // Each warp owns a (bm/wgm) x (bn/wgn) block of 16x16 fragments.
     let (wtm, wtn) = (bm / wgm, bn / wgn);

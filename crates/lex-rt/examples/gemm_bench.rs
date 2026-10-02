@@ -15,7 +15,7 @@
 //! NVRTC before a cloud run.
 
 fn main() -> Result<(), String> {
-    use lex_msl::gemm::{Backend, Gemm, gemm_nvfp4};
+    use lex_msl::gemm::{Backend, Gemm};
 
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| {
@@ -41,15 +41,48 @@ fn main() -> Result<(), String> {
 
     if let Some(dir) = arg("--emit") {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        for (label, n, k, res, xh) in shapes {
-            let l = gemm_nvfp4(&gemm(n, k, res, xh), Backend::Cuda)?;
-            let path = format!("{dir}/{}.cu", label.replace('/', "_"));
-            std::fs::write(&path, &l.source).map_err(|e| e.to_string())?;
-            println!(
-                "{path}: {} threads, {} bytes shared",
-                l.threads, l.threadgroup_bytes
-            );
+        // `--all`: every schedule a tuner may pick, at every chunk size the
+        // runtime compiles, so each can go through nvcc and NVRTC here.
+        let all = args.iter().any(|a| a == "--all");
+        let sizes: Vec<usize> = if all {
+            vec![512, 256, 128, 64, 32, 16]
+        } else {
+            vec![tokens]
+        };
+        let mut written = 0;
+        for t in sizes {
+            for (label, n, k, res, xh) in shapes {
+                let g = Gemm {
+                    m: t,
+                    n,
+                    k,
+                    residual: res,
+                    x_half: xh,
+                };
+                let scheds: Vec<Option<lex_msl::gemm::CudaSchedule>> = if all {
+                    lex_msl::gemm::cuda_candidates(&g)
+                        .into_iter()
+                        .map(Some)
+                        .collect()
+                } else {
+                    vec![None]
+                };
+                for sc in scheds {
+                    let l = lex_msl::gemm::gemm_nvfp4_with(&g, Backend::Cuda, sc)?;
+                    let tag = sc.map(|s| s.name()).unwrap_or_default();
+                    let path = format!("{dir}/{}_{t}_{tag}.cu", label.replace('/', "_"));
+                    std::fs::write(&path, &l.source).map_err(|e| e.to_string())?;
+                    written += 1;
+                    if !all {
+                        println!(
+                            "{path}: {} threads, {} bytes shared",
+                            l.threads, l.threadgroup_bytes
+                        );
+                    }
+                }
+            }
         }
+        println!("{written} kernels in {dir}");
         return Ok(());
     }
     run(tokens, &shapes, gemm)
