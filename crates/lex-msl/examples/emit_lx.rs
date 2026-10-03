@@ -41,7 +41,16 @@ fn main() -> Result<(), String> {
         let warps = s.warps;
         let (prog, threads) = unit.compile(target.name, &args)?;
         lex_front::check(&prog, &target).map_err(|e| format!("{}: {e:#?}", target.name))?;
-        let l = lower_sched(&prog, &target, dialect, &Sched { threads, warps })?;
+        let l = lower_sched(
+            &prog,
+            &target,
+            dialect,
+            &Sched {
+                threads,
+                warps,
+                pad: s.pad,
+            },
+        )?;
         let path = format!("{dir}/{}.{ext}", l.entry);
         std::fs::write(&path, &l.source).map_err(|e| e.to_string())?;
         println!(

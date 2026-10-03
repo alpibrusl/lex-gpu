@@ -538,17 +538,22 @@ Read the diff before committing it.
 - **Most of the surface syntax:** `.lx` parses algorithms, elementwise and
   reduction ops, `grid` axes, loops that carry a tile, windows at affine
   offsets, `matmul_nt`, and schedules with `threads`, `chunk` and the
-  algorithm's `tile` extents — enough for `rmsnorm`, `silu_mul` and a tiled
-  `gemm` (`crates/lex-front/lx`). Layouts and memory spaces are not in the
-  type, and the matvec, attention and the gated-delta recurrence are
-  still built through the Rust IR API. The measurement that most wants a
+  algorithm's `tile` extents — enough for `rmsnorm`, `silu_mul`, a tiled
+  `gemm` and `gemm_mma`, which runs on the matrix units (`@shared`/`@frag`
+  tiles, `mma`, a `warps` grid in the schedule; `crates/lex-front/lx`).
+  The matvec, attention and the gated-delta recurrence are still built
+  through the Rust IR API. The measurement that most wants a
   schedule block — rows per simdgroup, 1 on Apple and 2 on Ada — is still
   a constant in the target table.
-- **Matrix units from the IR:** the prefill GEMM (`lex_msl::gemm`), the
-  chunked gated-delta rule (`lex_msl::delta`) and the int16 matvec
-  (`lex_msl::int8`) are hand-scheduled kernels that take the same
-  parameters as the programs they stand in for; the IR has no matrix
-  fragments yet.
+- **Matrix units for the kernels the model runs:** the IR has fragment
+  tiles and `mma` now, and an f16 GEMM written in `.lx` lowers to `wmma` and
+  `simdgroup_matrix`. The prefill GEMM the model uses (`lex_msl::gemm`,
+  NVFP4 weights), the causal attention (`lex_msl::attn`), the chunked
+  gated-delta rule (`lex_msl::delta`) and the int16 matvec
+  (`lex_msl::int8`) are still hand-scheduled kernels that take the same
+  parameters as the programs they stand in for: they need quantised
+  operands staged into shared memory, row-wise operations on fragments
+  (the online softmax) and an epilogue.
 - **Around the model:** the embedding lookup as a kernel (host glue
   today), and paged KV.
 - **Other parts of the design:** a graph compiler, MLIR.

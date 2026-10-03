@@ -220,17 +220,18 @@ pub trait Matrix {
     /// Set one accumulator to `val`.
     fn fill(&self, frag: &str, val: &str) -> String;
 
-    /// Lines adding `a b^T` over the inner dimension `k` into the
-    /// accumulators `c[fm][fnn]`: `a` and `b` are f16 tiles in threadgroup
-    /// memory, row-major with `k` columns, and this warp's accumulators sit
-    /// at row `a_row` of `a` and row `b_row` of `b`.
+    /// Lines adding `a b^T` over the inner dimension into the accumulators
+    /// `c[fm][fnn]`: `a` and `b` are f16 tiles in threadgroup memory,
+    /// row-major, and `k = (inner, row length of a, row length of b)` -- the
+    /// row lengths exceed the inner dimension when the tiles are padded. This
+    /// warp's accumulators sit at row `a_row` of `a` and row `b_row` of `b`.
     #[allow(clippy::too_many_arguments)]
     fn mma(
         &self,
         c: &str,
         a: &str,
         b: &str,
-        k: usize,
+        k: (usize, usize, usize),
         fm: usize,
         fnn: usize,
         a_row: &str,
@@ -242,6 +243,14 @@ pub trait Matrix {
 
     /// Elements a global store's address must be a multiple of.
     fn store_align(&self) -> usize;
+
+    /// Elements of padding after each row of a shared f16 tile read by
+    /// fragments, so the rows of a fragment load fall in different banks.
+    /// 8 halves is 16 bytes, which keeps `wmma`'s alignment and shifts each
+    /// row by four banks; measured on an L4 against none, it is the
+    /// difference between conflicted and clean loads (the hand-written
+    /// GEMM's `bk + 8`). Not yet measured on Apple, so none.
+    fn default_pad(&self) -> usize;
 }
 
 /// CUDA `wmma`: 16x16x16, f16 in and f32 accumulating.
@@ -272,7 +281,7 @@ impl Matrix for Wmma {
         c: &str,
         a: &str,
         b: &str,
-        k: usize,
+        (k, lda, ldb): (usize, usize, usize),
         fm: usize,
         fnn: usize,
         a_row: &str,
@@ -288,10 +297,10 @@ impl Matrix for Wmma {
             ),
             format!("    for (uint kk = 0; kk < {k}u; kk += 16u) {{"),
             format!(
-                "        for (uint i = 0; i < {fm}u; ++i) nvcuda::wmma::load_matrix_sync(fa[i], {a} + ({a_row} + i * 16u) * {k}u + kk, {k}u);"
+                "        for (uint i = 0; i < {fm}u; ++i) nvcuda::wmma::load_matrix_sync(fa[i], {a} + ({a_row} + i * 16u) * {lda}u + kk, {lda}u);"
             ),
             format!(
-                "        for (uint j = 0; j < {fnn}u; ++j) nvcuda::wmma::load_matrix_sync(fb[j], {b} + ({b_row} + j * 16u) * {k}u + kk, {k}u);"
+                "        for (uint j = 0; j < {fnn}u; ++j) nvcuda::wmma::load_matrix_sync(fb[j], {b} + ({b_row} + j * 16u) * {ldb}u + kk, {ldb}u);"
             ),
             format!("        for (uint i = 0; i < {fm}u; ++i)"),
             format!(
@@ -310,6 +319,10 @@ impl Matrix for Wmma {
 
     fn store_align(&self) -> usize {
         // A 256-bit aligned address, in f32 elements.
+        8
+    }
+
+    fn default_pad(&self) -> usize {
         8
     }
 }
@@ -340,7 +353,7 @@ impl Matrix for Simdgroup {
         c: &str,
         a: &str,
         b: &str,
-        k: usize,
+        (k, lda, ldb): (usize, usize, usize),
         fm: usize,
         fnn: usize,
         a_row: &str,
@@ -351,10 +364,10 @@ impl Matrix for Simdgroup {
             format!("    simdgroup_matrix<half, 8, 8> fa[{fm}], fb[{fnn}];"),
             format!("    for (uint kk = 0; kk < {k}u; kk += 8u) {{"),
             format!(
-                "        for (uint i = 0; i < {fm}u; ++i) simdgroup_load(fa[i], {a} + ({a_row} + i * 8u) * {k}u + kk, {k}u);"
+                "        for (uint i = 0; i < {fm}u; ++i) simdgroup_load(fa[i], {a} + ({a_row} + i * 8u) * {lda}u + kk, {lda}u);"
             ),
             format!(
-                "        for (uint j = 0; j < {fnn}u; ++j) simdgroup_load(fb[j], {b} + ({b_row} + j * 8u) * {k}u + kk, {k}u, ulong2(0, 0), true);"
+                "        for (uint j = 0; j < {fnn}u; ++j) simdgroup_load(fb[j], {b} + ({b_row} + j * 8u) * {ldb}u + kk, {ldb}u, ulong2(0, 0), true);"
             ),
             format!("        for (uint i = 0; i < {fm}u; ++i)"),
             format!(
@@ -371,6 +384,10 @@ impl Matrix for Simdgroup {
 
     fn store_align(&self) -> usize {
         1
+    }
+
+    fn default_pad(&self) -> usize {
+        0
     }
 }
 

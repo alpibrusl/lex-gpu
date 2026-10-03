@@ -481,6 +481,7 @@ fn the_matrix_unit_gemm_lowers_to_wmma_and_to_simdgroup_matrices() {
             &Sched {
                 threads,
                 warps: s.warps,
+                pad: s.pad,
             },
         )
         .unwrap_or_else(|e| panic!("{}: {e}", target.name));
@@ -494,6 +495,7 @@ fn the_matrix_unit_gemm_lowers_to_wmma_and_to_simdgroup_matrices() {
             &Sched {
                 threads,
                 warps: None,
+                pad: None,
             },
         )
         .unwrap_err();

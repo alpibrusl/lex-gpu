@@ -100,6 +100,10 @@ pub struct Sched {
     /// Warps along the rows and along the columns of an accumulator tile.
     /// `threads` must be `simd_width * wm * wn`.
     pub warps: Option<(usize, usize)>,
+    /// Elements added to the row length of a shared tile a matrix unit reads,
+    /// so consecutive rows start in different banks. `None` is the
+    /// dialect's own answer ([`crate::dialect::Matrix::default_pad`]).
+    pub pad: Option<usize>,
 }
 
 /// The index placeholder in a lazy lex's expression.
@@ -186,6 +190,9 @@ struct Gen<'a> {
     tile_align: usize,
     /// The program uses fragments, so the preamble needs the matrix header.
     mma: bool,
+    /// Shared tiles that only a matrix op reads, with the elements of padding
+    /// their rows carry.
+    padded: HashMap<Var, usize>,
 }
 
 /// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
@@ -247,6 +254,7 @@ pub fn lower_with(
         &Sched {
             threads,
             warps: None,
+            pad: None,
         },
     )
 }
@@ -258,6 +266,73 @@ fn uses_mma(b: &Block) -> bool {
         Stmt::For { body, .. } | Stmt::MapEach { body, .. } => uses_mma(body),
         Stmt::Specialize { roles, .. } => roles.iter().any(|r| uses_mma(&r.body)),
     })
+}
+
+/// Variables whose every use is as an operand of `mma`: tiles nothing else
+/// reads by flat element number, so their rows may be padded.
+fn mma_only_operands(b: &Block) -> Vec<Var> {
+    fn walk(b: &Block, mma: &mut Vec<Var>, other: &mut Vec<Var>) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Let { op, .. } => {
+                    if let Op::Mma(c, a, bb) = op {
+                        other.push(c.var());
+                        mma.extend([a.var(), bb.var()]);
+                    } else {
+                        op_vars(op, other);
+                    }
+                }
+                Stmt::For {
+                    init, body, params, ..
+                } => {
+                    other.extend(init.iter().copied());
+                    other.extend(params.iter().copied());
+                    walk(body, mma, other);
+                    other.extend(body.yields.iter().copied());
+                }
+                Stmt::MapEach { arrays, body, .. } => {
+                    other.extend(arrays.iter().copied());
+                    walk(body, mma, other);
+                    other.extend(body.yields.iter().copied());
+                }
+                Stmt::Specialize { .. } => {}
+            }
+        }
+    }
+    let (mut mma, mut other) = (vec![], vec![]);
+    walk(b, &mut mma, &mut other);
+    mma.retain(|x| !other.contains(x));
+    mma
+}
+
+/// Every variable an op reads, for [`mma_only_operands`]. Ops it does not
+/// list are conservative: a variable they mention is simply not padded,
+/// because anything unlisted reaches `other` through the catch-all below.
+fn op_vars(op: &Op, out: &mut Vec<Var>) {
+    match op {
+        Op::Store(a, _) | Op::Exp(a) | Op::Scale(a, _) | Op::Unary(_, a) | Op::Dup(a) => {
+            out.push(a.var())
+        }
+        Op::Binary(_, a, b) | Op::MatMulNT(a, b, _) | Op::MatMul(a, b, _) => {
+            out.extend([a.var(), b.var()])
+        }
+        Op::Drop(v) | Op::Wait(v) => out.push(*v),
+        Op::CopyAsync(_, v) => out.push(*v),
+        // A tile that anything else touches: treat every variable the
+        // debug form names as used, which over-approximates and is safe.
+        other => out.extend(vars_in(&format!("{other:?}"))),
+    }
+}
+
+/// `Var(n)` mentions in a debug string.
+fn vars_in(s: &str) -> Vec<Var> {
+    s.match_indices("Var(")
+        .filter_map(|(i, _)| {
+            let rest = &s[i + 4..];
+            let end = rest.find(')')?;
+            rest[..end].parse().ok().map(Var)
+        })
+        .collect()
 }
 
 /// [`lower_with`], with the schedule's warp grid for programs that use the
@@ -304,7 +379,16 @@ pub fn lower_sched(
         warps: sched.warps,
         tile_align: if mma { 32 } else { 16 },
         mma,
+        padded: HashMap::new(),
     };
+    if mma && let Some(m) = dialect.matrix() {
+        let pad = sched.pad.unwrap_or(m.default_pad());
+        if pad > 0 {
+            for x in mma_only_operands(&prog.body) {
+                g.padded.insert(x, pad);
+            }
+        }
+    }
     if let Some(pid) = prog.pid {
         g.locs.insert(pid, Loc::Index("gid".into()));
     }
@@ -677,10 +761,75 @@ impl Gen<'_> {
         Ok(name)
     }
 
+    /// A cooperative global-to-shared copy in 16-byte pieces, when the
+    /// dialect has wide loads and the view allows them: each row of the
+    /// window is a contiguous run starting on a 16-byte boundary. `None`
+    /// leaves the element-at-a-time copy.
+    fn vector_copy(
+        &self,
+        view: &View,
+        t: &TileTy,
+        name: &str,
+        ld: Option<usize>,
+    ) -> Result<Option<Vec<String>>, String> {
+        let param = &self.prog.params[view.param];
+        let width = 16 / t.dtype.size_bytes();
+        if !self.d.wide_loads() || t.shape.len() != 2 || param.dtype != t.dtype {
+            return Ok(None);
+        }
+        let (rows, cols) = (t.shape[0], t.shape[1]);
+        let aligned = |e: &IdxExpr| {
+            e.constant.rem_euclid(width as i64) == 0
+                && e.terms
+                    .iter()
+                    .all(|&(_, c)| c.rem_euclid(width as i64) == 0)
+        };
+        if param.shape.len() != 2
+            || !cols.is_multiple_of(width)
+            || !param.shape[1].is_multiple_of(width)
+            || !aligned(&view.offset[1])
+        {
+            return Ok(None);
+        }
+        let ld = ld.unwrap_or(cols);
+        let per_row = cols / width;
+        let ty = match t.dtype.size_bytes() * width {
+            16 => "uint4",
+            _ => return Ok(None),
+        };
+        let src = self.addr(
+            view,
+            "(r * COLS + c)".replace("COLS", &cols.to_string()).as_str(),
+        )?;
+        let load = self.d.vector_load(ty, &src);
+        let threads = self.threads;
+        Ok(Some(vec![
+            format!(
+                "for (uint e = tid; e < {}u; e += {threads}u) {{",
+                rows * per_row
+            ),
+            format!("    const uint r = e / {per_row}u, c = (e % {per_row}u) * {width}u;"),
+            format!("    *reinterpret_cast<{ty}*>(&{name}[r * {ld}u + c]) = {load};"),
+            "}".to_string(),
+        ]))
+    }
+
+    /// The row length of a shared tile in memory: its columns, and the
+    /// padding if it has any.
+    fn row_len(&self, x: Var, cols: usize) -> usize {
+        cols + self.padded.get(&x).copied().unwrap_or(0)
+    }
+
     fn declare_tg(&mut self, x: Var, ty: &TileTy) -> String {
         let name = v(x);
         let off = self.arena.next_multiple_of(self.tile_align);
-        self.arena = off + ty.bytes();
+        // A padded tile's rows are longer than its columns.
+        let bytes = if ty.shape.len() == 2 {
+            ty.shape[0] * self.row_len(x, ty.shape[1]) * ty.dtype.size_bytes()
+        } else {
+            ty.bytes()
+        };
+        self.arena = off + bytes;
         let st = self.d.scalar(ty.dtype);
         self.line(&format!(
             "{p} {name} = ({p})(arena + {off});",
@@ -1046,6 +1195,7 @@ impl Gen<'_> {
                     return Err("mma reads tiles in threadgroup memory".into());
                 };
                 let k = at.shape[1];
+                let (lda, ldb) = (self.row_len(var(a), k), self.row_len(var(b), k));
                 if !k.is_multiple_of(g.atom) {
                     return Err(format!("mma over {k} is not whole {}-wide steps", g.atom));
                 }
@@ -1054,11 +1204,16 @@ impl Gen<'_> {
                 let (rows, cols) = (ct.shape[0] / g.wm, ct.shape[1] / g.wn);
                 let a_row = format!("(tid / {}u) * {rows}u", 32 * g.wn);
                 let b_row = format!("(tid / 32u % {}u) * {cols}u", g.wn);
-                let lines = self
-                    .d
-                    .matrix()
-                    .ok_or("no matrix unit")?
-                    .mma(&cn, &an, &bn, k, g.fm, g.fnn, &a_row, &b_row);
+                let lines = self.d.matrix().ok_or("no matrix unit")?.mma(
+                    &cn,
+                    &an,
+                    &bn,
+                    (k, lda, ldb),
+                    g.fm,
+                    g.fnn,
+                    &a_row,
+                    &b_row,
+                );
                 for l in lines {
                     self.line(&l);
                 }
@@ -1074,7 +1229,25 @@ impl Gen<'_> {
                     Space::Threadgroup => {
                         let name = self.declare_tg(x, t);
                         self.barrier();
-                        self.every(t.elems(), &format!("{name}[e] = {st}({src});"));
+                        let ld = self
+                            .padded
+                            .contains_key(&x)
+                            .then(|| self.row_len(x, t.shape[1]));
+                        if let Some(lines) = self.vector_copy(view, t, &name, ld)? {
+                            for l in lines {
+                                self.line(&l);
+                            }
+                        } else if let Some(ld) = ld {
+                            let cols = t.shape[1];
+                            self.every(
+                                t.elems(),
+                                &format!(
+                                    "{name}[(e / {cols}u) * {ld}u + e % {cols}u] = {st}({src});"
+                                ),
+                            );
+                        } else {
+                            self.every(t.elems(), &format!("{name}[e] = {st}({src});"));
+                        }
                         self.barrier();
                     }
                     _ if !self.prog.params[view.param].writable

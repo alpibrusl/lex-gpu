@@ -23,12 +23,20 @@
 //! mode: the algorithm says `tile bm, bn, bk` and each machine's schedule
 //! says how big.
 //!
+//! Memory spaces are in the type where a matrix unit needs them: `@shared`
+//! on a load puts the window in threadgroup memory, `@frag` on `zeros`
+//! makes an accumulator a fragment tile, and `mma acc a b` adds `a b^T`
+//! into it. A schedule's `warps rows cols` says how the threadgroup's warps
+//! divide the accumulator and `pad n` pads shared rows against bank
+//! conflicts; the dialect supplies the atom (16x16x16 `wmma`, 8x8
+//! `simdgroup_matrix`), so `gemm_mma.lx` lowers for both.
+//!
 //! What it does not do, stated because a surface that hides its holes is
-//! worse than no surface: no layouts or memory spaces in the type (every
-//! loaded tile is a register tile), no matrix-unit lowering of
-//! `matmul_nt` (it lowers to scalar code, correct and slow -- the
-//! hand-scheduled kernels in `lex_msl::gemm` are what it has to meet), no
-//! more than one carried tile, no autotuner `?`.
+//! worse than no surface: no quantised operands staged into shared memory
+//! (so the hand-scheduled NVFP4 GEMM in `lex_msl::gemm`, which the model
+//! runs, has no `.lx` equivalent yet), no epilogue on a fragment, no
+//! software pipelining of the copies, no more than one carried tile, no
+//! autotuner `?`.
 //!
 //! ## The linear discipline is visible
 //!
@@ -626,6 +634,9 @@ pub struct Schedule {
     /// Warps along the rows and along the columns of an accumulator tile:
     /// how a matrix-unit program is split across a threadgroup.
     pub warps: Option<(usize, usize)>,
+    /// Elements of padding after each row of a shared tile a matrix unit
+    /// reads, against bank conflicts. `None` takes the dialect's default.
+    pub pad: Option<usize>,
     /// The extents the algorithm declared with `tile`, by name: the part of
     /// a schedule that is a number rather than a mode.
     pub extents: Vec<(String, usize)>,
@@ -759,7 +770,7 @@ pub fn parse(src: &str) -> Result<Unit, String> {
             target.push_str(&p.want_ident()?);
         }
         p.want_punct("{")?;
-        let (mut threads, mut chunk, mut warps) = (None, None, None);
+        let (mut threads, mut chunk, mut warps, mut pad) = (None, None, None, None);
         let mut extents: Vec<(String, usize)> = vec![];
         while !p.eat_punct("}") {
             let at = p.at();
@@ -768,6 +779,10 @@ pub fn parse(src: &str) -> Result<Unit, String> {
                 "threads" => match p.bump() {
                     Tok::Num(n) => threads = Some(n as usize),
                     other => return Err(format!("{at}: threads takes a number, found {other:?}")),
+                },
+                "pad" => match p.bump() {
+                    Tok::Num(n) => pad = Some(n as usize),
+                    other => return Err(format!("{at}: pad takes a number, found {other:?}")),
                 },
                 "warps" => match (p.bump(), p.bump()) {
                     (Tok::Num(r), Tok::Num(c)) => warps = Some((r as usize, c as usize)),
@@ -813,6 +828,7 @@ pub fn parse(src: &str) -> Result<Unit, String> {
             threads,
             chunk,
             warps,
+            pad,
             extents,
         });
     }
