@@ -262,6 +262,11 @@ pub trait Matrix {
     /// Store one accumulator to the address `ptr`, rows `ldm` apart.
     fn store(&self, frag: &str, ptr: &str, ldm: usize) -> String;
 
+    /// Lines adding the f32 tile at the address `ptr`, rows `ldm` apart,
+    /// into the accumulator `frag`: the tile is loaded as a fragment of the
+    /// same layout and the two are added, so no lane's element is named.
+    fn add_loaded(&self, frag: &str, ptr: &str, ldm: usize) -> Vec<String>;
+
     /// Elements a global store's address must be a multiple of.
     fn store_align(&self) -> usize;
 
@@ -338,6 +343,18 @@ impl Matrix for Wmma {
         )
     }
 
+    fn add_loaded(&self, frag: &str, ptr: &str, ldm: usize) -> Vec<String> {
+        vec![
+            "{".into(),
+            "    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> rf;".into(),
+            format!(
+                "    nvcuda::wmma::load_matrix_sync(rf, {ptr}, {ldm}u, nvcuda::wmma::mem_row_major);"
+            ),
+            format!("    for (int t = 0; t < rf.num_elements; ++t) {frag}.x[t] += rf.x[t];"),
+            "}".into(),
+        ]
+    }
+
     fn store_align(&self) -> usize {
         // A 256-bit aligned address, in f32 elements.
         8
@@ -401,6 +418,21 @@ impl Matrix for Simdgroup {
 
     fn store(&self, frag: &str, ptr: &str, ldm: usize) -> String {
         format!("simdgroup_store({frag}, {ptr}, {ldm}u);")
+    }
+
+    fn add_loaded(&self, frag: &str, ptr: &str, ldm: usize) -> Vec<String> {
+        // The identity times the loaded tile, added into the accumulator by
+        // the matrix unit: exact (a product with one and zero), and no
+        // element of a fragment is named.
+        vec![
+            "{".into(),
+            "    simdgroup_matrix<float, 8, 8> rf;".into(),
+            format!("    simdgroup_load(rf, {ptr}, {ldm}u);"),
+            format!(
+                "    simdgroup_multiply_accumulate({frag}, simdgroup_matrix<float, 8, 8>(1.0f), rf, {frag});"
+            ),
+            "}".into(),
+        ]
     }
 
     fn store_align(&self) -> usize {

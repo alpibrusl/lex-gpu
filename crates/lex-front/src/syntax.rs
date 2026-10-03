@@ -250,6 +250,9 @@ enum Expr {
     /// `[r, c/2]` packed pairs, `s` is `[r, c/16]` E4M3 scales, `g` the
     /// per-row f32 scale `[r]`; the result is `[r, c]` in f32.
     DequantFp4(Box<Expr>, Box<Expr>, Box<Expr>, usize),
+    /// `add_window acc r[i * bm, j * bn]`: add the `acc`-shaped window of an
+    /// f32 parameter into a fragment tile, in place.
+    AddWindow(Box<Expr>, String, Vec<Ce>),
     /// `stage f16 e`: copy a computed tile into threadgroup memory as
     /// `f16`, which is where a matrix unit reads its operands.
     Stage(DType, Box<Expr>),
@@ -424,6 +427,17 @@ impl Parser {
                         Box::new(g),
                         group,
                     ))
+                }
+                "add_window" => {
+                    let acc = self.atom()?;
+                    let name = self.want_ident()?;
+                    self.want_punct("[")?;
+                    let mut at = vec![self.ce()?];
+                    while self.eat_punct(",") {
+                        at.push(self.ce()?);
+                    }
+                    self.want_punct("]")?;
+                    Ok(Expr::AddWindow(Box::new(acc), name, at))
                 }
                 "stage" => {
                     let at = self.at();
@@ -1123,6 +1137,16 @@ impl Algo {
                 );
                 (v, vec![rows, cols], DType::F32)
             }
+            Expr::AddWindow(acc, p, at) => {
+                let (av, shape, dt) = self.lower(b, env, params, cx, acc, name, pid)?;
+                let (id, _, _) = params
+                    .get(p.as_str())
+                    .ok_or_else(|| format!("`{p}` is not a parameter"))?;
+                let view = window(*id, at, &shape, cx)?;
+                let v = b.op(name, Op::AddWindow(arg(acc, av), view));
+                cx.spaces.borrow_mut().insert(v, Space::Frag);
+                (v, shape, dt)
+            }
             Expr::Stage(dt, inner) => {
                 let (iv, shape, _) = self.lower(b, env, params, cx, inner, name, pid)?;
                 let v = b.op(name, Op::Stage(arg(inner, iv), *dt));
@@ -1326,6 +1350,9 @@ fn substitute(e: &Expr, vals: &HashMap<&str, f64>) -> Expr {
             *n,
         ),
         Expr::Stage(dt, e) => Expr::Stage(*dt, Box::new(substitute(e, vals))),
+        Expr::AddWindow(a, p, at) => {
+            Expr::AddWindow(Box::new(substitute(a, vals)), p.clone(), at.clone())
+        }
         Expr::Mma(c, l, r) => Expr::Mma(
             Box::new(substitute(c, vals)),
             Box::new(substitute(l, vals)),

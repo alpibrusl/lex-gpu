@@ -628,3 +628,67 @@ fn the_fp4_gemm_decodes_a_group_a_thread_on_cuda() {
         "a group store indexes an element"
     );
 }
+
+const GEMM_FP4_RES: &str = include_str!("../lx/gemm_fp4_res.lx");
+
+#[test]
+fn the_residual_epilogue_adds_the_stream_to_the_product() {
+    use lex_front::interp::{Tensor, run};
+    let unit = syntax::parse(GEMM_FP4_RES).unwrap_or_else(|e| panic!("{e}"));
+    for target in [
+        lex_ir::Target::nvidia_ada(),
+        lex_ir::Target::apple_m_series(),
+    ] {
+        let s = unit.schedule_for(target.name).expect("a schedule");
+        let (bm, bn, bk) = (s.extents[0].1, s.extents[1].1, s.extents[2].1);
+        let (m, n, k) = (bm, 2 * bn, bk);
+        let (prog, _) = unit
+            .compile(
+                target.name,
+                &[("m", m as f64), ("n", n as f64), ("k", k as f64)],
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        lex_front::check(&prog, &target).unwrap_or_else(|e| panic!("{}: {e:#?}", target.name));
+        let x = fill(m * k, 51);
+        let q: Vec<f32> = (0..n * k / 2)
+            .map(|i| ((i * 31 + 7) % 256) as u8 as i8 as f32)
+            .collect();
+        let sc: Vec<f32> = (0..n * k / 16).map(|i| (0x30 + i % 5) as f32).collect();
+        let g: Vec<f32> = (0..n).map(|i| 0.5 + (i % 3) as f32 * 0.5).collect();
+        let r = fill(m * n, 52);
+        let mk = |res: &[f32]| {
+            vec![
+                Tensor::new(lex_ir::DType::F16, &[m, k], &x),
+                Tensor::new(lex_ir::DType::I8, &[n, k / 2], &q),
+                Tensor::new(lex_ir::DType::I8, &[n, k / 16], &sc),
+                Tensor::new(lex_ir::DType::F32, &[n], &g),
+                Tensor::new(lex_ir::DType::F32, &[m, n], res),
+                Tensor::new(lex_ir::DType::F32, &[m, n], &vec![0.0; m * n]),
+            ]
+        };
+        // With the residual, and with a zero one: the difference is exactly r.
+        let (mut with, mut without) = (mk(&r), mk(&vec![0.0; m * n]));
+        run(&prog, &mut with).unwrap_or_else(|e| panic!("{}: {e:?}", target.name));
+        run(&prog, &mut without).unwrap_or_else(|e| panic!("{}: {e:?}", target.name));
+        for i in 0..m * n {
+            let got = (with[5].data[i] - without[5].data[i]) as f64;
+            assert!(
+                (got - r[i] as f64).abs() < 1e-5,
+                "{}: element {i} gained {got}, not {}",
+                target.name,
+                r[i]
+            );
+        }
+    }
+}
+
+#[test]
+fn a_residual_must_match_the_accumulator_and_be_f32() {
+    let bad = GEMM_FP4_RES.replace("in  r:  f32[m, n]", "in  r:  f16[m, n]");
+    let unit = syntax::parse(&bad).expect("parses");
+    let (prog, _) = unit
+        .compile("nvidia-ada", &[("m", 128.0), ("n", 128.0), ("k", 64.0)])
+        .expect("builds");
+    let err = lex_front::check(&prog, &lex_ir::Target::nvidia_ada()).unwrap_err();
+    assert!(err.iter().any(|d| d.msg.contains("add_window")), "{err:#?}");
+}

@@ -111,6 +111,7 @@ fn op(p: &Program, o: &Op) -> String {
         Op::Store(a, v) => format!("store {} -> {}", arg(p, *a), view(p, v)),
         Op::Drop(v) => format!("drop {}", var(p, *v)),
         Op::Dup(a) => format!("dup {}", arg(p, *a)),
+        Op::AddWindow(a, v) => format!("add_window {} + {}", arg(p, *a), view(p, v)),
         Op::Stage(a, dt) => format!("stage {} as {dt:?}", arg(p, *a)),
         Op::Mma(acc, a, b) => format!("mma {}, {}, {}", arg(p, *acc), arg(p, *a), arg(p, *b)),
         Op::MatMulNT(a, b, acc) => format!("matmul_nt {}, {} acc {acc:?}", arg(p, *a), arg(p, *b)),

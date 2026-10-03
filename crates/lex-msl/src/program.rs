@@ -734,6 +734,33 @@ impl Gen<'_> {
         name
     }
 
+    /// Where fragment `(i, j)` of this warp's share of a tile sits in the
+    /// window `view` of a parameter, as an address expression over the
+    /// loop variables `i` and `j`, and the row length of the parameter.
+    fn frag_window(&self, t: &TileTy, g: Geom, view: &View) -> Result<(String, usize), String> {
+        let m = self.d.matrix().ok_or("no matrix unit")?;
+        let dims = &self.prog.params[view.param].shape;
+        let ldm = dims[dims.len() - 1];
+        if !ldm.is_multiple_of(m.store_align())
+            || !view.shape.iter().all(|d| d.is_multiple_of(g.atom))
+        {
+            return Err(format!(
+                "a fragment access needs rows of a multiple of {} elements, found {ldm}",
+                m.store_align()
+            ));
+        }
+        let (rows, cols) = (t.shape[0] / g.wm, t.shape[1] / g.wn);
+        let n = t.shape[1];
+        let at = format!(
+            "((tid / {}u) * {rows}u + i * {}u) * {n}u + (tid / 32u % {}u) * {cols}u + j * {}u",
+            32 * g.wn,
+            g.atom,
+            g.wn,
+            g.atom
+        );
+        Ok((format!("&{}", self.addr(view, &at)?), ldm))
+    }
+
     /// How the schedule's warp grid cuts a fragment tile.
     fn frag_geom(&self, t: &TileTy) -> Result<Geom, String> {
         let m = self
@@ -1391,35 +1418,34 @@ impl Gen<'_> {
                     unreachable!("matched above")
                 };
                 let m = self.d.matrix().ok_or("no matrix unit")?;
-                let dims = &self.prog.params[view.param].shape;
-                let ldm: usize = dims[dims.len() - 1..].iter().product();
                 if self.prog.params[view.param].dtype != t.dtype {
                     return Err("a fragment stores at its own dtype".into());
                 }
-                if !ldm.is_multiple_of(m.store_align())
-                    || !view.shape.iter().all(|d| d.is_multiple_of(g.atom))
-                {
-                    return Err(format!(
-                        "a fragment store needs rows of a multiple of {} elements, found {ldm}",
-                        m.store_align()
-                    ));
-                }
-                let (rows, cols) = (t.shape[0] / g.wm, t.shape[1] / g.wn);
-                let n = t.shape[1];
-                let at = format!(
-                    "((tid / {}u) * {rows}u + i * {}u) * {n}u + (tid / 32u % {}u) * {cols}u + j * {}u",
-                    32 * g.wn,
-                    g.atom,
-                    g.wn,
-                    g.atom
-                );
-                let ptr = format!("&{}", self.addr(view, &at)?);
+                let (ptr, ldm) = self.frag_window(&t, g, view)?;
                 self.line(&format!(
                     "for (uint i = 0; i < {}u; ++i) for (uint j = 0; j < {}u; ++j) {}",
                     g.fm,
                     g.fnn,
                     m.store(&format!("{name}[i][j]"), &ptr, ldm)
                 ));
+            }
+            Op::AddWindow(a, view) => {
+                let x = dst.ok_or("add_window without a result")?;
+                let Loc::Frag(name, t, g) = self.loc(a.var())? else {
+                    return Err("add_window adds into a fragment tile".into());
+                };
+                let m = self.d.matrix().ok_or("no matrix unit")?;
+                let (ptr, ldm) = self.frag_window(&t, g, view)?;
+                self.line(&format!(
+                    "for (uint i = 0; i < {}u; ++i) for (uint j = 0; j < {}u; ++j) {{",
+                    g.fm, g.fnn
+                ));
+                for l in m.add_loaded(&format!("{name}[i][j]"), &ptr, ldm) {
+                    self.line(&format!("    {l}"));
+                }
+                self.line("}");
+                // In place, like `mma`.
+                self.locs.insert(x, Loc::Frag(name, t, g));
             }
             Op::Store(a, view) => {
                 let dt = self.d.scalar(self.prog.params[view.param].dtype);

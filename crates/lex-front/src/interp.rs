@@ -482,6 +482,21 @@ impl Interp<'_> {
                 None
             }
             Op::Dup(a) => Some(Val::Tile(self.arg(*a)?)),
+            Op::AddWindow(a, view) => {
+                let t = self.arg(*a)?;
+                let off = self.offsets(view)?;
+                let w = self.read_global(
+                    view.param,
+                    &off,
+                    &TileTy::new(DType::F32, &view.shape, lex_ir::Space::Reg),
+                );
+                let data = t.data.iter().zip(&w.data).map(|(&x, &y)| x + y).collect();
+                Some(Val::Tile(Tile {
+                    ty: t.ty.clone(),
+                    data,
+                    init: true,
+                }))
+            }
             Op::Stage(a, dt) => {
                 let t = self.arg(*a)?;
                 Some(Val::Tile(Tile {

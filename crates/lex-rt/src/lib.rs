@@ -10,6 +10,7 @@ pub mod dev;
 pub mod gguf;
 pub mod json;
 pub mod llama;
+pub mod lx_kernels;
 // Generated (`scripts/unicode_nfc_table.py`): kept as the generator
 // writes it, one entry a line, not spread over thousands by rustfmt.
 #[rustfmt::skip]

@@ -660,6 +660,30 @@ impl Checker<'_> {
                 self.report.dups += 1;
                 Some(Ty::Tile(t))
             }
+            Op::AddWindow(a, view) => {
+                let (dt, shape) = self.view(view, false)?;
+                let ty = self.args(&[*a])?.remove(0);
+                let t = self.tile_any(ty, "accumulator")?;
+                if t.space != Space::Frag || t.dtype != DType::F32 || dt != DType::F32 {
+                    self.err(
+                        Kind::Type,
+                        format!(
+                            "add_window adds an f32 window into an f32 fragment tile, found \
+                             {dt:?} into {:?} in {:?}",
+                            t.dtype, t.space
+                        ),
+                    );
+                    return None;
+                }
+                if shape != t.shape {
+                    self.err(
+                        Kind::Shape,
+                        format!("window of {shape:?} added into a {:?} tile", t.shape),
+                    );
+                    return None;
+                }
+                Some(Ty::Tile(t))
+            }
             Op::Stage(a, dt) => {
                 let ty = self.args(&[*a])?.remove(0);
                 let t = self.tile(ty, "staged tile")?;

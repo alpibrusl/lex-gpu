@@ -363,6 +363,12 @@ pub enum Op {
     /// unit, which reads only shared memory. The conversion is named here,
     /// so narrowing f32 to f16 is explicit by construction.
     Stage(Arg, DType),
+    /// `acc + window`: add a window of an f32 parameter, the accumulator's
+    /// own shape, into a fragment tile in place. The epilogue of a matmul
+    /// that writes back into a residual stream. Fragments add in their own
+    /// layout -- the window is loaded as a fragment, not read element by
+    /// element -- so no program ever names which lane holds what.
+    AddWindow(Arg, View),
     /// Elementwise. `b` may also be `[m]`, one value per row of an `[m,n]`
     /// `a`, or `[1,n]`, one row repeated for every row of `a`.
     Binary(BinOp, Arg, Arg),

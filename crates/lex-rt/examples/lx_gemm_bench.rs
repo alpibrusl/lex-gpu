@@ -26,11 +26,13 @@ fn main() -> Result<(), String> {
         .position(|a| a == "--tokens")
         .and_then(|i| args.get(i + 1)?.parse().ok())
         .unwrap_or(512);
+    // (label, rows, inputs, residual): `down` and `out_proj` write back into
+    // the residual stream.
     let shapes = [
-        ("gate/up", 17408usize, 5120usize),
-        ("down", 5120, 17408),
-        ("qkv", 10240, 5120),
-        ("out_proj", 5120, 6144),
+        ("gate/up", 17408usize, 5120usize, false),
+        ("down", 5120, 17408, true),
+        ("qkv", 10240, 5120, false),
+        ("out_proj", 5120, 6144, true),
     ];
 
     let backend = lex_rt::dev::gemm_backend();
@@ -38,8 +40,11 @@ fn main() -> Result<(), String> {
         Backend::Metal => (lex_ir::Target::apple_m_series(), &Msl),
         Backend::Cuda => (lex_ir::Target::nvidia_ada(), &Cuda),
     };
-    let unit = lex_front::syntax::parse(include_str!("../../lex-front/lx/gemm_fp4.lx"))?;
-    let mut sched = unit.schedule_for(target.name)?.clone();
+    let units = [
+        lex_front::syntax::parse(include_str!("../../lex-front/lx/gemm_fp4.lx"))?,
+        lex_front::syntax::parse(include_str!("../../lex-front/lx/gemm_fp4_res.lx"))?,
+    ];
+    let mut sched = units[0].schedule_for(target.name)?.clone();
     // `--sched key=value,...` overrides the file's schedule, to try one
     // without editing it.
     if let Some(spec) = args
@@ -77,14 +82,15 @@ fn main() -> Result<(), String> {
         "{:<10} {:>6} {:>6} {:>10} {:>8} {:>10} {:>8} {:>8} {:>8}",
         "shape", "n", "k", "hand ms", "TFLOPS", "lx ms", "TFLOPS", "error", "lx/hand"
     );
-    for (label, n, k) in shapes {
+    for (label, n, k, residual) in shapes {
+        let unit = &units[residual as usize];
         let m = tokens;
         let hand = gpu.build_lowered(&gemm_nvfp4(
             &Gemm {
                 m,
                 n,
                 k,
-                residual: false,
+                residual,
                 x_half: true,
             },
             backend,
@@ -128,15 +134,25 @@ fn main() -> Result<(), String> {
             })
             .collect();
         let (yh, yl) = (gpu.zeroed::<f32>(m * n), gpu.zeroed::<f32>(m * n));
+        let r: Buffer = gpu.upload(
+            &(0..m * n)
+                .map(|i| ((i * 3) % 11) as f32 * 0.1)
+                .collect::<Vec<_>>(),
+        );
+        let res = residual.then_some(&r);
         fn bound<'a>(
             x: &'a Buffer,
             [q, s, gs]: &'a [Buffer; 3],
+            r: Option<&'a Buffer>,
             out: &'a Buffer,
         ) -> Vec<&'a Buffer> {
-            vec![x, q, s, gs, out]
+            let mut b = vec![x, q, s, gs];
+            b.extend(r);
+            b.push(out);
+            b
         }
 
-        let (bh, bl) = (bound(&x, &sets[0], &yh), bound(&x, &sets[0], &yl));
+        let (bh, bl) = (bound(&x, &sets[0], res, &yh), bound(&x, &sets[0], res, &yl));
         gpu.run_launches(&[(&hand, bh.as_slice(), None)]);
         gpu.run_launches(&[(&lx, bl.as_slice(), None)]);
         let (mut want, mut got) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
@@ -160,13 +176,17 @@ fn main() -> Result<(), String> {
         fn steps_for<'a>(
             x: &'a Buffer,
             sets: &'a [[Buffer; 3]],
+            r: Option<&'a Buffer>,
             out: &'a Buffer,
         ) -> Vec<Vec<&'a Buffer>> {
             (0..sets.len() * 4)
-                .map(|i| bound(x, &sets[i % sets.len()], out))
+                .map(|i| bound(x, &sets[i % sets.len()], r, out))
                 .collect()
         }
-        let (binds_h, binds_l) = (steps_for(&x, &sets, &yh), steps_for(&x, &sets, &yl));
+        let (binds_h, binds_l) = (
+            steps_for(&x, &sets, res, &yh),
+            steps_for(&x, &sets, res, &yl),
+        );
         let steps_h: Vec<Step<'_>> = binds_h
             .iter()
             .map(|b| (&hand, b.as_slice(), None))
