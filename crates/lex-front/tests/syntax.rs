@@ -381,3 +381,122 @@ fn the_parsed_gemm_lowers_for_both_backends() {
         );
     }
 }
+
+const GEMM_MMA: &str = include_str!("../lx/gemm_mma.lx");
+
+fn fill(len: usize, seed: u32) -> Vec<f32> {
+    let mut x = seed;
+    (0..len)
+        .map(|_| {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((x >> 9) as f32 / (1u32 << 23) as f32) - 0.5
+        })
+        .collect()
+}
+
+#[test]
+fn the_matrix_unit_gemm_checks_and_computes_a_matrix_product() {
+    use lex_front::interp::{Tensor, run};
+    let unit = syntax::parse(GEMM_MMA).unwrap_or_else(|e| panic!("{e}"));
+    for target in [
+        lex_ir::Target::nvidia_ada(),
+        lex_ir::Target::apple_m_series(),
+    ] {
+        let s = unit.schedule_for(target.name).expect("a schedule");
+        let (bm, bn) = (s.extents[0].1, s.extents[1].1);
+        // Two blocks each way and two steps of the inner dimension.
+        let (m, n, k) = (2 * bm, 2 * bn, 2 * s.extents[2].1);
+        let (prog, _) = unit
+            .compile(
+                target.name,
+                &[("m", m as f64), ("n", n as f64), ("k", k as f64)],
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        lex_front::check(&prog, &target).unwrap_or_else(|e| panic!("{}: {e:#?}", target.name));
+        let (av, wv) = (fill(m * k, 3), fill(n * k, 4));
+        let mut t = vec![
+            Tensor::new(lex_ir::DType::F16, &[m, k], &av),
+            Tensor::new(lex_ir::DType::F16, &[n, k], &wv),
+            Tensor::new(lex_ir::DType::F32, &[m, n], &vec![0.0; m * n]),
+        ];
+        run(&prog, &mut t).unwrap_or_else(|e| panic!("{}: {e:?}", target.name));
+        let (ar, wr) = (&t[0].data, &t[1].data);
+        for i in (0..m).step_by(7) {
+            for j in (0..n).step_by(5) {
+                let want: f64 = (0..k)
+                    .map(|p| ar[i * k + p] as f64 * wr[j * k + p] as f64)
+                    .sum();
+                let got = t[2].data[i * n + j] as f64;
+                assert!(
+                    (got - want).abs() < 1e-4,
+                    "{}: y[{i},{j}] = {got}, want {want}",
+                    target.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_fragment_tile_is_not_a_register_tile() {
+    // Adding to the accumulator by hand reads elements the hardware owns the
+    // layout of; the checker has to say no rather than the lowering guess.
+    let src = GEMM_MMA.replace("yield mma acc at wt", "yield acc * 2");
+    let unit = syntax::parse(&src).expect("it parses");
+    let (prog, _) = unit
+        .compile("nvidia-ada", &[("m", 128.0), ("n", 128.0), ("k", 64.0)])
+        .expect("it builds");
+    let err = lex_front::check(&prog, &lex_ir::Target::nvidia_ada()).unwrap_err();
+    assert!(
+        err.iter().any(|d| d.msg.contains("matrix fragment")),
+        "{err:#?}"
+    );
+}
+
+#[test]
+fn the_matrix_unit_gemm_lowers_to_wmma_and_to_simdgroup_matrices() {
+    use lex_msl::dialect::{Cuda, Msl};
+    use lex_msl::program::{Sched, lower_sched};
+    let unit = syntax::parse(GEMM_MMA).unwrap_or_else(|e| panic!("{e}"));
+    for (target, dialect, want) in [
+        (
+            lex_ir::Target::nvidia_ada(),
+            &Cuda as &dyn lex_msl::dialect::Dialect,
+            "nvcuda::wmma::mma_sync",
+        ),
+        (
+            lex_ir::Target::apple_m_series(),
+            &Msl,
+            "simdgroup_multiply_accumulate",
+        ),
+    ] {
+        let s = unit.schedule_for(target.name).expect("a schedule");
+        let (prog, threads) = unit
+            .compile(target.name, &[("m", 256.0), ("n", 256.0), ("k", 128.0)])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let l = lower_sched(
+            &prog,
+            &target,
+            dialect,
+            &Sched {
+                threads,
+                warps: s.warps,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{}: {e}", target.name));
+        assert!(l.source.contains(want), "{}: no matrix op", target.name);
+        assert_eq!(l.threads, threads);
+        // Without the warp grid there is nothing to split a fragment by.
+        let err = lower_sched(
+            &prog,
+            &target,
+            dialect,
+            &Sched {
+                threads,
+                warps: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("warps"), "{err}");
+    }
+}

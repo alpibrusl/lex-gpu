@@ -183,7 +183,7 @@ impl<'a> Lexer<'a> {
                 } else if c == '.' && self.src.peek() == Some(&'.') {
                     self.bump();
                     out.push((Tok::Punct("..".into()), at));
-                } else if "(){}[],:;=*+-/&".contains(c) {
+                } else if "(){}[],:;=*+-/&@".contains(c) {
                     out.push((Tok::Punct(c.to_string()), at));
                 } else {
                     return Err(format!("{at}: `{c}` means nothing here"));
@@ -222,9 +222,15 @@ enum Ce {
 enum Expr {
     /// `load a[i * bm, p * bk ; bm, bk]`: a window of a parameter, its
     /// offsets then its shape.
-    LoadAt(String, Vec<Ce>, Vec<Dim>),
-    /// `zeros f32[bm, bn]`
-    Zeros(DType, Vec<Dim>),
+    /// `load a[..] @shared`: the tile lands in threadgroup memory, where a
+    /// matrix unit can read it; without a space it is a register tile.
+    LoadAt(String, Vec<Ce>, Vec<Dim>, Space),
+    /// `zeros f32[bm, bn]`, or `zeros f32[bm, bn] @frag`: an accumulator in
+    /// matrix-unit fragments.
+    Zeros(DType, Vec<Dim>, Space),
+    /// `mma acc a b`: `acc + a b^T` on the matrix units, `acc` a fragment
+    /// tile and `a`, `b` shared f16 tiles.
+    Mma(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `matmul_nt a b` (`[m,k] x [n,k]^T`) and `matmul a b` (`[m,k] x [k,n]`),
     /// accumulating in f32.
     MatMul(bool, Box<Expr>, Box<Expr>),
@@ -369,11 +375,17 @@ impl Parser {
                         shape.push(self.dim()?);
                     }
                     self.want_punct("]")?;
-                    Ok(Expr::LoadAt(name, at, shape))
+                    let space = self.space()?;
+                    Ok(Expr::LoadAt(name, at, shape, space))
                 }
                 "zeros" => {
                     let (dtype, shape) = self.ty()?;
-                    Ok(Expr::Zeros(dtype, shape))
+                    let space = self.space()?;
+                    Ok(Expr::Zeros(dtype, shape, space))
+                }
+                "mma" => {
+                    let (c, a, b) = (self.atom()?, self.atom()?, self.atom()?);
+                    Ok(Expr::Mma(Box::new(c), Box::new(a), Box::new(b)))
                 }
                 "matmul_nt" | "matmul" => {
                     let (a, b) = (self.atom()?, self.atom()?);
@@ -412,6 +424,22 @@ impl Parser {
                 _ => Ok(Expr::Move(s)),
             },
             other => Err(format!("{at}: expected a value, found {other:?}")),
+        }
+    }
+
+    /// An optional `@shared`, `@frag` or `@reg` after a tile's shape.
+    fn space(&mut self) -> Result<Space, String> {
+        if !self.eat_punct("@") {
+            return Ok(Space::Reg);
+        }
+        let at = self.at();
+        match self.want_ident()?.as_str() {
+            "reg" => Ok(Space::Reg),
+            "shared" => Ok(Space::Threadgroup),
+            "frag" => Ok(Space::Frag),
+            other => Err(format!(
+                "{at}: `@{other}` is not a memory space (reg, shared, frag)"
+            )),
         }
     }
 
@@ -595,6 +623,9 @@ pub struct Schedule {
     /// not mention it, the schedule does, and the same algorithm takes a
     /// different cut on a different card without being rewritten.
     pub chunk: Option<usize>,
+    /// Warps along the rows and along the columns of an accumulator tile:
+    /// how a matrix-unit program is split across a threadgroup.
+    pub warps: Option<(usize, usize)>,
     /// The extents the algorithm declared with `tile`, by name: the part of
     /// a schedule that is a number rather than a mode.
     pub extents: Vec<(String, usize)>,
@@ -728,7 +759,7 @@ pub fn parse(src: &str) -> Result<Unit, String> {
             target.push_str(&p.want_ident()?);
         }
         p.want_punct("{")?;
-        let (mut threads, mut chunk) = (None, None);
+        let (mut threads, mut chunk, mut warps) = (None, None, None);
         let mut extents: Vec<(String, usize)> = vec![];
         while !p.eat_punct("}") {
             let at = p.at();
@@ -737,6 +768,12 @@ pub fn parse(src: &str) -> Result<Unit, String> {
                 "threads" => match p.bump() {
                     Tok::Num(n) => threads = Some(n as usize),
                     other => return Err(format!("{at}: threads takes a number, found {other:?}")),
+                },
+                "warps" => match (p.bump(), p.bump()) {
+                    (Tok::Num(r), Tok::Num(c)) => warps = Some((r as usize, c as usize)),
+                    other => {
+                        return Err(format!("{at}: warps takes two numbers, found {other:?}"));
+                    }
                 },
                 "chunk" => match p.bump() {
                     Tok::Num(n) => chunk = Some(n as usize),
@@ -775,6 +812,7 @@ pub fn parse(src: &str) -> Result<Unit, String> {
             target,
             threads,
             chunk,
+            warps,
             extents,
         });
     }
@@ -883,6 +921,7 @@ impl Algo {
         let mut env: HashMap<String, (crate::ir::Var, Vec<usize>, DType)> = HashMap::new();
 
         let mut idx: HashMap<String, crate::ir::Var> = HashMap::new();
+        let spaces = std::cell::RefCell::new(HashMap::new());
         for stmt in &self.body {
             if let Stmt::Grid(axes) = stmt {
                 if axes.len() > 2 {
@@ -894,6 +933,7 @@ impl Algo {
                         &Cx {
                             vals: &vals,
                             idx: &idx,
+                            spaces: &spaces,
                         },
                     )?;
                     let v = if k == 0 { b.grid(n) } else { b.grid2(n) };
@@ -904,6 +944,7 @@ impl Algo {
             let cx = Cx {
                 vals: &vals,
                 idx: &idx,
+                spaces: &spaces,
             };
             let mut one = vec![stmt.clone()];
             if self
@@ -990,7 +1031,7 @@ impl Algo {
                 );
                 (v, shape.clone(), *dt)
             }
-            Expr::LoadAt(p, at, shape) => {
+            Expr::LoadAt(p, at, shape, space) => {
                 let (id, _, dt) = params
                     .get(p.as_str())
                     .ok_or_else(|| format!("`{p}` is not a parameter"))?;
@@ -999,16 +1040,34 @@ impl Algo {
                     .map(|d| dim_of(d, cx.vals))
                     .collect::<Result<_, _>>()?;
                 let view = window(*id, at, &shape, cx)?;
-                let v = b.op(p, Op::Load(view, TileTy::new(*dt, &shape, Space::Reg)));
+                let v = b.op(p, Op::Load(view, TileTy::new(*dt, &shape, *space)));
+                cx.spaces.borrow_mut().insert(v, *space);
                 (v, shape, *dt)
             }
-            Expr::Zeros(dt, shape) => {
+            Expr::Zeros(dt, shape, space) => {
                 let shape: Vec<usize> = shape
                     .iter()
                     .map(|d| dim_of(d, cx.vals))
                     .collect::<Result<_, _>>()?;
-                let v = b.op(name, Op::Fill(TileTy::new(*dt, &shape, Space::Reg), 0.0));
+                let v = b.op(name, Op::Fill(TileTy::new(*dt, &shape, *space), 0.0));
+                cx.spaces.borrow_mut().insert(v, *space);
                 (v, shape, *dt)
+            }
+            Expr::Mma(c, l, r) => {
+                let (cv, cshape, cdt) = self.lower(b, env, params, cx, c, name, pid)?;
+                let (lv, lshape, _) = self.lower(b, env, params, cx, l, name, pid)?;
+                let (rv, rshape, _) = self.lower(b, env, params, cx, r, name, pid)?;
+                if cshape.len() != 2 || lshape.len() != 2 || rshape.len() != 2 {
+                    return Err(format!("`{name}`: mma takes 2-d tiles"));
+                }
+                if cshape != [lshape[0], rshape[0]] || lshape[1] != rshape[1] {
+                    return Err(format!(
+                        "`{name}`: mma of {lshape:?} x {rshape:?}^T into {cshape:?}"
+                    ));
+                }
+                let v = b.op(name, Op::Mma(arg(c, cv), arg(l, lv), arg(r, rv)));
+                cx.spaces.borrow_mut().insert(v, Space::Frag);
+                (v, cshape, cdt)
             }
             Expr::MatMul(nt, l, r) => {
                 let (lv, lshape, _) = self.lower(b, env, params, cx, l, name, pid)?;
@@ -1049,8 +1108,9 @@ impl Algo {
                         .ok_or_else(|| format!("`{n}` is not bound"))?
                         .clone();
                     init.push(v);
-                    tys.push(crate::ir::Ty::Tile(TileTy::new(dt, &shape, Space::Reg)));
-                    seen.push((shape, dt));
+                    let space = cx.spaces.borrow().get(&v).copied().unwrap_or(Space::Reg);
+                    tys.push(crate::ir::Ty::Tile(TileTy::new(dt, &shape, space)));
+                    seen.push((shape, dt, space));
                 }
                 if carry.len() != 1 {
                     return Err(format!(
@@ -1061,14 +1121,16 @@ impl Algo {
                 let failed: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
                 let outs = b.for_range(start, end, init, tys, |b, i, ps| {
                     let mut inner = env.clone();
-                    for ((n, p), (shape, dt)) in carry.iter().zip(ps).zip(&seen) {
+                    for ((n, p), (shape, dt, space)) in carry.iter().zip(ps).zip(&seen) {
                         inner.insert(n.clone(), (*p, shape.clone(), *dt));
+                        cx.spaces.borrow_mut().insert(*p, *space);
                     }
                     let mut idx = cx.idx.clone();
                     idx.insert(index.clone(), i);
                     let inside = Cx {
                         vals: cx.vals,
                         idx: &idx,
+                        spaces: cx.spaces,
                     };
                     let mut stmts = body.clone();
                     match self.lower_block(b, &mut inner, params, &inside, &mut stmts, pid) {
@@ -1087,6 +1149,7 @@ impl Algo {
                 if let Some(e) = failed.into_inner() {
                     return Err(e);
                 }
+                cx.spaces.borrow_mut().insert(outs[0], seen[0].2);
                 (outs[0], seen[0].0.clone(), seen[0].1)
             }
             Expr::Move(n) | Expr::Borrow(n) => {
@@ -1180,6 +1243,11 @@ fn substitute(e: &Expr, vals: &HashMap<&str, f64>) -> Expr {
             None => e.clone(),
         },
         Expr::Call(f, x) => Expr::Call(f.clone(), Box::new(substitute(x, vals))),
+        Expr::Mma(c, l, r) => Expr::Mma(
+            Box::new(substitute(c, vals)),
+            Box::new(substitute(l, vals)),
+            Box::new(substitute(r, vals)),
+        ),
         Expr::MatMul(nt, l, r) => Expr::MatMul(
             *nt,
             Box::new(substitute(l, vals)),
@@ -1264,6 +1332,9 @@ fn whole(param: usize, shape: &[usize]) -> View {
 struct Cx<'a> {
     vals: &'a HashMap<&'a str, f64>,
     idx: &'a HashMap<String, crate::ir::Var>,
+    /// The memory space of every tile made so far, for a loop to give its
+    /// carried tile the type it entered with.
+    spaces: &'a std::cell::RefCell<HashMap<crate::ir::Var, Space>>,
 }
 
 /// A dimension, resolved.

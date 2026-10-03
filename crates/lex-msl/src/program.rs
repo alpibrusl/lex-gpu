@@ -72,10 +72,34 @@ enum Loc {
     /// A threadgroup tile: `name[e]` is flat element `e`.
     Tg(String, TileTy),
     Index(String),
+    /// An accumulator in matrix-unit fragments: `name[i][j]` is this warp's
+    /// fragment at row `i`, column `j` of its share of the tile.
+    Frag(String, TileTy, Geom),
     /// A tile not held anywhere: an MSL expression for element `@I@`,
     /// evaluated where it is read (a load from a read-only parameter, or
     /// a conversion or dequantisation of one).
     Lazy(String, TileTy),
+}
+
+/// How a fragment tile is split: the warp grid cuts `[m, n]` into
+/// `wm x wn` equal blocks, and each warp's block is `fm x fnn` atoms.
+#[derive(Clone, Copy, Debug)]
+struct Geom {
+    wm: usize,
+    wn: usize,
+    fm: usize,
+    fnn: usize,
+    atom: usize,
+}
+
+/// What a schedule fixes about how a program is lowered, beyond the thread
+/// count: the warp grid a matrix-unit tile is split over.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sched {
+    pub threads: usize,
+    /// Warps along the rows and along the columns of an accumulator tile.
+    /// `threads` must be `simd_width * wm * wn`.
+    pub warps: Option<(usize, usize)>,
 }
 
 /// The index placeholder in a lazy lex's expression.
@@ -155,6 +179,13 @@ struct Gen<'a> {
     fp4: bool,
     /// A dense-ternary decode needs its helper in the preamble.
     tern: bool,
+    /// The warp grid of a matrix-unit program, from the schedule.
+    warps: Option<(usize, usize)>,
+    /// Bytes a threadgroup tile's address is a multiple of: 16, or 32 when
+    /// fragments are loaded from tiles (a `wmma` load needs 256 bits).
+    tile_align: usize,
+    /// The program uses fragments, so the preamble needs the matrix header.
+    mma: bool,
 }
 
 /// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
@@ -209,6 +240,44 @@ pub fn lower_with(
     threads: usize,
     dialect: &dyn Dialect,
 ) -> Result<Lowered, String> {
+    lower_sched(
+        prog,
+        target,
+        dialect,
+        &Sched {
+            threads,
+            warps: None,
+        },
+    )
+}
+
+/// Whether a block, or anything nested in it, multiplies on the matrix units.
+fn uses_mma(b: &Block) -> bool {
+    b.stmts.iter().any(|s| match s {
+        Stmt::Let { op, .. } => matches!(op, Op::Mma(..)),
+        Stmt::For { body, .. } | Stmt::MapEach { body, .. } => uses_mma(body),
+        Stmt::Specialize { roles, .. } => roles.iter().any(|r| uses_mma(&r.body)),
+    })
+}
+
+/// [`lower_with`], with the schedule's warp grid for programs that use the
+/// matrix units.
+pub fn lower_sched(
+    prog: &Program,
+    target: &Target,
+    dialect: &dyn Dialect,
+    sched: &Sched,
+) -> Result<Lowered, String> {
+    let threads = sched.threads;
+    let mma = uses_mma(&prog.body);
+    if let (true, Some((wm, wn))) = (mma, sched.warps)
+        && threads != target.simd_width * wm * wn
+    {
+        return Err(format!(
+            "a {wm}x{wn} warp grid is {} threads, not {threads}",
+            target.simd_width * wm * wn
+        ));
+    }
     if threads == 0
         || !threads.is_multiple_of(target.simd_width)
         || threads > target.max_threads_per_threadgroup
@@ -232,6 +301,9 @@ pub fn lower_with(
         dq: HashMap::new(),
         fp4: false,
         tern: false,
+        warps: sched.warps,
+        tile_align: if mma { 32 } else { 16 },
+        mma,
     };
     if let Some(pid) = prog.pid {
         g.locs.insert(pid, Loc::Index("gid".into()));
@@ -286,6 +358,9 @@ pub fn lower_with(
         target.max_threadgroup_bytes
     );
     s.push_str(&g.d.includes());
+    if let (true, Some(m)) = (g.mma, g.d.matrix()) {
+        s.push_str(m.includes());
+    }
     if g.tern {
         s.push_str(&g.d.tern_preamble());
     }
@@ -318,7 +393,11 @@ pub fn lower_with(
         let _ = writeln!(
             s,
             "    {}\n    {p} arena = ({p})arena4;",
-            g.d.shared_array("float4", "arena4", arena_bytes.div_ceil(16)),
+            if g.mma {
+                g.d.shared_array_aligned("float4", "arena4", arena_bytes.div_ceil(16), g.tile_align)
+            } else {
+                g.d.shared_array("float4", "arena4", arena_bytes.div_ceil(16))
+            },
             p = g.d.shared_ptr("uchar")
         );
     }
@@ -394,7 +473,11 @@ fn split_k_vec(kd: usize, lanes: usize, default: usize) -> usize {
 /// The storage name a location reads from.
 fn storage(l: &Loc) -> String {
     match l {
-        Loc::Reg(n, _) | Loc::RegArr(n, _, _) | Loc::Tg(n, _) | Loc::Index(n) => n.clone(),
+        Loc::Reg(n, _)
+        | Loc::RegArr(n, _, _)
+        | Loc::Tg(n, _)
+        | Loc::Frag(n, _, _)
+        | Loc::Index(n) => n.clone(),
         Loc::Lazy(e, _) => e.clone(),
     }
 }
@@ -561,9 +644,42 @@ impl Gen<'_> {
         name
     }
 
+    /// How the schedule's warp grid cuts a fragment tile.
+    fn frag_geom(&self, t: &TileTy) -> Result<Geom, String> {
+        let m = self
+            .d
+            .matrix()
+            .ok_or("this backend has no matrix unit for a fragment tile")?;
+        let (wm, wn) = self
+            .warps
+            .ok_or("a program with fragment tiles needs a schedule with `warps`")?;
+        let (a, rows, cols) = (m.atom(), t.shape[0], t.shape[1]);
+        if t.shape.len() != 2 || !rows.is_multiple_of(wm * a) || !cols.is_multiple_of(wn * a) {
+            return Err(format!(
+                "a {rows}x{cols} fragment tile does not split into {wm}x{wn} warps of whole \
+                 {a}x{a} atoms"
+            ));
+        }
+        Ok(Geom {
+            wm,
+            wn,
+            fm: rows / (wm * a),
+            fnn: cols / (wn * a),
+            atom: a,
+        })
+    }
+
+    fn declare_frag(&mut self, x: Var, ty: &TileTy, g: Geom) -> Result<String, String> {
+        let name = v(x);
+        let m = self.d.matrix().ok_or("no matrix unit")?;
+        self.line(&m.decl(&name, g.fm, g.fnn));
+        self.locs.insert(x, Loc::Frag(name.clone(), ty.clone(), g));
+        Ok(name)
+    }
+
     fn declare_tg(&mut self, x: Var, ty: &TileTy) -> String {
         let name = v(x);
-        let off = self.arena.next_multiple_of(16);
+        let off = self.arena.next_multiple_of(self.tile_align);
         self.arena = off + ty.bytes();
         let st = self.d.scalar(ty.dtype);
         self.line(&format!(
@@ -810,6 +926,10 @@ impl Gen<'_> {
                 ));
                 self.locs.insert(p, Loc::Tg(name, t.clone()));
             }
+            Loc::Frag(_, t, g) => {
+                let (t, g) = (t.clone(), *g);
+                self.declare_frag(p, &t, g)?;
+            }
             Loc::Lazy(_, t) => {
                 let t = t.clone();
                 self.declare_reg(p, &t);
@@ -843,6 +963,15 @@ impl Gen<'_> {
             (Loc::Tg(d, _), Loc::Tg(s, _)) => {
                 if d != s {
                     self.line(&format!("{d} = {s};"));
+                }
+            }
+            (Loc::Frag(d, _, g), Loc::Frag(s, _, _)) => {
+                if d != s {
+                    self.line(&format!(
+                        "for (uint i = 0; i < {}u; ++i) for (uint j = 0; j < {}u; ++j) \
+                         {d}[i][j] = {s}[i][j];",
+                        g.fm, g.fnn
+                    ));
                 }
             }
             // A lazy value needs storage now: evaluate the elements each
@@ -887,11 +1016,55 @@ impl Gen<'_> {
                         self.every(t.elems(), &format!("{name}[e] = {st}({});", lit(*val)));
                         self.barrier();
                     }
+                    Space::Frag => {
+                        let g = self.frag_geom(t)?;
+                        let name = self.declare_frag(x, t, g)?;
+                        let fill = self
+                            .d
+                            .matrix()
+                            .ok_or("no matrix unit")?
+                            .fill(&format!("{name}[i][j]"), &lit(*val));
+                        self.line(&format!(
+                            "for (uint i = 0; i < {}u; ++i) for (uint j = 0; j < {}u; ++j) {fill}",
+                            g.fm, g.fnn
+                        ));
+                    }
                     _ => {
                         let name = self.declare_reg(x, t);
                         self.owned(t.elems(), &[format!("{name}[k] = {st}({});", lit(*val))]);
                     }
                 }
+            }
+            Op::Mma(c, a, b) => {
+                let x = dst.ok_or("mma without a result")?;
+                let var = |a: &Arg| a.var();
+                let Loc::Frag(cn, ct, g) = self.loc(var(c))? else {
+                    return Err("mma accumulates into a fragment tile".into());
+                };
+                let (Loc::Tg(an, at), Loc::Tg(bn, _)) = (self.loc(var(a))?, self.loc(var(b))?)
+                else {
+                    return Err("mma reads tiles in threadgroup memory".into());
+                };
+                let k = at.shape[1];
+                if !k.is_multiple_of(g.atom) {
+                    return Err(format!("mma over {k} is not whole {}-wide steps", g.atom));
+                }
+                // This warp's block of the accumulator: rows `wi * (m / wm)`
+                // of the left tile, rows `wj * (n / wn)` of the right.
+                let (rows, cols) = (ct.shape[0] / g.wm, ct.shape[1] / g.wn);
+                let a_row = format!("(tid / {}u) * {rows}u", 32 * g.wn);
+                let b_row = format!("(tid / 32u % {}u) * {cols}u", g.wn);
+                let lines = self
+                    .d
+                    .matrix()
+                    .ok_or("no matrix unit")?
+                    .mma(&cn, &an, &bn, k, g.fm, g.fnn, &a_row, &b_row);
+                for l in lines {
+                    self.line(&l);
+                }
+                // In place: the accumulator was moved in, so its storage is
+                // the result's.
+                self.locs.insert(x, Loc::Frag(cn, ct, g));
             }
             Op::Load(view, t) => {
                 let x = dst.ok_or("load without a result")?;
@@ -933,6 +1106,41 @@ impl Gen<'_> {
                 let l = self.loc(*f)?;
                 self.barrier();
                 self.locs.insert(x, l);
+            }
+            Op::Store(a, view) if matches!(self.locs.get(&a.var()), Some(Loc::Frag(..))) => {
+                let Loc::Frag(name, t, g) = self.loc(a.var())? else {
+                    unreachable!("matched above")
+                };
+                let m = self.d.matrix().ok_or("no matrix unit")?;
+                let dims = &self.prog.params[view.param].shape;
+                let ldm: usize = dims[dims.len() - 1..].iter().product();
+                if self.prog.params[view.param].dtype != t.dtype {
+                    return Err("a fragment stores at its own dtype".into());
+                }
+                if !ldm.is_multiple_of(m.store_align())
+                    || !view.shape.iter().all(|d| d.is_multiple_of(g.atom))
+                {
+                    return Err(format!(
+                        "a fragment store needs rows of a multiple of {} elements, found {ldm}",
+                        m.store_align()
+                    ));
+                }
+                let (rows, cols) = (t.shape[0] / g.wm, t.shape[1] / g.wn);
+                let n = t.shape[1];
+                let at = format!(
+                    "((tid / {}u) * {rows}u + i * {}u) * {n}u + (tid / 32u % {}u) * {cols}u + j * {}u",
+                    32 * g.wn,
+                    g.atom,
+                    g.wn,
+                    g.atom
+                );
+                let ptr = format!("&{}", self.addr(view, &at)?);
+                self.line(&format!(
+                    "for (uint i = 0; i < {}u; ++i) for (uint j = 0; j < {}u; ++j) {}",
+                    g.fm,
+                    g.fnn,
+                    m.store(&format!("{name}[i][j]"), &ptr, ldm)
+                ));
             }
             Op::Store(a, view) => {
                 let dt = self.d.scalar(self.prog.params[view.param].dtype);
@@ -2230,7 +2438,7 @@ impl Gen<'_> {
     fn arg_ty(&self, a: Arg) -> Result<TileTy, String> {
         Ok(match a {
             Arg::Move(x) | Arg::Borrow(x) => match self.loc(x)? {
-                Loc::Reg(_, t) | Loc::Tg(_, t) | Loc::Lazy(_, t) => t,
+                Loc::Reg(_, t) | Loc::Tg(_, t) | Loc::Lazy(_, t) | Loc::Frag(_, t, _) => t,
                 _ => return Err("operand is not a tile".into()),
             },
             Arg::BorrowElem(arr, _) => match self.loc(arr)? {

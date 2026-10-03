@@ -126,6 +126,19 @@ pub trait Dialect {
         usize::MAX
     }
 
+    /// The matrix unit this target spells, if the dialect has one: what
+    /// `Space::Frag` tiles and `mma` lower to.
+    fn matrix(&self) -> Option<&dyn Matrix> {
+        None
+    }
+
+    /// A threadgroup array whose address is a multiple of `align` bytes,
+    /// for tiles a matrix unit loads fragments from.
+    fn shared_array_aligned(&self, ty: &str, name: &str, len: usize, align: usize) -> String {
+        let _ = align;
+        self.shared_array(ty, name, len)
+    }
+
     /// Whether a lane's run of consecutive loads is spelled as explicit
     /// wide loads (`uint2`, `float4`) rather than left for the compiler to
     /// merge.
@@ -187,11 +200,189 @@ pub trait Dialect {
     fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool, gid2: bool) -> String;
 }
 
+/// How a target's matrix unit is spelled.
+///
+/// The atom is the one thing the hardware fixes: a warp multiplies 16x16x16
+/// on CUDA (`wmma`, f16 in, f32 out) and a simdgroup 8x8x8 on Apple. A
+/// program names neither -- it says `mma` over tiles, and the schedule's warp
+/// grid says how many atoms each warp owns -- so the same `.lx` lowers to
+/// both, and what differs is only here.
+pub trait Matrix {
+    /// Edge of the square atom.
+    fn atom(&self) -> usize;
+
+    /// Appended to the preamble of a kernel that uses fragments.
+    fn includes(&self) -> &'static str;
+
+    /// `fm x fnn` f32 accumulators named `name`.
+    fn decl(&self, name: &str, fm: usize, fnn: usize) -> String;
+
+    /// Set one accumulator to `val`.
+    fn fill(&self, frag: &str, val: &str) -> String;
+
+    /// Lines adding `a b^T` over the inner dimension `k` into the
+    /// accumulators `c[fm][fnn]`: `a` and `b` are f16 tiles in threadgroup
+    /// memory, row-major with `k` columns, and this warp's accumulators sit
+    /// at row `a_row` of `a` and row `b_row` of `b`.
+    #[allow(clippy::too_many_arguments)]
+    fn mma(
+        &self,
+        c: &str,
+        a: &str,
+        b: &str,
+        k: usize,
+        fm: usize,
+        fnn: usize,
+        a_row: &str,
+        b_row: &str,
+    ) -> Vec<String>;
+
+    /// Store one accumulator to the address `ptr`, rows `ldm` apart.
+    fn store(&self, frag: &str, ptr: &str, ldm: usize) -> String;
+
+    /// Elements a global store's address must be a multiple of.
+    fn store_align(&self) -> usize;
+}
+
+/// CUDA `wmma`: 16x16x16, f16 in and f32 accumulating.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Wmma;
+
+impl Matrix for Wmma {
+    fn atom(&self) -> usize {
+        16
+    }
+
+    fn includes(&self) -> &'static str {
+        "#include <mma.h>\n\n"
+    }
+
+    fn decl(&self, name: &str, fm: usize, fnn: usize) -> String {
+        format!(
+            "nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> {name}[{fm}][{fnn}];"
+        )
+    }
+
+    fn fill(&self, frag: &str, val: &str) -> String {
+        format!("nvcuda::wmma::fill_fragment({frag}, {val});")
+    }
+
+    fn mma(
+        &self,
+        c: &str,
+        a: &str,
+        b: &str,
+        k: usize,
+        fm: usize,
+        fnn: usize,
+        a_row: &str,
+        b_row: &str,
+    ) -> Vec<String> {
+        vec![
+            "{".into(),
+            format!(
+                "    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> fa[{fm}];"
+            ),
+            format!(
+                "    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> fb[{fnn}];"
+            ),
+            format!("    for (uint kk = 0; kk < {k}u; kk += 16u) {{"),
+            format!(
+                "        for (uint i = 0; i < {fm}u; ++i) nvcuda::wmma::load_matrix_sync(fa[i], {a} + ({a_row} + i * 16u) * {k}u + kk, {k}u);"
+            ),
+            format!(
+                "        for (uint j = 0; j < {fnn}u; ++j) nvcuda::wmma::load_matrix_sync(fb[j], {b} + ({b_row} + j * 16u) * {k}u + kk, {k}u);"
+            ),
+            format!("        for (uint i = 0; i < {fm}u; ++i)"),
+            format!(
+                "            for (uint j = 0; j < {fnn}u; ++j) nvcuda::wmma::mma_sync({c}[i][j], fa[i], fb[j], {c}[i][j]);"
+            ),
+            "    }".into(),
+            "}".into(),
+        ]
+    }
+
+    fn store(&self, frag: &str, ptr: &str, ldm: usize) -> String {
+        format!(
+            "nvcuda::wmma::store_matrix_sync({ptr}, {frag}, {ldm}u, nvcuda::wmma::mem_row_major);"
+        )
+    }
+
+    fn store_align(&self) -> usize {
+        // A 256-bit aligned address, in f32 elements.
+        8
+    }
+}
+
+/// Metal `simdgroup_matrix`: 8x8x8, f16 in and f32 accumulating.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Simdgroup;
+
+impl Matrix for Simdgroup {
+    fn atom(&self) -> usize {
+        8
+    }
+
+    fn includes(&self) -> &'static str {
+        "#include <metal_simdgroup_matrix>\n\n"
+    }
+
+    fn decl(&self, name: &str, fm: usize, fnn: usize) -> String {
+        format!("simdgroup_matrix<float, 8, 8> {name}[{fm}][{fnn}];")
+    }
+
+    fn fill(&self, frag: &str, val: &str) -> String {
+        format!("{frag} = simdgroup_matrix<float, 8, 8>({val});")
+    }
+
+    fn mma(
+        &self,
+        c: &str,
+        a: &str,
+        b: &str,
+        k: usize,
+        fm: usize,
+        fnn: usize,
+        a_row: &str,
+        b_row: &str,
+    ) -> Vec<String> {
+        vec![
+            "{".into(),
+            format!("    simdgroup_matrix<half, 8, 8> fa[{fm}], fb[{fnn}];"),
+            format!("    for (uint kk = 0; kk < {k}u; kk += 8u) {{"),
+            format!(
+                "        for (uint i = 0; i < {fm}u; ++i) simdgroup_load(fa[i], {a} + ({a_row} + i * 8u) * {k}u + kk, {k}u);"
+            ),
+            format!(
+                "        for (uint j = 0; j < {fnn}u; ++j) simdgroup_load(fb[j], {b} + ({b_row} + j * 8u) * {k}u + kk, {k}u, ulong2(0, 0), true);"
+            ),
+            format!("        for (uint i = 0; i < {fm}u; ++i)"),
+            format!(
+                "            for (uint j = 0; j < {fnn}u; ++j) simdgroup_multiply_accumulate({c}[i][j], fa[i], fb[j], {c}[i][j]);"
+            ),
+            "    }".into(),
+            "}".into(),
+        ]
+    }
+
+    fn store(&self, frag: &str, ptr: &str, ldm: usize) -> String {
+        format!("simdgroup_store({frag}, {ptr}, {ldm}u);")
+    }
+
+    fn store_align(&self) -> usize {
+        1
+    }
+}
+
 /// Metal Shading Language.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Msl;
 
 impl Dialect for Msl {
+    fn matrix(&self) -> Option<&dyn Matrix> {
+        Some(&Simdgroup)
+    }
+
     fn barrier(&self) -> String {
         "threadgroup_barrier(mem_flags::mem_threadgroup);".to_string()
     }
@@ -294,6 +485,14 @@ impl Dialect for Msl {
 pub struct Cuda;
 
 impl Dialect for Cuda {
+    fn matrix(&self) -> Option<&dyn Matrix> {
+        Some(&Wmma)
+    }
+
+    fn shared_array_aligned(&self, ty: &str, name: &str, len: usize, align: usize) -> String {
+        format!("__shared__ __align__({align}) {ty} {name}[{len}];")
+    }
+
     fn barrier(&self) -> String {
         "__syncthreads();".to_string()
     }

@@ -353,6 +353,11 @@ pub enum Op {
     MatMulNT(Arg, Arg, DType),
     /// `[m,k] x [k,n] -> [m,n]`, accumulating in `acc`.
     MatMul(Arg, Arg, DType),
+    /// `acc + a b^T` on the matrix units: `a: [m,k]` and `b: [n,k]` f16
+    /// tiles in threadgroup memory, `acc: [m,n]` an f32 [`Space::Frag`]
+    /// tile. The accumulator is consumed and its updated self returned, so
+    /// the update is in place and the checker still sees one owner.
+    Mma(Arg, Arg, Arg),
     /// Elementwise. `b` may also be `[m]`, one value per row of an `[m,n]`
     /// `a`, or `[1,n]`, one row repeated for every row of `a`.
     Binary(BinOp, Arg, Arg),
