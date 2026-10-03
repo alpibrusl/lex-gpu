@@ -502,3 +502,121 @@ fn the_matrix_unit_gemm_lowers_to_wmma_and_to_simdgroup_matrices() {
         assert!(err.contains("warps"), "{err}");
     }
 }
+
+const GEMM_FP4: &str = include_str!("../lx/gemm_fp4.lx");
+
+/// An E2M1 code: sign, two exponent bits, one mantissa bit.
+fn e2m1(code: u8) -> f64 {
+    let mag = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][(code & 7) as usize];
+    if code & 8 != 0 { -mag } else { mag }
+}
+
+/// An E4M3 byte: sign, four exponent bits (bias 7), three mantissa bits.
+fn e4m3(b: u8) -> f64 {
+    let (e, m) = ((b >> 3) & 15, (b & 7) as f64);
+    let v = if e == 0 {
+        m / 8.0 * 2f64.powi(-6)
+    } else {
+        (1.0 + m / 8.0) * 2f64.powi(e as i32 - 7)
+    };
+    if b & 0x80 != 0 { -v } else { v }
+}
+
+#[test]
+fn the_fp4_gemm_decodes_stages_and_multiplies() {
+    use lex_front::interp::{Tensor, run};
+    let unit = syntax::parse(GEMM_FP4).unwrap_or_else(|e| panic!("{e}"));
+    for target in [
+        lex_ir::Target::nvidia_ada(),
+        lex_ir::Target::apple_m_series(),
+    ] {
+        let s = unit.schedule_for(target.name).expect("a schedule");
+        let (bm, bn, bk) = (s.extents[0].1, s.extents[1].1, s.extents[2].1);
+        let (m, n, k) = (bm, 2 * bn, 2 * bk);
+        let (prog, _) = unit
+            .compile(
+                target.name,
+                &[("m", m as f64), ("n", n as f64), ("k", k as f64)],
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        lex_front::check(&prog, &target).unwrap_or_else(|e| panic!("{}: {e:#?}", target.name));
+
+        let x = fill(m * k, 31);
+        // Bytes, held in an I8 tensor as the signed values they are.
+        let q: Vec<f32> = (0..n * k / 2)
+            .map(|i| ((i * 97 + 13) % 256) as u8 as i8 as f32)
+            .collect();
+        // Scales in a sane range, as the hand-written benchmark uses.
+        let sc: Vec<f32> = (0..n * k / 16).map(|i| (0x30 + i % 7) as f32).collect();
+        let g: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32 * 0.25).collect();
+        let mut t = vec![
+            Tensor::new(lex_ir::DType::F16, &[m, k], &x),
+            Tensor::new(lex_ir::DType::I8, &[n, k / 2], &q),
+            Tensor::new(lex_ir::DType::I8, &[n, k / 16], &sc),
+            Tensor::new(lex_ir::DType::F32, &[n], &g),
+            Tensor::new(lex_ir::DType::F32, &[m, n], &vec![0.0; m * n]),
+        ];
+        run(&prog, &mut t).unwrap_or_else(|e| panic!("{}: {e:?}", target.name));
+
+        // The weight a code means, rounded to f16 as the staging copy does.
+        let w = |j: usize, p: usize| -> f64 {
+            let byte = q[j * (k / 2) + p / 2] as i8 as u8;
+            let code = if p.is_multiple_of(2) {
+                byte & 15
+            } else {
+                byte >> 4
+            };
+            let v = e2m1(code) * e4m3(sc[j * (k / 16) + p / 16] as u8) * g[j] as f64;
+            half::f16::from_f64(v).to_f64()
+        };
+        let xr = &t[0].data;
+        for i in (0..m).step_by(9) {
+            for j in (0..n).step_by(7) {
+                let want: f64 = (0..k).map(|p| xr[i * k + p] as f64 * w(j, p)).sum();
+                let got = t[4].data[i * n + j] as f64;
+                assert!(
+                    (got - want).abs() < 1e-3 * want.abs().max(1.0),
+                    "{}: y[{i},{j}] = {got}, want {want}",
+                    target.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_fp4_gemm_decodes_a_group_a_thread_on_cuda() {
+    use lex_msl::dialect::Cuda;
+    use lex_msl::program::{Sched, lower_sched};
+    let unit = syntax::parse(GEMM_FP4).unwrap_or_else(|e| panic!("{e}"));
+    let target = lex_ir::Target::nvidia_ada();
+    let s = unit.schedule_for(target.name).expect("a schedule");
+    let (prog, threads) = unit
+        .compile(target.name, &[("m", 256.0), ("n", 1024.0), ("k", 1024.0)])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let l = lower_sched(
+        &prog,
+        &target,
+        &Cuda,
+        &Sched {
+            threads,
+            warps: s.warps,
+            pad: s.pad,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    for want in [
+        "fp4_pair(",
+        "__floats2half2_rn",
+        "const uint2 w =",
+        "mma_sync",
+    ] {
+        assert!(l.source.contains(want), "the staged decode lacks `{want}`");
+    }
+    // The decode is the group decode, not the per-element lane gather,
+    // which shuffles under a loop whose trip count differs by lane.
+    assert!(
+        !l.source.contains("fp4_lane"),
+        "fell back to the lane gather"
+    );
+}

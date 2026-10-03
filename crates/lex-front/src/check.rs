@@ -660,6 +660,14 @@ impl Checker<'_> {
                 self.report.dups += 1;
                 Some(Ty::Tile(t))
             }
+            Op::Stage(a, dt) => {
+                let ty = self.args(&[*a])?.remove(0);
+                let t = self.tile(ty, "staged tile")?;
+                if !self.numeric(&t, "staged tile") {
+                    return None;
+                }
+                Some(Ty::Tile(TileTy::new(*dt, &t.shape, Space::Threadgroup)))
+            }
             Op::Mma(c, a, b) => {
                 let tys = self.args(&[*c, *a, *b])?;
                 let tc = self.tile_any(tys[0].clone(), "mma accumulator")?;

@@ -1,0 +1,39 @@
+// y = x w^T with NVFP4 weights: the matrix the model's prefill runs.
+//
+// `x` is f16 activations; the weights are 4-bit E2M1 codes two to a byte
+// (`wq`), an E4M3 scale per 16 values (`ws`) and one f32 scale per row
+// (`wg`). The program says what the numbers mean -- `dequant_fp4` meets the
+// codes with their scales -- and where they go: `stage f16` copies the
+// dequantised window into threadgroup memory, which is where the matrix
+// unit reads it. How the decode is done is not here. Lowered for CUDA it
+// becomes one thread per group of 16 values: the scale formed once for the
+// group, the eight bytes read in one load, the sixteen halves written in
+// two -- what `lex_msl::gemm` does by hand, found from this text.
+//
+// The packed shapes follow from the logical ones (`k / 2` bytes, `k / 16`
+// scales a row), so a window of the codes is `bk / 2` wide and steps by that.
+
+algo gemm_fp4(m, n, k)
+  in  x:  f16[m, k]
+  in  wq: i8[n, k / 2]
+  in  ws: i8[n, k / 16]
+  in  wg: f32[n]
+  out y:  f32[m, n]
+  tile bm, bn, bk
+{
+  grid i over m / bm, j over n / bn
+  let acc = zeros f32[bm, bn] @frag
+  let acc = for p in 0 .. k / bk with acc {
+    let xt = load x[i * bm, p * bk ; bm, bk] @shared
+    let q  = load wq[j * bn, p * (bk / 2) ; bn, bk / 2]
+    let s  = load ws[j * bn, p * (bk / 16) ; bn, bk / 16]
+    let g  = load wg[j * bn ; bn]
+    let w  = dequant_fp4 q s g 16
+    let wt = stage f16 w
+    yield mma acc xt wt
+  }
+  store acc -> y[i * bm, j * bn]
+}
+
+schedule gemm_fp4 for nvidia-ada     { threads 256 warps 2 4 bm 128 bn 128 bk 64 }
+schedule gemm_fp4 for apple-m-series { threads 128 warps 2 2 bm 64 bn 64 bk 32 }

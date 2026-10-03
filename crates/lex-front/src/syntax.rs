@@ -31,12 +31,19 @@
 //! conflicts; the dialect supplies the atom (16x16x16 `wmma`, 8x8
 //! `simdgroup_matrix`), so `gemm_mma.lx` lowers for both.
 //!
+//! Quantised weights are an operation, not a format hidden in a kernel:
+//! `dequant_fp4 q s g 16` meets NVFP4 codes with their scales, and `stage
+//! f16 e` copies a computed tile into shared memory for the matrix unit.
+//! `gemm_fp4.lx` is the matrix the model's prefill runs; lowered for CUDA
+//! its staging is one thread per group of 16 values with the scale formed
+//! once and the bytes read in one load, which is what `lex_msl::gemm` does
+//! by hand.
+//!
 //! What it does not do, stated because a surface that hides its holes is
-//! worse than no surface: no quantised operands staged into shared memory
-//! (so the hand-scheduled NVFP4 GEMM in `lex_msl::gemm`, which the model
-//! runs, has no `.lx` equivalent yet), no epilogue on a fragment, no
-//! software pipelining of the copies, no more than one carried tile, no
-//! autotuner `?`.
+//! worse than no surface: no epilogue on a fragment (the residual add of
+//! the model's `down` and `out_proj`), no software pipelining of the
+//! copies, no other quantised formats staged this way, no more than one
+//! carried tile, no autotuner `?`.
 //!
 //! ## The linear discipline is visible
 //!
@@ -214,6 +221,9 @@ struct ParamDecl {
 enum Dim {
     Lit(usize),
     Named(String),
+    /// `k / 2`, `bk / 16`: the packed formats' shapes follow from the
+    /// logical ones.
+    Expr(Ce),
 }
 
 /// An integer expression over constants and, where an index is wanted, the
@@ -236,6 +246,13 @@ enum Expr {
     /// `zeros f32[bm, bn]`, or `zeros f32[bm, bn] @frag`: an accumulator in
     /// matrix-unit fragments.
     Zeros(DType, Vec<Dim>, Space),
+    /// `dequant_fp4 q s g 16`: NVFP4 weights meeting their scales. `q` is
+    /// `[r, c/2]` packed pairs, `s` is `[r, c/16]` E4M3 scales, `g` the
+    /// per-row f32 scale `[r]`; the result is `[r, c]` in f32.
+    DequantFp4(Box<Expr>, Box<Expr>, Box<Expr>, usize),
+    /// `stage f16 e`: copy a computed tile into threadgroup memory as
+    /// `f16`, which is where a matrix unit reads its operands.
+    Stage(DType, Box<Expr>),
     /// `mma acc a b`: `acc + a b^T` on the matrix units, `acc` a fragment
     /// tile and `a`, `b` shared f16 tiles.
     Mma(Box<Expr>, Box<Expr>, Box<Expr>),
@@ -325,14 +342,11 @@ impl Parser {
     }
 
     fn dim(&mut self) -> Result<Dim, String> {
-        match self.bump() {
-            Tok::Num(n) => Ok(Dim::Lit(n as usize)),
-            Tok::Ident(s) => Ok(Dim::Named(s)),
-            other => Err(format!(
-                "{}: expected a dimension, found {other:?}",
-                self.at()
-            )),
-        }
+        Ok(match self.ce()? {
+            Ce::Num(n) => Dim::Lit(n as usize),
+            Ce::Name(s) => Dim::Named(s),
+            e => Dim::Expr(e),
+        })
     }
 
     /// `f32[1, n]`
@@ -394,6 +408,35 @@ impl Parser {
                 "mma" => {
                     let (c, a, b) = (self.atom()?, self.atom()?, self.atom()?);
                     Ok(Expr::Mma(Box::new(c), Box::new(a), Box::new(b)))
+                }
+                "dequant_fp4" => {
+                    let (q, sc, g) = (self.atom()?, self.atom()?, self.atom()?);
+                    let at = self.at();
+                    let group = match self.bump() {
+                        Tok::Num(n) => n as usize,
+                        other => {
+                            return Err(format!("{at}: a group size is a number, found {other:?}"));
+                        }
+                    };
+                    Ok(Expr::DequantFp4(
+                        Box::new(q),
+                        Box::new(sc),
+                        Box::new(g),
+                        group,
+                    ))
+                }
+                "stage" => {
+                    let at = self.at();
+                    let dtype = match self.want_ident()?.as_str() {
+                        "f16" => DType::F16,
+                        "f32" => DType::F32,
+                        other => {
+                            return Err(format!(
+                                "{at}: `{other}` is not a staging dtype (f16, f32)"
+                            ));
+                        }
+                    };
+                    Ok(Expr::Stage(dtype, Box::new(self.atom()?)))
                 }
                 "matmul_nt" | "matmul" => {
                     let (a, b) = (self.atom()?, self.atom()?);
@@ -869,15 +912,7 @@ impl Algo {
                 return Err(format!("`{}` needs a value for `{c}`", self.name));
             }
         }
-        let dim = |d: &Dim| -> Result<usize, String> {
-            Ok(match d {
-                Dim::Lit(n) => *n,
-                Dim::Named(s) => *vals
-                    .get(s.as_str())
-                    .ok_or_else(|| format!("`{s}` is not one of this algo's constants"))?
-                    as usize,
-            })
-        };
+        let dim = |d: &Dim| dim_of(d, &vals);
 
         // The suffix the Rust builders use: every constant in declaration
         // order. `rmsnorm(n)` with n = 4096 is `rmsnorm_4096`.
@@ -1067,6 +1102,31 @@ impl Algo {
                     .collect::<Result<_, _>>()?;
                 let v = b.op(name, Op::Fill(TileTy::new(*dt, &shape, *space), 0.0));
                 cx.spaces.borrow_mut().insert(v, *space);
+                (v, shape, *dt)
+            }
+            Expr::DequantFp4(q, sc, g, group) => {
+                let (qv, qshape, _) = self.lower(b, env, params, cx, q, name, pid)?;
+                let (sv, sshape, _) = self.lower(b, env, params, cx, sc, name, pid)?;
+                let (gv, gshape, _) = self.lower(b, env, params, cx, g, name, pid)?;
+                let (rows, cols) = (qshape[0], 2 * qshape[1]);
+                if sshape != [rows, cols / group] || gshape != [rows] {
+                    return Err(format!(
+                        "`{name}`: {qshape:?} values want scales {:?} and row scales {:?}, \
+                         found {sshape:?} and {gshape:?}",
+                        [rows, cols / group],
+                        [rows]
+                    ));
+                }
+                let v = b.op(
+                    name,
+                    Op::DequantFp4(arg(q, qv), arg(sc, sv), arg(g, gv), *group),
+                );
+                (v, vec![rows, cols], DType::F32)
+            }
+            Expr::Stage(dt, inner) => {
+                let (iv, shape, _) = self.lower(b, env, params, cx, inner, name, pid)?;
+                let v = b.op(name, Op::Stage(arg(inner, iv), *dt));
+                cx.spaces.borrow_mut().insert(v, Space::Threadgroup);
                 (v, shape, *dt)
             }
             Expr::Mma(c, l, r) => {
@@ -1259,6 +1319,13 @@ fn substitute(e: &Expr, vals: &HashMap<&str, f64>) -> Expr {
             None => e.clone(),
         },
         Expr::Call(f, x) => Expr::Call(f.clone(), Box::new(substitute(x, vals))),
+        Expr::DequantFp4(q, s, g, n) => Expr::DequantFp4(
+            Box::new(substitute(q, vals)),
+            Box::new(substitute(s, vals)),
+            Box::new(substitute(g, vals)),
+            *n,
+        ),
+        Expr::Stage(dt, e) => Expr::Stage(*dt, Box::new(substitute(e, vals))),
         Expr::Mma(c, l, r) => Expr::Mma(
             Box::new(substitute(c, vals)),
             Box::new(substitute(l, vals)),
@@ -1361,6 +1428,14 @@ fn dim_of(d: &Dim, vals: &HashMap<&str, f64>) -> Result<usize, String> {
             .get(s.as_str())
             .ok_or_else(|| format!("`{s}` is not one of this algo's constants"))?
             as usize,
+        Dim::Expr(e) => constant(
+            e,
+            &Cx {
+                vals,
+                idx: &HashMap::new(),
+                spaces: &std::cell::RefCell::new(HashMap::new()),
+            },
+        )?,
     })
 }
 

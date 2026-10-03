@@ -358,6 +358,11 @@ pub enum Op {
     /// tile. The accumulator is consumed and its updated self returned, so
     /// the update is in place and the checker still sees one owner.
     Mma(Arg, Arg, Arg),
+    /// Copy a tile into threadgroup memory, converting to `dtype`: the one
+    /// way a computed tile -- a dequantised weight, say -- reaches a matrix
+    /// unit, which reads only shared memory. The conversion is named here,
+    /// so narrowing f32 to f16 is explicit by construction.
+    Stage(Arg, DType),
     /// Elementwise. `b` may also be `[m]`, one value per row of an `[m,n]`
     /// `a`, or `[1,n]`, one row repeated for every row of `a`.
     Binary(BinOp, Arg, Arg),

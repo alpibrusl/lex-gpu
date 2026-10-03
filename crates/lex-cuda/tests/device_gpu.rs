@@ -576,3 +576,97 @@ fn the_lx_gemm_runs_on_the_matrix_units() {
         assert!(worst / peak < 1e-4, "off by {:.2e} of scale", worst / peak);
     }
 }
+
+/// The `.lx` NVFP4 GEMM against `lex_msl::gemm`'s, on the same weights: the
+/// language's kernel has to be the hand-written one's answer, to f32
+/// accumulation order, before its speed means anything
+/// (`examples/lx_gemm_bench` times it).
+#[test]
+fn the_lx_fp4_gemm_agrees_with_the_hand_written_one() {
+    use lex_msl::gemm::{Backend, Gemm, gemm_nvfp4};
+    use lex_msl::program::{Sched, lower_sched};
+    let Some(g) = gpu() else { return };
+    let unit = lex_front::syntax::parse(include_str!("../../lex-front/lx/gemm_fp4.lx"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let target = Target::nvidia_ada();
+    let s = unit.schedule_for(target.name).expect("an Ada schedule");
+    for (m, n, k) in [(128usize, 128usize, 64usize), (256, 512, 1024)] {
+        let hand = g
+            .build_lowered(
+                &gemm_nvfp4(
+                    &Gemm {
+                        m,
+                        n,
+                        k,
+                        residual: false,
+                        x_half: true,
+                    },
+                    Backend::Cuda,
+                )
+                .expect("hand-written"),
+            )
+            .expect("compile hand-written");
+        let (prog, threads) = unit
+            .compile(
+                target.name,
+                &[("m", m as f64), ("n", n as f64), ("k", k as f64)],
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let lx = g
+            .build_lowered(
+                &lower_sched(
+                    &prog,
+                    &target,
+                    &Cuda,
+                    &Sched {
+                        threads,
+                        warps: s.warps,
+                        pad: s.pad,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{e}")),
+            )
+            .expect("compile lx");
+        let x = g.upload(
+            &fill(m * k, 41)
+                .iter()
+                .map(|&v| f16::from_f32(v))
+                .collect::<Vec<_>>(),
+        );
+        let q = g.upload(
+            &(0..n * k / 2)
+                .map(|i| (i.wrapping_mul(97) + 5) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let sc = g.upload(
+            &(0..n * k / 16)
+                .map(|i| 0x30u8 + (i % 7) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let gs = g.upload(
+            &(0..n)
+                .map(|i| 0.5 + (i % 5) as f32 * 0.25)
+                .collect::<Vec<f32>>(),
+        );
+        let (yh, yl) = (
+            g.upload(&vec![9.0f32; m * n]),
+            g.upload(&vec![9.0f32; m * n]),
+        );
+        g.run(&hand, &[&x, &q, &sc, &gs, &yh]).expect("run hand");
+        g.run(&lx, &[&x, &q, &sc, &gs, &yl]).expect("run lx");
+        let (mut a, mut b) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+        g.download(&yh, &mut a);
+        g.download(&yl, &mut b);
+        let peak = a.iter().fold(1e-9f32, |p, v| p.max(v.abs()));
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "lx fp4 gemm {m}x{n}x{k}: worst {:.2e} of scale against the hand-written",
+            worst / peak
+        );
+        assert!(worst / peak < 1e-4, "off by {:.2e} of scale", worst / peak);
+    }
+}

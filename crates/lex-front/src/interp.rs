@@ -482,6 +482,14 @@ impl Interp<'_> {
                 None
             }
             Op::Dup(a) => Some(Val::Tile(self.arg(*a)?)),
+            Op::Stage(a, dt) => {
+                let t = self.arg(*a)?;
+                Some(Val::Tile(Tile {
+                    ty: TileTy::new(*dt, &t.ty.shape, lex_ir::Space::Threadgroup),
+                    data: t.data.iter().map(|&x| round(*dt, x)).collect(),
+                    init: true,
+                }))
+            }
             Op::Mma(c, a, b) => {
                 // The same arithmetic as `matmul_nt` added into `c`: a
                 // fragment is a tile here, because the interpreter has no

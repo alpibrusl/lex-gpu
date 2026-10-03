@@ -193,6 +193,8 @@ struct Gen<'a> {
     /// Shared tiles that only a matrix op reads, with the elements of padding
     /// their rows carry.
     padded: HashMap<Var, usize>,
+    /// The window of every tile that is a lazy read of a parameter.
+    views: HashMap<Var, View>,
 }
 
 /// A lazy dequantisation in parts: `v(I) * s(G) - m(G)` with
@@ -212,6 +214,9 @@ struct Dq {
     /// How values are packed, so a reduction can load each byte once for
     /// all the values in it instead of once per value.
     pack: Pack,
+    /// The window of the quantised values, when they come straight from a
+    /// parameter: what a staging copy checks its alignment against.
+    qview: Option<View>,
 }
 
 #[derive(Clone, Debug)]
@@ -380,6 +385,7 @@ pub fn lower_sched(
         tile_align: if mma { 32 } else { 16 },
         mma,
         padded: HashMap::new(),
+        views: HashMap::new(),
     };
     if mma && let Some(m) = dialect.matrix() {
         let pad = sched.pad.unwrap_or(m.default_pad());
@@ -820,6 +826,82 @@ impl Gen<'_> {
         cols + self.padded.get(&x).copied().unwrap_or(0)
     }
 
+    /// NVFP4 weights decoded straight into a shared f16 tile, a thread to a
+    /// group of 16 values: the scale (E4M3 byte times the row's f32 scale,
+    /// times the 2^14 that `fp4_pair` leaves out) is formed once for the
+    /// group, the eight bytes come in one wide load, and the sixteen halves
+    /// leave in two. `None` where the dialect has no wide loads, the group is
+    /// not 16, or the packed window is not 8-byte aligned.
+    ///
+    /// This is the decode the hand-written GEMM does -- found here from the
+    /// lazy dequantisation the program says, not written beside it.
+    fn fp4_stage(
+        &self,
+        src: Var,
+        name: &str,
+        t: &TileTy,
+        ld: Option<usize>,
+    ) -> Result<Option<Vec<String>>, String> {
+        let Some(dq) = self.dq.get(&src) else {
+            return Ok(None);
+        };
+        let (Pack::Fp4(qe, qc), Some(row), Some(qv)) = (&dq.pack, &dq.row, &dq.qview) else {
+            return Ok(None);
+        };
+        let (rows, cols) = (t.shape[0], t.shape[1]);
+        let param = &self.prog.params[qv.param];
+        let bytes8 = |e: &IdxExpr| {
+            e.constant.rem_euclid(8) == 0 && e.terms.iter().all(|&(_, c)| c.rem_euclid(8) == 0)
+        };
+        if !self.d.wide_loads()
+            || t.dtype != DType::F16
+            || dq.group != 16
+            || !cols.is_multiple_of(16)
+            || *qc != cols / 2
+            || param.shape.len() != 2
+            || !param.shape[1].is_multiple_of(8)
+            || !qc.is_multiple_of(8)
+            || !bytes8(&qv.offset[1])
+        {
+            return Ok(None);
+        }
+        let ld = ld.unwrap_or(cols);
+        let per_row = cols / 16;
+        let q_at = at_index(qe, &format!("rr * {qc}u + c0 / 2u"));
+        let Some(lv) = lvalue(&q_at) else {
+            return Ok(None);
+        };
+        let load = self.d.vector_load("uint2", lv);
+        let scale = format!(
+            "{} * {} * 16384.0f",
+            at_index(&dq.s, "gi"),
+            at_index(row, "rr")
+        );
+        let threads = self.threads;
+        Ok(Some(vec![
+            format!(
+                "for (uint gi = tid; gi < {}u; gi += {threads}u) {{",
+                rows * per_row
+            ),
+            format!("    const uint rr = gi / {per_row}u, c0 = (gi % {per_row}u) * 16u;"),
+            format!("    const float sc = {scale};"),
+            format!("    const uint2 w = {load};"),
+            "    __half2 h[8];".to_string(),
+            "    for (uint b = 0; b < 8u; ++b) {".to_string(),
+            "        const float2 v = fp4_pair(((b < 4u ? w.x : w.y) >> (8u * (b & 3u))) & 0xFFu);"
+                .to_string(),
+            "        h[b] = __floats2half2_rn(v.x * sc, v.y * sc);".to_string(),
+            "    }".to_string(),
+            format!(
+                "    *reinterpret_cast<uint4*>(&{name}[rr * {ld}u + c0]) = *reinterpret_cast<uint4*>(&h[0]);"
+            ),
+            format!(
+                "    *reinterpret_cast<uint4*>(&{name}[rr * {ld}u + c0 + 8u]) = *reinterpret_cast<uint4*>(&h[4]);"
+            ),
+            "}".to_string(),
+        ]))
+    }
+
     fn declare_tg(&mut self, x: Var, ty: &TileTy) -> String {
         let name = v(x);
         let off = self.arena.next_multiple_of(self.tile_align);
@@ -1184,6 +1266,34 @@ impl Gen<'_> {
                     }
                 }
             }
+            Op::Stage(a, dt) => {
+                let x = dst.ok_or("stage without a result")?;
+                let from = self.arg_ty(*a)?;
+                if from.shape.len() != 2 {
+                    return Err("staging copies a 2-d tile".into());
+                }
+                let (rows, cols) = (from.shape[0], from.shape[1]);
+                let t = TileTy::new(*dt, &from.shape, Space::Threadgroup);
+                let name = self.declare_tg(x, &t);
+                let ld = self.padded.contains_key(&x).then(|| self.row_len(x, cols));
+                self.barrier();
+                if let Some(lines) = self.fp4_stage(a.var(), &name, &t, ld)? {
+                    for l in lines {
+                        self.line(&l);
+                    }
+                } else {
+                    let n = rows * cols;
+                    let ops = self.operands(&[*a], &[false], n)?;
+                    let val = Self::read(&ops[0].0, "e");
+                    let at = match ld {
+                        Some(ld) => format!("(e / {cols}u) * {ld}u + e % {cols}u"),
+                        None => "e".to_string(),
+                    };
+                    let st = self.d.scalar(*dt);
+                    self.every(n, &format!("{name}[{at}] = {st}({val});"));
+                }
+                self.barrier();
+            }
             Op::Mma(c, a, b) => {
                 let x = dst.ok_or("mma without a result")?;
                 let var = |a: &Arg| a.var();
@@ -1254,6 +1364,7 @@ impl Gen<'_> {
                         && std::env::var_os("LEX_NO_LAZY").is_none() =>
                     {
                         let e = format!("{st}({})", self.addr(view, AT)?);
+                        self.views.insert(x, view.clone());
                         self.locs.insert(x, Loc::Lazy(e, t.clone()));
                     }
                     _ => {
@@ -1407,6 +1518,7 @@ impl Gen<'_> {
                         } else {
                             Pack::None
                         },
+                        qview: None,
                     },
                 );
                 let e = format!("({qv} * {sv}{mv})");
@@ -1454,6 +1566,7 @@ impl Gen<'_> {
                         group: *group,
                         row: Some(ge.clone()),
                         pack: Pack::Fp4(qe.clone(), tq.shape[1]),
+                        qview: self.views.get(&q.var()).cloned(),
                     },
                 );
                 self.locs.insert(x, Loc::Lazy(e, reg(DType::F32, &[r, c])));
@@ -1485,6 +1598,7 @@ impl Gen<'_> {
                         group: *group,
                         row: None,
                         pack: Pack::Six(le.clone(), lc, he.clone(), hc),
+                        qview: None,
                     },
                 );
                 let e = format!("({qv} * {sv})");
@@ -1546,6 +1660,7 @@ impl Gen<'_> {
                         group: *group,
                         row: None,
                         pack: Pack::None,
+                        qview: None,
                     },
                 );
                 self.locs.insert(x, Loc::Lazy(e, reg(DType::F32, &[r, c])));

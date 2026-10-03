@@ -546,14 +546,15 @@ Read the diff before committing it.
   schedule block — rows per simdgroup, 1 on Apple and 2 on Ada — is still
   a constant in the target table.
 - **Matrix units for the kernels the model runs:** the IR has fragment
-  tiles and `mma` now, and an f16 GEMM written in `.lx` lowers to `wmma` and
-  `simdgroup_matrix`. The prefill GEMM the model uses (`lex_msl::gemm`,
-  NVFP4 weights), the causal attention (`lex_msl::attn`), the chunked
-  gated-delta rule (`lex_msl::delta`) and the int16 matvec
+  tiles and `mma`, and `gemm_fp4.lx` -- NVFP4 weights decoded into shared
+  memory, then multiplied -- lowers to `wmma` and `simdgroup_matrix` from
+  one source (`examples/lx_gemm_bench` compares it with the hand-scheduled
+  one). Whether it matches that kernel's speed has not been measured. The
+  GEMM's residual epilogue, the causal attention (`lex_msl::attn`), the
+  chunked gated-delta rule (`lex_msl::delta`) and the int16 matvec
   (`lex_msl::int8`) are still hand-scheduled kernels that take the same
-  parameters as the programs they stand in for: they need quantised
-  operands staged into shared memory, row-wise operations on fragments
-  (the online softmax) and an epilogue.
+  parameters as the programs they stand in for: they need an epilogue on
+  fragments and row-wise operations on them (the online softmax).
 - **Around the model:** the embedding lookup as a kernel (host glue
   today), and paged KV.
 - **Other parts of the design:** a graph compiler, MLIR.
