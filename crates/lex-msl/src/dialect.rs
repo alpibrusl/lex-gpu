@@ -567,7 +567,7 @@ impl Dialect for Cuda {
             format!("    h[b] = __floats2half2_rn(v.x * {sc}, v.y * {sc});"),
             "}".to_string(),
             format!("*reinterpret_cast<uint4*>(&{dst}) = *reinterpret_cast<uint4*>(&h[0]);"),
-            format!("*reinterpret_cast<uint4*>(&{dst}[8]) = *reinterpret_cast<uint4*>(&h[4]);"),
+            format!("*reinterpret_cast<uint4*>(&{dst} + 8) = *reinterpret_cast<uint4*>(&h[4]);"),
         ])
     }
 
