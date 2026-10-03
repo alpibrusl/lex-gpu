@@ -36,4 +36,4 @@ algo gemm_fp4(m, n, k)
 }
 
 schedule gemm_fp4 for nvidia-ada     { threads 256 warps 2 4 bm 128 bn 128 bk 64 }
-schedule gemm_fp4 for apple-m-series { threads 128 warps 2 2 bm 64 bn 64 bk 32 }
+schedule gemm_fp4 for apple-m-series { threads 256 warps 2 4 bm 64 bn 128 bk 32 }

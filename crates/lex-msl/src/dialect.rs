@@ -132,6 +132,27 @@ pub trait Dialect {
         None
     }
 
+    /// The vector a cooperative copy of `dtype` moves through, and how many
+    /// elements it holds: 16 bytes on CUDA (`uint4`), 8 on Metal (`half4`).
+    /// `None` leaves the element-at-a-time copy.
+    fn copy_vector(&self, dtype: DType) -> Option<(&'static str, usize)> {
+        let _ = dtype;
+        None
+    }
+
+    /// A store of the vector `value` to the threadgroup address of `lvalue`.
+    fn vector_store_shared(&self, ty: &str, lvalue: &str, value: &str) -> String {
+        format!("*({ty}*)(&{lvalue}) = {value};")
+    }
+
+    /// Lines decoding one group of sixteen NVFP4 codes -- `w`, a `uint2` of
+    /// eight bytes -- scaled by `sc` and storing sixteen halves from `dst`
+    /// (a threadgroup lvalue). `None` where the dialect has no such store.
+    fn fp4_group_store(&self, dst: &str, w: &str, sc: &str) -> Option<Vec<String>> {
+        let _ = (dst, w, sc);
+        None
+    }
+
     /// A threadgroup array whose address is a multiple of `align` bytes,
     /// for tiles a matrix unit loads fragments from.
     fn shared_array_aligned(&self, ty: &str, name: &str, len: usize, align: usize) -> String {
@@ -400,6 +421,28 @@ impl Dialect for Msl {
         Some(&Simdgroup)
     }
 
+    fn copy_vector(&self, dtype: DType) -> Option<(&'static str, usize)> {
+        (dtype == DType::F16).then_some(("half4", 4))
+    }
+
+    fn vector_store_shared(&self, ty: &str, lvalue: &str, value: &str) -> String {
+        format!("*(threadgroup {ty}*)(&{lvalue}) = {value};")
+    }
+
+    fn fp4_group_store(&self, dst: &str, w: &str, sc: &str) -> Option<Vec<String>> {
+        Some(vec![
+            format!("threadgroup half4* row = (threadgroup half4*)(&{dst});"),
+            "for (uint b = 0; b < 4u; ++b) {".to_string(),
+            format!("    const uint wv = (b < 2u ? {w}.x : {w}.y) >> ((b & 1u) * 16u);"),
+            "    const float2 lo = fp4_pair(wv & 0xFFu), hi = fp4_pair((wv >> 8u) & 0xFFu);"
+                .to_string(),
+            format!(
+                "    row[b] = half4(half(lo.x * {sc}), half(lo.y * {sc}), half(hi.x * {sc}), half(hi.y * {sc}));"
+            ),
+            "}".to_string(),
+        ])
+    }
+
     fn barrier(&self) -> String {
         "threadgroup_barrier(mem_flags::mem_threadgroup);".to_string()
     }
@@ -504,6 +547,28 @@ pub struct Cuda;
 impl Dialect for Cuda {
     fn matrix(&self) -> Option<&dyn Matrix> {
         Some(&Wmma)
+    }
+
+    fn copy_vector(&self, dtype: DType) -> Option<(&'static str, usize)> {
+        (dtype == DType::F16).then_some(("uint4", 8))
+    }
+
+    fn vector_store_shared(&self, ty: &str, lvalue: &str, value: &str) -> String {
+        format!("*reinterpret_cast<{ty}*>(&{lvalue}) = {value};")
+    }
+
+    fn fp4_group_store(&self, dst: &str, w: &str, sc: &str) -> Option<Vec<String>> {
+        Some(vec![
+            "__half2 h[8];".to_string(),
+            "for (uint b = 0; b < 8u; ++b) {".to_string(),
+            format!(
+                "    const float2 v = fp4_pair(((b < 4u ? {w}.x : {w}.y) >> (8u * (b & 3u))) & 0xFFu);"
+            ),
+            format!("    h[b] = __floats2half2_rn(v.x * {sc}, v.y * {sc});"),
+            "}".to_string(),
+            format!("*reinterpret_cast<uint4*>(&{dst}) = *reinterpret_cast<uint4*>(&h[0]);"),
+            format!("*reinterpret_cast<uint4*>(&{dst}[8]) = *reinterpret_cast<uint4*>(&h[4]);"),
+        ])
     }
 
     fn shared_array_aligned(&self, ty: &str, name: &str, len: usize, align: usize) -> String {

@@ -779,11 +779,14 @@ impl Gen<'_> {
         ld: Option<usize>,
     ) -> Result<Option<Vec<String>>, String> {
         let param = &self.prog.params[view.param];
-        let width = 16 / t.dtype.size_bytes();
-        if !self.d.wide_loads() || t.shape.len() != 2 || param.dtype != t.dtype {
+        let Some((ty, width)) = self.d.copy_vector(t.dtype) else {
+            return Ok(None);
+        };
+        if t.shape.len() != 2 || param.dtype != t.dtype {
             return Ok(None);
         }
         let (rows, cols) = (t.shape[0], t.shape[1]);
+        let ld = ld.unwrap_or(cols);
         let aligned = |e: &IdxExpr| {
             e.constant.rem_euclid(width as i64) == 0
                 && e.terms
@@ -792,22 +795,18 @@ impl Gen<'_> {
         };
         if param.shape.len() != 2
             || !cols.is_multiple_of(width)
+            || !ld.is_multiple_of(width)
             || !param.shape[1].is_multiple_of(width)
             || !aligned(&view.offset[1])
         {
             return Ok(None);
         }
-        let ld = ld.unwrap_or(cols);
         let per_row = cols / width;
-        let ty = match t.dtype.size_bytes() * width {
-            16 => "uint4",
-            _ => return Ok(None),
-        };
-        let src = self.addr(
-            view,
-            "(r * COLS + c)".replace("COLS", &cols.to_string()).as_str(),
-        )?;
+        let src = self.addr(view, &format!("(r * {cols}u + c)"))?;
         let load = self.d.vector_load(ty, &src);
+        let store = self
+            .d
+            .vector_store_shared(ty, &format!("{name}[r * {ld}u + c]"), &load);
         let threads = self.threads;
         Ok(Some(vec![
             format!(
@@ -815,15 +814,9 @@ impl Gen<'_> {
                 rows * per_row
             ),
             format!("    const uint r = e / {per_row}u, c = (e % {per_row}u) * {width}u;"),
-            format!("    *reinterpret_cast<{ty}*>(&{name}[r * {ld}u + c]) = {load};"),
+            format!("    {store}"),
             "}".to_string(),
         ]))
-    }
-
-    /// The row length of a shared tile in memory: its columns, and the
-    /// padding if it has any.
-    fn row_len(&self, x: Var, cols: usize) -> usize {
-        cols + self.padded.get(&x).copied().unwrap_or(0)
     }
 
     /// NVFP4 weights decoded straight into a shared f16 tile, a thread to a
@@ -853,10 +846,11 @@ impl Gen<'_> {
         let bytes8 = |e: &IdxExpr| {
             e.constant.rem_euclid(8) == 0 && e.terms.iter().all(|&(_, c)| c.rem_euclid(8) == 0)
         };
-        if !self.d.wide_loads()
-            || t.dtype != DType::F16
+        let ld = ld.unwrap_or(cols);
+        if t.dtype != DType::F16
             || dq.group != 16
             || !cols.is_multiple_of(16)
+            || !ld.is_multiple_of(8)
             || *qc != cols / 2
             || param.shape.len() != 2
             || !param.shape[1].is_multiple_of(8)
@@ -865,7 +859,6 @@ impl Gen<'_> {
         {
             return Ok(None);
         }
-        let ld = ld.unwrap_or(cols);
         let per_row = cols / 16;
         let q_at = at_index(qe, &format!("rr * {qc}u + c0 / 2u"));
         let Some(lv) = lvalue(&q_at) else {
@@ -877,8 +870,14 @@ impl Gen<'_> {
             at_index(&dq.s, "gi"),
             at_index(row, "rr")
         );
+        let Some(store) = self
+            .d
+            .fp4_group_store(&format!("{name}[rr * {ld}u + c0]"), "w", "sc")
+        else {
+            return Ok(None);
+        };
         let threads = self.threads;
-        Ok(Some(vec![
+        let mut lines = vec![
             format!(
                 "for (uint gi = tid; gi < {}u; gi += {threads}u) {{",
                 rows * per_row
@@ -886,20 +885,16 @@ impl Gen<'_> {
             format!("    const uint rr = gi / {per_row}u, c0 = (gi % {per_row}u) * 16u;"),
             format!("    const float sc = {scale};"),
             format!("    const uint2 w = {load};"),
-            "    __half2 h[8];".to_string(),
-            "    for (uint b = 0; b < 8u; ++b) {".to_string(),
-            "        const float2 v = fp4_pair(((b < 4u ? w.x : w.y) >> (8u * (b & 3u))) & 0xFFu);"
-                .to_string(),
-            "        h[b] = __floats2half2_rn(v.x * sc, v.y * sc);".to_string(),
-            "    }".to_string(),
-            format!(
-                "    *reinterpret_cast<uint4*>(&{name}[rr * {ld}u + c0]) = *reinterpret_cast<uint4*>(&h[0]);"
-            ),
-            format!(
-                "    *reinterpret_cast<uint4*>(&{name}[rr * {ld}u + c0 + 8u]) = *reinterpret_cast<uint4*>(&h[4]);"
-            ),
-            "}".to_string(),
-        ]))
+        ];
+        lines.extend(store.into_iter().map(|l| format!("    {l}")));
+        lines.push("}".to_string());
+        Ok(Some(lines))
+    }
+
+    /// The row length of a shared tile in memory: its columns, and the
+    /// padding if it has any.
+    fn row_len(&self, x: Var, cols: usize) -> usize {
+        cols + self.padded.get(&x).copied().unwrap_or(0)
     }
 
     fn declare_tg(&mut self, x: Var, ty: &TileTy) -> String {
