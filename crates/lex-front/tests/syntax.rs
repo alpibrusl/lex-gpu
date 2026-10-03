@@ -619,4 +619,12 @@ fn the_fp4_gemm_decodes_a_group_a_thread_on_cuda() {
         !l.source.contains("fp4_lane"),
         "fell back to the lane gather"
     );
+    // Both halves of a group are stored through a pointer: `[..][8]` on an
+    // element is not C++, and a source-text test cannot compile it, so the
+    // shape that broke once is named here (`scripts/cuda_check.sh` is the
+    // compile).
+    assert!(
+        !l.source.contains("][8]"),
+        "a group store indexes an element"
+    );
 }
