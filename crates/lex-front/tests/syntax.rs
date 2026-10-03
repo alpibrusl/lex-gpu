@@ -670,13 +670,13 @@ fn the_residual_epilogue_adds_the_stream_to_the_product() {
         let (mut with, mut without) = (mk(&r), mk(&vec![0.0; m * n]));
         run(&prog, &mut with).unwrap_or_else(|e| panic!("{}: {e:?}", target.name));
         run(&prog, &mut without).unwrap_or_else(|e| panic!("{}: {e:?}", target.name));
-        for i in 0..m * n {
+        for (i, &add) in r.iter().enumerate() {
             let got = (with[5].data[i] - without[5].data[i]) as f64;
             assert!(
-                (got - r[i] as f64).abs() < 1e-5,
+                (got - add as f64).abs() < 1e-5,
                 "{}: element {i} gained {got}, not {}",
                 target.name,
-                r[i]
+                add
             );
         }
     }
