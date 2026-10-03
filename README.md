@@ -45,10 +45,11 @@ mlx-lm decodes the same model at 29.5. How each number was measured, and
 what is being tried next, is in
 [`docs/roadmap-weeks.md`](docs/roadmap-weeks.md).
 
-Not done yet: the `.lx` surface syntax covers two kernels (everything the
-runtime runs is built through the Rust IR API, typed and checked), and the
-matrix-unit kernels are hand-scheduled rather than lowered. See
-[`docs/guide.md`](docs/guide.md#not-built-yet).
+The language is partly there: a kernel can be written in `.lx` (see
+[The language](#the-language)), and the NVFP4 prefill GEMM written that way
+runs the model on an M4 Max at the hand-written kernel's speed. Attention, the
+gated-delta rule and the matvecs are still built through the Rust IR API or
+hand-scheduled; see [`docs/guide.md`](docs/guide.md#not-built-yet).
 
 ## Quick start
 
@@ -75,13 +76,56 @@ GCP_PROJECT=<project> scripts/gcp/nvidia_test.sh         # the suite on an NVIDI
 More examples, benchmarks against PyTorch, and how to read the numbers:
 [`docs/guide.md`](docs/guide.md).
 
+## The language
+
+A kernel is an `algo` -- what it computes, over tiles, with no machine in it --
+and a `schedule` per target that says how big the pieces are and how the warps
+divide them. This is `crates/lex-front/lx/gemm_fp4.lx`, the matmul the model's
+prefill runs, with NVFP4 weights:
+
+```text
+algo gemm_fp4(m, n, k)
+  in  x:  f16[m, k]
+  in  wq: i8[n, k / 2]          // two 4-bit codes a byte
+  in  ws: i8[n, k / 16]         // an E4M3 scale per 16 values
+  in  wg: f32[n]                // a per-row scale
+  out y:  f32[m, n]
+  tile bm, bn, bk
+{
+  grid i over m / bm, j over n / bn
+  let acc = zeros f32[bm, bn] @frag                 // lives in matrix-unit fragments
+  let acc = for p in 0 .. k / bk with acc {         // the loop carries the tile
+    let xt = load x[i * bm, p * bk ; bm, bk] @shared
+    let q  = load wq[j * bn, p * (bk / 2) ; bn, bk / 2]
+    let s  = load ws[j * bn, p * (bk / 16) ; bn, bk / 16]
+    let g  = load wg[j * bn ; bn]
+    let wt = stage f16 (dequant_fp4 q s g 16)       // decoded into shared memory
+    yield mma acc xt wt
+  }
+  store acc -> y[i * bm, j * bn]
+}
+
+schedule gemm_fp4 for nvidia-ada     { threads 256 warps 2 4 bm 128 bn 128 bk 64 }
+schedule gemm_fp4 for apple-m-series { threads 256 warps 2 4 bm 64 bn 128 bk 32 }
+```
+
+```bash
+# check it, lower it for CUDA and Metal, and run it on the CPU interpreter
+cargo run -p lex-msl --example emit_lx -- crates/lex-front/lx/gemm_fp4.lx out/ m=128 n=128 k=64 --run
+scripts/cuda_check.sh out/*.cu                                       # nvcc + NVRTC, no GPU needed
+cargo run --release -p lex-rt --example lx_gemm_bench -- --tokens 512   # against the hand-written kernel (Metal or CUDA)
+LEX_GEMM_LX=1 cargo run --release -p lex-rt --example serve -- --model qwen3.8:27b-mlx   # the server, prefill from .lx
+```
+
+More kernels and how to write your own: [`docs/guide.md`](docs/guide.md#8-write-a-kernel-in-lx-any-host).
+
 ## Crates
 
 | Crate | What it is |
 | --- | --- |
 | `lex-ir` | Tile IR, target table (Apple, Hopper, Ada, CDNA3), planner, CPU reference |
 | `lex-front` | Typed tile programs and the `.lx` surface; the linearity, effect and pipe checker; reference interpreter |
-| `lex-msl` | Lowering to MSL and CUDA C; hand-scheduled GEMM, chunked gated-delta and int16 matvec kernels |
+| `lex-msl` | Lowering from `.lx` programs and schedules to MSL and CUDA C, matrix units included; still hand-scheduled: causal attention, chunked gated-delta, int16 matvec, and the GEMM the model ships |
 | `lex-metal` | Metal: compile, allocate, dispatch, time |
 | `lex-cuda` | CUDA: NVRTC and the driver API through `dlopen`, no link-time dependency on a driver |
 | `lex-rt` | Runtime: GGUF and safetensors, quantised formats, Llama and Qwen loops, speculation, tokenizer, server |

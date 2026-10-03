@@ -491,6 +491,91 @@ Qwen3.8-27B there — `ollama pull` refuses an MLX build on Linux, so
 which is a client-side check rather than a registry one and `lex-rt` reads
 the store without asking Ollama to run anything.
 
+### 8. Write a kernel in `.lx` (any host)
+
+A kernel is an `algo` and a `schedule` per target. The algorithm names no
+machine; the schedule is where a machine's numbers live. Everything below runs
+on a laptop with no GPU.
+
+```bash
+# What the files are
+ls crates/lex-front/lx
+```
+
+| File | What it shows |
+| --- | --- |
+| `rmsnorm.lx`, `silu_mul.lx` | straight-line tile code; `&x` borrows, `x` moves, and the checker counts both |
+| `gemm.lx` | `grid`, a `for` loop that carries a tile, windows at affine offsets, `matmul_nt`, `tile` extents set by the schedule |
+| `gemm_mma.lx` | the same on the matrix units: `@shared` operands, an `@frag` accumulator, `mma`, a `warps` grid |
+| `gemm_fp4.lx` | NVFP4 weights: `dequant_fp4`, `stage f16` into shared memory |
+| `gemm_fp4_res.lx` | the residual epilogue, `add_window` |
+
+Check one, lower it for every target it has a schedule for, and run it on the
+CPU interpreter over made-up inputs:
+
+```bash
+cargo run -p lex-msl --example emit_lx -- crates/lex-front/lx/rmsnorm.lx out/ n=4096 eps=0.00001 --run
+cargo run -p lex-msl --example emit_lx -- crates/lex-front/lx/gemm_fp4_res.lx out/ m=128 n=128 k=64 --run
+```
+
+`out/` now holds the CUDA C and Metal source it lowered to. A shape the
+schedule cannot tile is an error that says so (`m=64` against an Ada block of
+128 rows: "64 does not divide by 128").
+
+Compile the output the way the runtime will, still without a GPU:
+
+```bash
+scripts/cuda_check.sh out/*.cu                                  # nvcc and NVRTC in Docker: registers, spills, shared memory
+xcrun -sdk macosx metal -c out/*.metal -o /dev/null             # Metal, on a Mac
+```
+
+A first kernel of your own, in `scale.lx`:
+
+```text
+algo scale(n)
+  in  x: f32[1, n]
+  out y: f32[1, n]
+{
+  let v = load x
+  store v * 2 -> y
+}
+
+schedule scale for apple-m-series { threads 256 }
+schedule scale for nvidia-ada     { threads 256 }
+```
+
+```bash
+cargo run -p lex-msl --example emit_lx -- scale.lx out/ n=1024 --run
+```
+
+What the checker refuses is the point of having a language. Each of these is a
+test in `crates/lex-front/tests/syntax.rs`:
+
+- using a tile twice after it was moved (`x * x`), or a loop that spends its
+  accumulator twice;
+- elementwise arithmetic on a fragment tile (`acc * 2`): which lane holds
+  which element is the hardware's, so a fragment may only be accumulated into
+  with `mma`, extended with `add_window`, stored, or carried;
+- a schedule that leaves a `tile` extent unset, or sets one the algorithm did
+  not declare;
+- an `add_window` of the wrong dtype or shape.
+
+Compare a `.lx` kernel with the hand-written one on whichever device you have,
+and try a schedule without editing the file:
+
+```bash
+cargo run --release -p lex-rt --example lx_gemm_bench -- --tokens 512
+cargo run --release -p lex-rt --example lx_gemm_bench -- --tokens 512 --sched bn=128,warps=2x4,threads=256,pad=8
+```
+
+Run the model's prefill GEMMs from `.lx` instead (opt-in; the hand-written
+kernel ships):
+
+```bash
+LEX_GEMM_LX=1 LEX_GEMM_LX_TRACE=1 cargo run --release -p lex-rt --example serve -- --model qwen3.8:27b-mlx
+LEX_GEMM_LX=1 cargo test --release -p lex-rt --test qwen_golden
+```
+
 ## Layering
 
 ```text
@@ -534,27 +619,31 @@ Read the diff before committing it.
 
 ## Not built yet
 
-- **Layouts in the type:** no swizzle or MMA-fragment layouts are checked yet.
-- **Most of the surface syntax:** `.lx` parses algorithms, elementwise and
-  reduction ops, `grid` axes, loops that carry a tile, windows at affine
-  offsets, `matmul_nt`, and schedules with `threads`, `chunk` and the
-  algorithm's `tile` extents — enough for `rmsnorm`, `silu_mul`, a tiled
-  `gemm` and `gemm_mma`, which runs on the matrix units (`@shared`/`@frag`
-  tiles, `mma`, a `warps` grid in the schedule; `crates/lex-front/lx`).
-  The matvec, attention and the gated-delta recurrence are still built
-  through the Rust IR API. The measurement that most wants a
-  schedule block — rows per simdgroup, 1 on Apple and 2 on Ada — is still
-  a constant in the target table.
-- **Matrix units for the kernels the model runs:** the IR has fragment
-  tiles and `mma`, and `gemm_fp4.lx` -- NVFP4 weights decoded into shared
-  memory, then multiplied -- lowers to `wmma` and `simdgroup_matrix` from
-  one source (`examples/lx_gemm_bench` compares it with the hand-scheduled
-  one). Whether it matches that kernel's speed has not been measured. The
-  GEMM's residual epilogue, the causal attention (`lex_msl::attn`), the
-  chunked gated-delta rule (`lex_msl::delta`) and the int16 matvec
-  (`lex_msl::int8`) are still hand-scheduled kernels that take the same
-  parameters as the programs they stand in for: they need an epilogue on
-  fragments and row-wise operations on them (the online softmax).
+- **Layouts in the type:** shared tiles read by a matrix unit get a padded row
+  (`pad` in the schedule) but no swizzle algebra: a layout is a number, not a
+  value the checker can compare.
+- **More of the surface:** `.lx` has algorithms, elementwise and reduction
+  ops, `grid` axes, loops that carry one tile, windows at affine offsets,
+  `matmul_nt`, fragment tiles with `mma` and an `add_window` epilogue,
+  `dequant_fp4` and `stage`, and schedules with `threads`, `warps`, `pad`,
+  `chunk` and the algorithm's `tile` extents. That is enough for `rmsnorm`,
+  `silu_mul`, `gemm`, `gemm_mma`, `gemm_fp4` and `gemm_fp4_res`
+  (`crates/lex-front/lx`). Not yet: more than one carried tile, row-wise
+  operations on fragments (the online softmax), software pipelining of the
+  copies, other quantised formats staged into shared memory, and `?` tile
+  extents for an autotuner. The measurement that most wants a schedule
+  block -- rows per simdgroup, 1 on Apple and 2 on Ada -- is still a
+  constant in the target table.
+- **The kernels the model runs:** the prefill GEMM written in `.lx` matches
+  the hand-scheduled one on an M4 Max (`examples/lx_gemm_bench`: 11.6 against
+  11.7 TFLOPS at 512 tokens, bit-identical output, residual shapes included),
+  the Qwen goldens pass with it (`LEX_GEMM_LX=1`), and it is opt-in. On CUDA
+  it compiles (nvcc and NVRTC) but has not run on a device; below 128 tokens
+  on Metal it is 1.1-1.5x slower (no software pipelining of the copies).
+  Causal attention (`lex_msl::attn`), the chunked gated-delta rule
+  (`lex_msl::delta`) and the int16 matvec (`lex_msl::int8`) are still
+  hand-scheduled kernels that take the same parameters as the programs they
+  stand in for.
 - **Around the model:** the embedding lookup as a kernel (host glue
   today), and paged KV.
 - **Other parts of the design:** a graph compiler, MLIR.
