@@ -482,6 +482,48 @@ impl Interp<'_> {
                 None
             }
             Op::Dup(a) => Some(Val::Tile(self.arg(*a)?)),
+            Op::AddWindow(a, view) => {
+                let t = self.arg(*a)?;
+                let off = self.offsets(view)?;
+                let w = self.read_global(
+                    view.param,
+                    &off,
+                    &TileTy::new(DType::F32, &view.shape, lex_ir::Space::Reg),
+                );
+                let data = t.data.iter().zip(&w.data).map(|(&x, &y)| x + y).collect();
+                Some(Val::Tile(Tile {
+                    ty: t.ty.clone(),
+                    data,
+                    init: true,
+                }))
+            }
+            Op::Stage(a, dt) => {
+                let t = self.arg(*a)?;
+                Some(Val::Tile(Tile {
+                    ty: TileTy::new(*dt, &t.ty.shape, lex_ir::Space::Threadgroup),
+                    data: t.data.iter().map(|&x| round(*dt, x)).collect(),
+                    init: true,
+                }))
+            }
+            Op::Mma(c, a, b) => {
+                // The same arithmetic as `matmul_nt` added into `c`: a
+                // fragment is a tile here, because the interpreter has no
+                // lanes to lay it out across.
+                let (tc, ta, tb) = (self.arg(*c)?, self.arg(*a)?, self.arg(*b)?);
+                let (m, k) = (ta.ty.shape[0], ta.ty.shape[1]);
+                let n = tb.ty.shape[0];
+                let mut out = tc.data.clone();
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut s = 0.0f32;
+                        for p in 0..k {
+                            s += ta.data[i * k + p] * tb.data[j * k + p];
+                        }
+                        out[i * n + j] += s;
+                    }
+                }
+                Some(Val::Tile(self.fresh(tc.ty.dtype, &[m, n], out)))
+            }
             Op::MatMulNT(a, b, acc) | Op::MatMul(a, b, acc) => {
                 let (ta, tb) = (self.arg(*a)?, self.arg(*b)?);
                 let (m, k) = (ta.ty.shape[0], ta.ty.shape[1]);

@@ -2561,7 +2561,17 @@ mod gpu {
                             residual: res,
                             x_half: xt == DType::F16,
                         };
-                        let l = gemm_nvfp4(&g, crate::dev::gemm_backend())?;
+                        let backend = crate::dev::gemm_backend();
+                        // `LEX_GEMM_LX=1`: the same matmul from `.lx` source.
+                        let from_lx = if crate::lx_kernels::enabled() {
+                            crate::lx_kernels::gemm(t, n_out, n_in, res, xt == DType::F16, backend)?
+                        } else {
+                            None
+                        };
+                        let l = match from_lx {
+                            Some(l) => l,
+                            None => gemm_nvfp4(&g, backend)?,
+                        };
                         slot.insert(gpu.build_lowered(&l)?);
                         continue;
                     }

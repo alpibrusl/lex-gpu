@@ -126,6 +126,40 @@ pub trait Dialect {
         usize::MAX
     }
 
+    /// The matrix unit this target spells, if the dialect has one: what
+    /// `Space::Frag` tiles and `mma` lower to.
+    fn matrix(&self) -> Option<&dyn Matrix> {
+        None
+    }
+
+    /// The vector a cooperative copy of `dtype` moves through, and how many
+    /// elements it holds: 16 bytes on CUDA (`uint4`), 8 on Metal (`half4`).
+    /// `None` leaves the element-at-a-time copy.
+    fn copy_vector(&self, dtype: DType) -> Option<(&'static str, usize)> {
+        let _ = dtype;
+        None
+    }
+
+    /// A store of the vector `value` to the threadgroup address of `lvalue`.
+    fn vector_store_shared(&self, ty: &str, lvalue: &str, value: &str) -> String {
+        format!("*({ty}*)(&{lvalue}) = {value};")
+    }
+
+    /// Lines decoding one group of sixteen NVFP4 codes -- `w`, a `uint2` of
+    /// eight bytes -- scaled by `sc` and storing sixteen halves from `dst`
+    /// (a threadgroup lvalue). `None` where the dialect has no such store.
+    fn fp4_group_store(&self, dst: &str, w: &str, sc: &str) -> Option<Vec<String>> {
+        let _ = (dst, w, sc);
+        None
+    }
+
+    /// A threadgroup array whose address is a multiple of `align` bytes,
+    /// for tiles a matrix unit loads fragments from.
+    fn shared_array_aligned(&self, ty: &str, name: &str, len: usize, align: usize) -> String {
+        let _ = align;
+        self.shared_array(ty, name, len)
+    }
+
     /// Whether a lane's run of consecutive loads is spelled as explicit
     /// wide loads (`uint2`, `float4`) rather than left for the compiler to
     /// merge.
@@ -187,11 +221,260 @@ pub trait Dialect {
     fn entry(&self, name: &str, params: &[Param<'_>], scalars: bool, gid2: bool) -> String;
 }
 
+/// How a target's matrix unit is spelled.
+///
+/// The atom is the one thing the hardware fixes: a warp multiplies 16x16x16
+/// on CUDA (`wmma`, f16 in, f32 out) and a simdgroup 8x8x8 on Apple. A
+/// program names neither -- it says `mma` over tiles, and the schedule's warp
+/// grid says how many atoms each warp owns -- so the same `.lx` lowers to
+/// both, and what differs is only here.
+pub trait Matrix {
+    /// Edge of the square atom.
+    fn atom(&self) -> usize;
+
+    /// Appended to the preamble of a kernel that uses fragments.
+    fn includes(&self) -> &'static str;
+
+    /// `fm x fnn` f32 accumulators named `name`.
+    fn decl(&self, name: &str, fm: usize, fnn: usize) -> String;
+
+    /// Set one accumulator to `val`.
+    fn fill(&self, frag: &str, val: &str) -> String;
+
+    /// Lines adding `a b^T` over the inner dimension into the accumulators
+    /// `c[fm][fnn]`: `a` and `b` are f16 tiles in threadgroup memory,
+    /// row-major, and `k = (inner, row length of a, row length of b)` -- the
+    /// row lengths exceed the inner dimension when the tiles are padded. This
+    /// warp's accumulators sit at row `a_row` of `a` and row `b_row` of `b`.
+    #[allow(clippy::too_many_arguments)]
+    fn mma(
+        &self,
+        c: &str,
+        a: &str,
+        b: &str,
+        k: (usize, usize, usize),
+        fm: usize,
+        fnn: usize,
+        a_row: &str,
+        b_row: &str,
+    ) -> Vec<String>;
+
+    /// Store one accumulator to the address `ptr`, rows `ldm` apart.
+    fn store(&self, frag: &str, ptr: &str, ldm: usize) -> String;
+
+    /// Lines adding the f32 tile at the address `ptr`, rows `ldm` apart,
+    /// into the accumulator `frag`: the tile is loaded as a fragment of the
+    /// same layout and the two are added, so no lane's element is named.
+    fn add_loaded(&self, frag: &str, ptr: &str, ldm: usize) -> Vec<String>;
+
+    /// Elements a global store's address must be a multiple of.
+    fn store_align(&self) -> usize;
+
+    /// Elements of padding after each row of a shared f16 tile read by
+    /// fragments, so the rows of a fragment load fall in different banks.
+    /// 8 halves is 16 bytes, which keeps `wmma`'s alignment and shifts each
+    /// row by four banks; measured on an L4 against none, it is the
+    /// difference between conflicted and clean loads (the hand-written
+    /// GEMM's `bk + 8`). Not yet measured on Apple, so none.
+    fn default_pad(&self) -> usize;
+}
+
+/// CUDA `wmma`: 16x16x16, f16 in and f32 accumulating.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Wmma;
+
+impl Matrix for Wmma {
+    fn atom(&self) -> usize {
+        16
+    }
+
+    fn includes(&self) -> &'static str {
+        "#include <mma.h>\n\n"
+    }
+
+    fn decl(&self, name: &str, fm: usize, fnn: usize) -> String {
+        format!(
+            "nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> {name}[{fm}][{fnn}];"
+        )
+    }
+
+    fn fill(&self, frag: &str, val: &str) -> String {
+        format!("nvcuda::wmma::fill_fragment({frag}, {val});")
+    }
+
+    fn mma(
+        &self,
+        c: &str,
+        a: &str,
+        b: &str,
+        (k, lda, ldb): (usize, usize, usize),
+        fm: usize,
+        fnn: usize,
+        a_row: &str,
+        b_row: &str,
+    ) -> Vec<String> {
+        vec![
+            "{".into(),
+            format!(
+                "    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> fa[{fm}];"
+            ),
+            format!(
+                "    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> fb[{fnn}];"
+            ),
+            format!("    for (uint kk = 0; kk < {k}u; kk += 16u) {{"),
+            format!(
+                "        for (uint i = 0; i < {fm}u; ++i) nvcuda::wmma::load_matrix_sync(fa[i], {a} + ({a_row} + i * 16u) * {lda}u + kk, {lda}u);"
+            ),
+            format!(
+                "        for (uint j = 0; j < {fnn}u; ++j) nvcuda::wmma::load_matrix_sync(fb[j], {b} + ({b_row} + j * 16u) * {ldb}u + kk, {ldb}u);"
+            ),
+            format!("        for (uint i = 0; i < {fm}u; ++i)"),
+            format!(
+                "            for (uint j = 0; j < {fnn}u; ++j) nvcuda::wmma::mma_sync({c}[i][j], fa[i], fb[j], {c}[i][j]);"
+            ),
+            "    }".into(),
+            "}".into(),
+        ]
+    }
+
+    fn store(&self, frag: &str, ptr: &str, ldm: usize) -> String {
+        format!(
+            "nvcuda::wmma::store_matrix_sync({ptr}, {frag}, {ldm}u, nvcuda::wmma::mem_row_major);"
+        )
+    }
+
+    fn add_loaded(&self, frag: &str, ptr: &str, ldm: usize) -> Vec<String> {
+        vec![
+            "{".into(),
+            "    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> rf;".into(),
+            format!(
+                "    nvcuda::wmma::load_matrix_sync(rf, {ptr}, {ldm}u, nvcuda::wmma::mem_row_major);"
+            ),
+            format!("    for (int t = 0; t < rf.num_elements; ++t) {frag}.x[t] += rf.x[t];"),
+            "}".into(),
+        ]
+    }
+
+    fn store_align(&self) -> usize {
+        // A 256-bit aligned address, in f32 elements.
+        8
+    }
+
+    fn default_pad(&self) -> usize {
+        8
+    }
+}
+
+/// Metal `simdgroup_matrix`: 8x8x8, f16 in and f32 accumulating.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Simdgroup;
+
+impl Matrix for Simdgroup {
+    fn atom(&self) -> usize {
+        8
+    }
+
+    fn includes(&self) -> &'static str {
+        "#include <metal_simdgroup_matrix>\n\n"
+    }
+
+    fn decl(&self, name: &str, fm: usize, fnn: usize) -> String {
+        format!("simdgroup_matrix<float, 8, 8> {name}[{fm}][{fnn}];")
+    }
+
+    fn fill(&self, frag: &str, val: &str) -> String {
+        format!("{frag} = simdgroup_matrix<float, 8, 8>({val});")
+    }
+
+    fn mma(
+        &self,
+        c: &str,
+        a: &str,
+        b: &str,
+        (k, lda, ldb): (usize, usize, usize),
+        fm: usize,
+        fnn: usize,
+        a_row: &str,
+        b_row: &str,
+    ) -> Vec<String> {
+        vec![
+            "{".into(),
+            format!("    simdgroup_matrix<half, 8, 8> fa[{fm}], fb[{fnn}];"),
+            format!("    for (uint kk = 0; kk < {k}u; kk += 8u) {{"),
+            format!(
+                "        for (uint i = 0; i < {fm}u; ++i) simdgroup_load(fa[i], {a} + ({a_row} + i * 8u) * {lda}u + kk, {lda}u);"
+            ),
+            format!(
+                "        for (uint j = 0; j < {fnn}u; ++j) simdgroup_load(fb[j], {b} + ({b_row} + j * 8u) * {ldb}u + kk, {ldb}u, ulong2(0, 0), true);"
+            ),
+            format!("        for (uint i = 0; i < {fm}u; ++i)"),
+            format!(
+                "            for (uint j = 0; j < {fnn}u; ++j) simdgroup_multiply_accumulate({c}[i][j], fa[i], fb[j], {c}[i][j]);"
+            ),
+            "    }".into(),
+            "}".into(),
+        ]
+    }
+
+    fn store(&self, frag: &str, ptr: &str, ldm: usize) -> String {
+        format!("simdgroup_store({frag}, {ptr}, {ldm}u);")
+    }
+
+    fn add_loaded(&self, frag: &str, ptr: &str, ldm: usize) -> Vec<String> {
+        // The identity times the loaded tile, added into the accumulator by
+        // the matrix unit: exact (a product with one and zero), and no
+        // element of a fragment is named.
+        vec![
+            "{".into(),
+            "    simdgroup_matrix<float, 8, 8> rf;".into(),
+            format!("    simdgroup_load(rf, {ptr}, {ldm}u);"),
+            format!(
+                "    simdgroup_multiply_accumulate({frag}, simdgroup_matrix<float, 8, 8>(1.0f), rf, {frag});"
+            ),
+            "}".into(),
+        ]
+    }
+
+    fn store_align(&self) -> usize {
+        1
+    }
+
+    fn default_pad(&self) -> usize {
+        0
+    }
+}
+
 /// Metal Shading Language.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Msl;
 
 impl Dialect for Msl {
+    fn matrix(&self) -> Option<&dyn Matrix> {
+        Some(&Simdgroup)
+    }
+
+    fn copy_vector(&self, dtype: DType) -> Option<(&'static str, usize)> {
+        (dtype == DType::F16).then_some(("half4", 4))
+    }
+
+    fn vector_store_shared(&self, ty: &str, lvalue: &str, value: &str) -> String {
+        format!("*(threadgroup {ty}*)(&{lvalue}) = {value};")
+    }
+
+    fn fp4_group_store(&self, dst: &str, w: &str, sc: &str) -> Option<Vec<String>> {
+        Some(vec![
+            format!("threadgroup half4* row = (threadgroup half4*)(&{dst});"),
+            "for (uint b = 0; b < 4u; ++b) {".to_string(),
+            format!("    const uint wv = (b < 2u ? {w}.x : {w}.y) >> ((b & 1u) * 16u);"),
+            "    const float2 lo = fp4_pair(wv & 0xFFu), hi = fp4_pair((wv >> 8u) & 0xFFu);"
+                .to_string(),
+            format!(
+                "    row[b] = half4(half(lo.x * {sc}), half(lo.y * {sc}), half(hi.x * {sc}), half(hi.y * {sc}));"
+            ),
+            "}".to_string(),
+        ])
+    }
+
     fn barrier(&self) -> String {
         "threadgroup_barrier(mem_flags::mem_threadgroup);".to_string()
     }
@@ -294,6 +577,36 @@ impl Dialect for Msl {
 pub struct Cuda;
 
 impl Dialect for Cuda {
+    fn matrix(&self) -> Option<&dyn Matrix> {
+        Some(&Wmma)
+    }
+
+    fn copy_vector(&self, dtype: DType) -> Option<(&'static str, usize)> {
+        (dtype == DType::F16).then_some(("uint4", 8))
+    }
+
+    fn vector_store_shared(&self, ty: &str, lvalue: &str, value: &str) -> String {
+        format!("*reinterpret_cast<{ty}*>(&{lvalue}) = {value};")
+    }
+
+    fn fp4_group_store(&self, dst: &str, w: &str, sc: &str) -> Option<Vec<String>> {
+        Some(vec![
+            "__half2 h[8];".to_string(),
+            "for (uint b = 0; b < 8u; ++b) {".to_string(),
+            format!(
+                "    const float2 v = fp4_pair(((b < 4u ? {w}.x : {w}.y) >> (8u * (b & 3u))) & 0xFFu);"
+            ),
+            format!("    h[b] = __floats2half2_rn(v.x * {sc}, v.y * {sc});"),
+            "}".to_string(),
+            format!("*reinterpret_cast<uint4*>(&{dst}) = *reinterpret_cast<uint4*>(&h[0]);"),
+            format!("*reinterpret_cast<uint4*>(&{dst} + 8) = *reinterpret_cast<uint4*>(&h[4]);"),
+        ])
+    }
+
+    fn shared_array_aligned(&self, ty: &str, name: &str, len: usize, align: usize) -> String {
+        format!("__shared__ __align__({align}) {ty} {name}[{len}];")
+    }
+
     fn barrier(&self) -> String {
         "__syncthreads();".to_string()
     }

@@ -107,6 +107,16 @@ pub enum Space {
     /// Per-thread registers, distributed across the threadgroup. Not budgeted
     /// yet: register pressure is an occupancy question for P3's cost model.
     Reg,
+    /// An accumulator held in matrix-unit fragments (CUDA `wmma`, Metal
+    /// `simdgroup_matrix`), split across the warps of the threadgroup by the
+    /// schedule's warp grid.
+    ///
+    /// Unlike a `Reg` tile its elements have no flat numbering a program can
+    /// index: which lane holds which element is the hardware's layout. So
+    /// what a program may do with one is short -- start it (`fill`), add a
+    /// product into it (`mma`), carry it through a loop, store it -- and the
+    /// checker refuses the rest instead of guessing a layout for it.
+    Frag,
 }
 
 /// How a kernel parameter is used. Enough, for now, to emit `const` correctly

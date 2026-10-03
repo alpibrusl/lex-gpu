@@ -358,7 +358,26 @@ impl Checker<'_> {
         Some(out.into_iter().map(|t| t.expect("typed")).collect())
     }
 
+    /// A tile that is not a fragment: what every elementwise and
+    /// reduction op takes. A fragment's elements have no numbering a
+    /// program can use, so only `mma`, `store` and loop carries accept one
+    /// ([`Checker::tile_any`]).
     fn tile(&mut self, ty: Ty, what: &str) -> Option<TileTy> {
+        let t = self.tile_any(ty, what)?;
+        if t.space == Space::Frag {
+            self.err(
+                Kind::Type,
+                format!(
+                    "{what} is a matrix fragment; it can be accumulated into with `mma`, \
+                     stored, or carried through a loop, and nothing else"
+                ),
+            );
+            return None;
+        }
+        Some(t)
+    }
+
+    fn tile_any(&mut self, ty: Ty, what: &str) -> Option<TileTy> {
         match ty {
             Ty::Tile(t) => Some(t),
             Ty::Future(_) => {
@@ -527,6 +546,14 @@ impl Checker<'_> {
                     self.err(Kind::Type, "tiles live in threadgroup or registers".into());
                     return None;
                 }
+                if t.space == Space::Frag && matches!(op, Op::Alloc(_)) {
+                    self.err(
+                        Kind::Type,
+                        "a fragment tile starts from `fill`: nothing may read an uninitialised one"
+                            .into(),
+                    );
+                    return None;
+                }
                 Some(Ty::Tile(t.clone()))
             }
             Op::Load(view, t) => {
@@ -582,7 +609,7 @@ impl Checker<'_> {
             Op::Store(a, view) => {
                 let (dt, shape) = self.view(view, true)?;
                 let ty = self.args(&[*a])?.remove(0);
-                let t = self.tile(ty, "stored value")?;
+                let t = self.tile_any(ty, "stored value")?;
                 // A view's unit dimensions are squeezed: a `[n]` tile stores
                 // into a `[n, 1]` column as well as a `[1, n]` row.
                 let squeeze =
@@ -632,6 +659,78 @@ impl Checker<'_> {
                 let t = self.tile(ty, "dup operand")?;
                 self.report.dups += 1;
                 Some(Ty::Tile(t))
+            }
+            Op::AddWindow(a, view) => {
+                let (dt, shape) = self.view(view, false)?;
+                let ty = self.args(&[*a])?.remove(0);
+                let t = self.tile_any(ty, "accumulator")?;
+                if t.space != Space::Frag || t.dtype != DType::F32 || dt != DType::F32 {
+                    self.err(
+                        Kind::Type,
+                        format!(
+                            "add_window adds an f32 window into an f32 fragment tile, found \
+                             {dt:?} into {:?} in {:?}",
+                            t.dtype, t.space
+                        ),
+                    );
+                    return None;
+                }
+                if shape != t.shape {
+                    self.err(
+                        Kind::Shape,
+                        format!("window of {shape:?} added into a {:?} tile", t.shape),
+                    );
+                    return None;
+                }
+                Some(Ty::Tile(t))
+            }
+            Op::Stage(a, dt) => {
+                let ty = self.args(&[*a])?.remove(0);
+                let t = self.tile(ty, "staged tile")?;
+                if !self.numeric(&t, "staged tile") {
+                    return None;
+                }
+                Some(Ty::Tile(TileTy::new(*dt, &t.shape, Space::Threadgroup)))
+            }
+            Op::Mma(c, a, b) => {
+                let tys = self.args(&[*c, *a, *b])?;
+                let tc = self.tile_any(tys[0].clone(), "mma accumulator")?;
+                let ta = self.tile(tys[1].clone(), "mma lhs")?;
+                let tb = self.tile(tys[2].clone(), "mma rhs")?;
+                if tc.space != Space::Frag || tc.dtype != DType::F32 {
+                    self.err(
+                        Kind::Type,
+                        format!(
+                            "mma accumulates into an f32 fragment tile, found {:?} in {:?}",
+                            tc.dtype, tc.space
+                        ),
+                    );
+                    return None;
+                }
+                for (t, what) in [(&ta, "lhs"), (&tb, "rhs")] {
+                    if t.space != Space::Threadgroup || t.dtype != DType::F16 || t.shape.len() != 2
+                    {
+                        self.err(
+                            Kind::Type,
+                            format!(
+                                "mma {what} is a 2-d f16 tile in threadgroup memory, found {:?}{:?} in {:?}",
+                                t.dtype, t.shape, t.space
+                            ),
+                        );
+                        return None;
+                    }
+                }
+                if tc.shape != [ta.shape[0], tb.shape[0]] || ta.shape[1] != tb.shape[1] {
+                    self.err(
+                        Kind::Shape,
+                        format!(
+                            "mma of {:?} x {:?}^T into {:?}",
+                            ta.shape, tb.shape, tc.shape
+                        ),
+                    );
+                    return None;
+                }
+                Some(Ty::Tile(tc))
             }
             Op::MatMulNT(a, b, acc) | Op::MatMul(a, b, acc) => {
                 let tys = self.args(&[*a, *b])?;

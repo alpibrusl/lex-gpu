@@ -1,0 +1,35 @@
+// y = x w^T + r with NVFP4 weights: `gemm_fp4.lx` with the residual stream
+// added on the way out, as the model's `down` and `out_proj` matmuls do.
+//
+// `add_window` adds the accumulator-shaped window of `r` into the fragment
+// tile in place. The window is loaded as a fragment of the same layout and
+// added, so the program never names which lane holds which element -- the
+// reason a fragment tile can have an epilogue at all while refusing every
+// other elementwise op.
+
+algo gemm_fp4_res(m, n, k)
+  in  x:  f16[m, k]
+  in  wq: i8[n, k / 2]
+  in  ws: i8[n, k / 16]
+  in  wg: f32[n]
+  in  r:  f32[m, n]
+  out y:  f32[m, n]
+  tile bm, bn, bk
+{
+  grid i over m / bm, j over n / bn
+  let acc = zeros f32[bm, bn] @frag
+  let acc = for p in 0 .. k / bk with acc {
+    let xt = load x[i * bm, p * bk ; bm, bk] @shared
+    let q  = load wq[j * bn, p * (bk / 2) ; bn, bk / 2]
+    let s  = load ws[j * bn, p * (bk / 16) ; bn, bk / 16]
+    let g  = load wg[j * bn ; bn]
+    let w  = dequant_fp4 q s g 16
+    let wt = stage f16 w
+    yield mma acc xt wt
+  }
+  let acc = add_window acc r[i * bm, j * bn]
+  store acc -> y[i * bm, j * bn]
+}
+
+schedule gemm_fp4_res for nvidia-ada     { threads 256 warps 2 4 bm 128 bn 128 bk 64 }
+schedule gemm_fp4_res for apple-m-series { threads 256 warps 2 4 bm 64 bn 128 bk 32 }

@@ -1,0 +1,34 @@
+// y = a w^T on the matrix units.
+//
+// The same algorithm as `gemm.lx` -- a loop over the inner dimension adding a
+// product into an accumulator -- with three things said about where tiles
+// live. `@shared` puts the two operand windows in threadgroup memory, where a
+// matrix unit reads them; `@frag` makes the accumulator a matrix-unit
+// fragment tile, which the checker lets nothing touch but `mma`, a store and
+// the loop's carry; `mma acc at wt` is `acc + at wt^T`, in place.
+//
+// What a machine decides stays in the schedules: the extent of a block of y
+// (`bm`, `bn`), how much of the inner dimension a step takes (`bk`), and how
+// the threadgroup's warps divide the block (`warps rows cols`). Nothing here
+// names an atom -- 16x16x16 `wmma` on CUDA, 8x8 `simdgroup_matrix` on Apple
+// -- because the dialect knows that, and a block that does not split into
+// whole atoms is a lowering error, not a wrong answer.
+
+algo gemm_mma(m, n, k)
+  in  a: f16[m, k]
+  in  w: f16[n, k]
+  out y: f32[m, n]
+  tile bm, bn, bk
+{
+  grid i over m / bm, j over n / bn
+  let acc = zeros f32[bm, bn] @frag
+  let acc = for p in 0 .. k / bk with acc {
+    let at = load a[i * bm, p * bk ; bm, bk] @shared
+    let wt = load w[j * bn, p * bk ; bn, bk] @shared
+    yield mma acc at wt
+  }
+  store acc -> y[i * bm, j * bn]
+}
+
+schedule gemm_mma for nvidia-ada     { threads 256 warps 2 4 bm 128 bn 128 bk 64 }
+schedule gemm_mma for apple-m-series { threads 128 warps 2 2 bm 64 bn 64 bk 32 }
