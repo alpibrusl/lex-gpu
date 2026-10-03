@@ -692,3 +692,34 @@ fn a_residual_must_match_the_accumulator_and_be_f32() {
     let err = lex_front::check(&prog, &lex_ir::Target::nvidia_ada()).unwrap_err();
     assert!(err.iter().any(|d| d.msg.contains("add_window")), "{err:#?}");
 }
+
+/// The `.lx` the README shows is the file `gemm_fp4.lx` says, so the quick
+/// start cannot drift from what parses: the README block must parse, check
+/// and lower like the shipped file, for both targets.
+#[test]
+fn the_readme_example_is_a_working_kernel() {
+    let readme = include_str!("../../../README.md");
+    let start = readme
+        .find("```text\nalgo gemm_fp4")
+        .expect("the README example")
+        + 8;
+    let block = &readme[start..start + readme[start..].find("```").expect("closing fence")];
+    // The README annotates lines with `//` comments; the parser skips them.
+    let shown = syntax::parse(block).unwrap_or_else(|e| panic!("the README example: {e}"));
+    let shipped = syntax::parse(GEMM_FP4).expect("the shipped file");
+    for target in [
+        lex_ir::Target::nvidia_ada(),
+        lex_ir::Target::apple_m_series(),
+    ] {
+        let args = [("m", 128.0), ("n", 128.0), ("k", 64.0)];
+        let (a, _) = shown
+            .compile(target.name, &args)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (b, _) = shipped.compile(target.name, &args).expect("shipped");
+        lex_front::check(&a, &target).unwrap_or_else(|e| panic!("{}: {e:#?}", target.name));
+        // Same operations: the README writes `stage f16 (dequant_fp4 ...)` in
+        // one line where the file names the intermediate.
+        let ops = |p: &lex_front::Program| lex_front::print::program(p).matches("mma").count();
+        assert_eq!(ops(&a), ops(&b), "{}", target.name);
+    }
+}
