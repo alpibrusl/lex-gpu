@@ -536,9 +536,11 @@ Read the diff before committing it.
 
 - **Layouts in the type:** no swizzle or MMA-fragment layouts are checked yet.
 - **Most of the surface syntax:** `.lx` parses algorithms, elementwise and
-  reduction ops, and schedules with `threads` and `chunk` — enough for
-  `rmsnorm` and `silu_mul`. Loops, index arithmetic and layouts are not
-  parsed, so the matvec, attention and the gated-delta recurrence are
+  reduction ops, `grid` axes, loops that carry a tile, windows at affine
+  offsets, `matmul_nt`, and schedules with `threads`, `chunk` and the
+  algorithm's `tile` extents — enough for `rmsnorm`, `silu_mul` and a tiled
+  `gemm` (`crates/lex-front/lx`). Layouts and memory spaces are not in the
+  type, and the matvec, attention and the gated-delta recurrence are
   still built through the Rust IR API. The measurement that most wants a
   schedule block — rows per simdgroup, 1 on Apple and 2 on Ada — is still
   a constant in the target table.

@@ -9,16 +9,26 @@
 //!
 //! What it does today: `algo` declarations with parameters, `let`
 //! bindings over the elementwise and reduction ops, a `store`, and
-//! `schedule` blocks that set `threads` and `chunk` per target. It parses
-//! `rmsnorm` and `silu_mul` into programs byte-identical to the Rust ones,
-//! which is the whole of its claim — see `tests/syntax.rs`, which holds it
-//! to the emitter goldens rather than to itself.
+//! `schedule` blocks that set `threads`, `chunk` and the algorithm's
+//! `tile` extents per target. It parses `rmsnorm` and `silu_mul` into
+//! programs byte-identical to the Rust ones, which is the whole of its
+//! claim -- see `tests/syntax.rs`, which holds it to the emitter goldens
+//! rather than to itself.
+//!
+//! And, since `gemm.lx`, the structure the matrix kernels need: `grid`
+//! axes, `for` loops that carry a tile (`with acc` moves it in, `yield`
+//! moves the next one out), windows of a parameter at affine offsets
+//! (`load a[i * bm, p * bk ; bm, bk]`), `zeros`, and `matmul_nt`. Tile
+//! extents are the first thing a schedule sets that is a number and not a
+//! mode: the algorithm says `tile bm, bn, bk` and each machine's schedule
+//! says how big.
 //!
 //! What it does not do, stated because a surface that hides its holes is
-//! worse than no surface: no loops, no index arithmetic, no layouts or
-//! memory spaces in the type, no autotuner `?`. Those are the interesting
-//! half and they are next; this half is the part that has to exist before
-//! any of them can be written down.
+//! worse than no surface: no layouts or memory spaces in the type (every
+//! loaded tile is a register tile), no matrix-unit lowering of
+//! `matmul_nt` (it lowers to scalar code, correct and slow -- the
+//! hand-scheduled kernels in `lex_msl::gemm` are what it has to meet), no
+//! more than one carried tile, no autotuner `?`.
 //!
 //! ## The linear discipline is visible
 //!
@@ -144,7 +154,16 @@ impl<'a> Lexer<'a> {
                     // other depending on the spacing.
                     let exponent_sign =
                         (c == '-' || c == '+') && matches!(s.chars().last(), Some('e' | 'E'));
-                    if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || exponent_sign {
+                    // `0 .. k` and `0..k` both mean a range: a dot that is
+                    // followed by another is not part of the number.
+                    let range_dots = c == '.' && {
+                        let mut ahead = self.src.clone();
+                        ahead.next();
+                        ahead.peek() == Some(&'.')
+                    };
+                    if !range_dots
+                        && (c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || exponent_sign)
+                    {
                         s.push(c);
                         self.bump();
                     } else {
@@ -161,7 +180,10 @@ impl<'a> Lexer<'a> {
                 if c == '-' && self.src.peek() == Some(&'>') {
                     self.bump();
                     out.push((Tok::Punct("->".into()), at));
-                } else if "(){}[],:=*+-/&".contains(c) {
+                } else if c == '.' && self.src.peek() == Some(&'.') {
+                    self.bump();
+                    out.push((Tok::Punct("..".into()), at));
+                } else if "(){}[],:;=*+-/&".contains(c) {
                     out.push((Tok::Punct(c.to_string()), at));
                 } else {
                     return Err(format!("{at}: `{c}` means nothing here"));
@@ -186,9 +208,36 @@ enum Dim {
     Named(String),
 }
 
+/// An integer expression over constants and, where an index is wanted, the
+/// grid's and loops' indices: `i * bm`, `k / bk`, `p * bk + 8`.
+#[derive(Clone, Debug)]
+enum Ce {
+    Num(f64),
+    Name(String),
+    Bin(char, Box<Ce>, Box<Ce>),
+}
+
 /// The right-hand side of a `let`, or the value of a `store`.
 #[derive(Clone, Debug)]
 enum Expr {
+    /// `load a[i * bm, p * bk ; bm, bk]`: a window of a parameter, its
+    /// offsets then its shape.
+    LoadAt(String, Vec<Ce>, Vec<Dim>),
+    /// `zeros f32[bm, bn]`
+    Zeros(DType, Vec<Dim>),
+    /// `matmul_nt a b` (`[m,k] x [n,k]^T`) and `matmul a b` (`[m,k] x [k,n]`),
+    /// accumulating in f32.
+    MatMul(bool, Box<Expr>, Box<Expr>),
+    /// `for p in 0 .. k / bk with acc { ...; yield e }`: the tiles named
+    /// after `with` are moved in, rebound to the loop's carry inside, and
+    /// the one `yield` moves the next iteration's values out.
+    For {
+        index: String,
+        start: Ce,
+        end: Ce,
+        carry: Vec<String>,
+        body: Vec<Stmt>,
+    },
     /// `x`, moved.
     Move(String),
     /// `&x`, borrowed.
@@ -305,7 +354,56 @@ impl Parser {
         match self.bump() {
             Tok::Num(n) => Ok(Expr::Num(n)),
             Tok::Ident(s) => match s.as_str() {
-                "load" => Ok(Expr::Load(self.want_ident()?)),
+                "load" => {
+                    let name = self.want_ident()?;
+                    if !self.eat_punct("[") {
+                        return Ok(Expr::Load(name));
+                    }
+                    let mut at = vec![self.ce()?];
+                    while self.eat_punct(",") {
+                        at.push(self.ce()?);
+                    }
+                    self.want_punct(";")?;
+                    let mut shape = vec![self.dim()?];
+                    while self.eat_punct(",") {
+                        shape.push(self.dim()?);
+                    }
+                    self.want_punct("]")?;
+                    Ok(Expr::LoadAt(name, at, shape))
+                }
+                "zeros" => {
+                    let (dtype, shape) = self.ty()?;
+                    Ok(Expr::Zeros(dtype, shape))
+                }
+                "matmul_nt" | "matmul" => {
+                    let (a, b) = (self.atom()?, self.atom()?);
+                    Ok(Expr::MatMul(s == "matmul_nt", Box::new(a), Box::new(b)))
+                }
+                "for" => {
+                    let index = self.want_ident()?;
+                    if !self.eat_kw("in") {
+                        return Err(format!("{}: expected `in` after `for {index}`", self.at()));
+                    }
+                    let start = self.ce()?;
+                    self.want_punct("..")?;
+                    let end = self.ce()?;
+                    let mut carry = vec![];
+                    if self.eat_kw("with") {
+                        carry.push(self.want_ident()?);
+                        while self.eat_punct(",") {
+                            carry.push(self.want_ident()?);
+                        }
+                    }
+                    self.want_punct("{")?;
+                    let body = self.block()?;
+                    Ok(Expr::For {
+                        index,
+                        start,
+                        end,
+                        carry,
+                        body,
+                    })
+                }
                 // A call is `name expr` with no parentheses, which reads
                 // as the pipeline it is: `rowsum sq`, `rsqrt t`.
                 "rowsum" | "rowmax" | "rsqrt" | "sigmoid" | "softplus" => {
@@ -315,6 +413,107 @@ impl Parser {
             },
             other => Err(format!("{at}: expected a value, found {other:?}")),
         }
+    }
+
+    /// An integer expression: `*` and `/` bind tighter than `+` and `-`.
+    fn ce(&mut self) -> Result<Ce, String> {
+        let mut lhs = self.ce_product()?;
+        loop {
+            let op = if self.eat_punct("+") {
+                '+'
+            } else if self.eat_punct("-") {
+                '-'
+            } else {
+                return Ok(lhs);
+            };
+            lhs = Ce::Bin(op, Box::new(lhs), Box::new(self.ce_product()?));
+        }
+    }
+
+    fn ce_product(&mut self) -> Result<Ce, String> {
+        let mut lhs = self.ce_atom()?;
+        loop {
+            let op = if self.eat_punct("*") {
+                '*'
+            } else if self.eat_punct("/") {
+                '/'
+            } else {
+                return Ok(lhs);
+            };
+            lhs = Ce::Bin(op, Box::new(lhs), Box::new(self.ce_atom()?));
+        }
+    }
+
+    fn ce_atom(&mut self) -> Result<Ce, String> {
+        let at = self.at();
+        if self.eat_punct("(") {
+            let e = self.ce()?;
+            self.want_punct(")")?;
+            return Ok(e);
+        }
+        match self.bump() {
+            Tok::Num(n) => Ok(Ce::Num(n)),
+            Tok::Ident(s) => Ok(Ce::Name(s)),
+            other => Err(format!(
+                "{at}: expected a number or a name, found {other:?}"
+            )),
+        }
+    }
+
+    /// Statements up to and including the closing `}`.
+    fn block(&mut self) -> Result<Vec<Stmt>, String> {
+        let mut body = vec![];
+        while !self.eat_punct("}") {
+            if self.eat_kw("let") {
+                let dst = self.want_ident()?;
+                self.want_punct("=")?;
+                body.push(Stmt::Let(dst, self.expr()?));
+            } else if self.eat_kw("store") {
+                let e = self.expr()?;
+                self.want_punct("->")?;
+                let dst = self.want_ident()?;
+                let at = if self.eat_punct("[") {
+                    let mut at = vec![self.ce()?];
+                    while self.eat_punct(",") {
+                        at.push(self.ce()?);
+                    }
+                    self.want_punct("]")?;
+                    Some(at)
+                } else {
+                    None
+                };
+                body.push(Stmt::Store(e, dst, at));
+            } else if self.eat_kw("grid") {
+                let mut axes = vec![];
+                loop {
+                    let name = self.want_ident()?;
+                    if !self.eat_kw("over") {
+                        return Err(format!(
+                            "{}: expected `over` after `grid {name}`",
+                            self.at()
+                        ));
+                    }
+                    axes.push((name, self.ce()?));
+                    if !self.eat_punct(",") {
+                        break;
+                    }
+                }
+                body.push(Stmt::Grid(axes));
+            } else if self.eat_kw("yield") {
+                let mut ys = vec![self.expr()?];
+                while self.eat_punct(",") {
+                    ys.push(self.expr()?);
+                }
+                body.push(Stmt::Yield(ys));
+            } else {
+                return Err(format!(
+                    "{}: expected `let`, `store`, `grid`, `yield` or `}}`, found {:?}",
+                    self.at(),
+                    self.peek()
+                ));
+            }
+        }
+        Ok(body)
     }
 
     fn product(&mut self) -> Result<Expr, String> {
@@ -347,15 +546,23 @@ impl Parser {
 }
 
 /// One statement of an `algo` body.
+#[derive(Clone, Debug)]
 enum Stmt {
     Let(String, Expr),
-    Store(Expr, String),
+    /// `store e -> y`, or `store e -> y[i * bm, j * bn]` at an offset.
+    Store(Expr, String, Option<Vec<Ce>>),
+    /// `grid i over m / bm, j over n / bn`: independent instances of the
+    /// body, one threadgroup each, with their indices usable in offsets.
+    Grid(Vec<(String, Ce)>),
+    Yield(Vec<Expr>),
 }
 
 /// A parsed algorithm, before any target is chosen.
 pub struct Algo {
     pub name: String,
     consts: Vec<String>,
+    /// Extents the algorithm uses and the schedule sets: `tile bm, bn, bk`.
+    tiles: Vec<String>,
     params: Vec<ParamDecl>,
     body: Vec<Stmt>,
 }
@@ -388,6 +595,9 @@ pub struct Schedule {
     /// not mention it, the schedule does, and the same algorithm takes a
     /// different cut on a different card without being rewritten.
     pub chunk: Option<usize>,
+    /// The extents the algorithm declared with `tile`, by name: the part of
+    /// a schedule that is a number rather than a mode.
+    pub extents: Vec<(String, usize)>,
 }
 
 /// One `.lx` file: an algorithm, and the schedules that bind it.
@@ -426,7 +636,9 @@ impl Unit {
     /// count to lower it with.
     pub fn compile(&self, target: &str, args: &[(&str, f64)]) -> Result<(Program, usize), String> {
         let s = self.schedule_for(target)?;
-        Ok((self.algo.build_with(args, s.chunk)?, s.threads))
+        let mut all: Vec<(&str, f64)> = args.to_vec();
+        all.extend(s.extents.iter().map(|(n, v)| (n.as_str(), *v as f64)));
+        Ok((self.algo.build_with(&all, s.chunk)?, s.threads))
     }
 }
 
@@ -476,28 +688,21 @@ pub fn parse(src: &str) -> Result<Unit, String> {
         return Err(format!("{}: an algo needs at least one parameter", p.at()));
     }
 
-    p.want_punct("{")?;
-    let mut body = vec![];
-    while !p.eat_punct("}") {
-        if p.eat_kw("let") {
-            let dst = p.want_ident()?;
-            p.want_punct("=")?;
-            body.push(Stmt::Let(dst, p.expr()?));
-        } else if p.eat_kw("store") {
-            let e = p.expr()?;
-            p.want_punct("->")?;
-            body.push(Stmt::Store(e, p.want_ident()?));
-        } else {
-            return Err(format!(
-                "{}: expected `let`, `store` or `}}`, found {:?}",
-                p.at(),
-                p.peek()
-            ));
+    // `tile bm, bn, bk`: extents the schedule sets.
+    let mut tiles = vec![];
+    if p.eat_kw("tile") {
+        tiles.push(p.want_ident()?);
+        while p.eat_punct(",") {
+            tiles.push(p.want_ident()?);
         }
     }
+
+    p.want_punct("{")?;
+    let body = p.block()?;
     let algo = Algo {
         name,
         consts,
+        tiles,
         params,
         body,
     };
@@ -524,6 +729,7 @@ pub fn parse(src: &str) -> Result<Unit, String> {
         }
         p.want_punct("{")?;
         let (mut threads, mut chunk) = (None, None);
+        let mut extents: Vec<(String, usize)> = vec![];
         while !p.eat_punct("}") {
             let at = p.at();
             let key = p.want_ident()?;
@@ -536,7 +742,16 @@ pub fn parse(src: &str) -> Result<Unit, String> {
                     Tok::Num(n) => chunk = Some(n as usize),
                     other => return Err(format!("{at}: chunk takes a number, found {other:?}")),
                 },
-                other => return Err(format!("{at}: `{other}` is not a schedule key")),
+                other if algo.tiles.iter().any(|t| t == other) => match p.bump() {
+                    Tok::Num(n) => extents.push((other.to_string(), n as usize)),
+                    got => return Err(format!("{at}: {other} takes a number, found {got:?}")),
+                },
+                other => {
+                    return Err(format!(
+                        "{at}: `{other}` is not a schedule key (this algo's tiles are {:?})",
+                        algo.tiles
+                    ));
+                }
             }
             // A comma between keys is allowed and means nothing. The
             // design doc writes them on separate lines without; a writer
@@ -549,10 +764,18 @@ pub fn parse(src: &str) -> Result<Unit, String> {
         if schedules.iter().any(|s: &Schedule| s.target == target) {
             return Err(format!("{at}: two schedules for `{target}`"));
         }
+        if let Some(t) = algo
+            .tiles
+            .iter()
+            .find(|t| !extents.iter().any(|(n, _)| n == *t))
+        {
+            return Err(format!("{at}: the schedule for `{target}` sets no `{t}`"));
+        }
         schedules.push(Schedule {
             target,
             threads,
             chunk,
+            extents,
         });
     }
 
@@ -587,7 +810,7 @@ impl Algo {
         chunk: Option<usize>,
     ) -> Result<Program, String> {
         let vals: HashMap<&str, f64> = args.iter().copied().collect();
-        for c in &self.consts {
+        for c in self.consts.iter().chain(&self.tiles) {
             if !vals.contains_key(c.as_str()) {
                 return Err(format!("`{}` needs a value for `{c}`", self.name));
             }
@@ -605,19 +828,13 @@ impl Algo {
         // The suffix the Rust builders use: every constant in declaration
         // order. `rmsnorm(n)` with n = 4096 is `rmsnorm_4096`.
         let mut full = self.name.clone();
-        for c in &self.consts {
+        for c in self.consts.iter().chain(&self.tiles) {
             let v = vals[c.as_str()];
             if v.fract() == 0.0 && v >= 0.0 {
                 full.push_str(&format!("_{}", v as usize));
             }
         }
         let mut b = Builder::new(&full);
-
-        // A constant used in an expression is a number, not a tile. `eps`
-        // reads like a value because it is one; it becomes a `Fill` of
-        // whatever shape it is added to, which is decided where it lands
-        // rather than where it is written.
-        let subst = |e: &Expr| -> Expr { substitute(e, &vals) };
 
         // Declare every parameter at its full shape, then decide what one
         // instance sees.
@@ -665,31 +882,99 @@ impl Algo {
         // so a `Fill` can take the shape of whatever it is added to.
         let mut env: HashMap<String, (crate::ir::Var, Vec<usize>, DType)> = HashMap::new();
 
+        let mut idx: HashMap<String, crate::ir::Var> = HashMap::new();
         for stmt in &self.body {
-            match stmt {
-                Stmt::Let(dst, e) => {
-                    let (v, shape, dt) =
-                        self.lower(&mut b, &mut env, &params, &subst(e), dst, pid)?;
-                    env.insert(dst.clone(), (v, shape, dt));
+            if let Stmt::Grid(axes) = stmt {
+                if axes.len() > 2 {
+                    return Err("a grid has at most two axes".into());
                 }
-                Stmt::Store(e, dst) => {
-                    let (v, _, _) = self.lower(&mut b, &mut env, &params, &subst(e), "y", pid)?;
-                    let (id, shape, _) = params
-                        .get(dst.as_str())
-                        .ok_or_else(|| format!("`{dst}` is not a parameter"))?;
-                    b.effect(Op::Store(Arg::Move(v), slice(pid, *id, shape)));
+                for (k, (name, extent)) in axes.iter().enumerate() {
+                    let n = constant(
+                        extent,
+                        &Cx {
+                            vals: &vals,
+                            idx: &idx,
+                        },
+                    )?;
+                    let v = if k == 0 { b.grid(n) } else { b.grid2(n) };
+                    idx.insert(name.clone(), v);
                 }
+                continue;
+            }
+            let cx = Cx {
+                vals: &vals,
+                idx: &idx,
+            };
+            let mut one = vec![stmt.clone()];
+            if self
+                .lower_block(&mut b, &mut env, &params, &cx, &mut one, pid)?
+                .is_some()
+            {
+                return Err("`yield` outside a loop".into());
             }
         }
         Ok(b.finish())
     }
 
+    /// Run statements in order. `Some` carries a `yield`'s values out of a
+    /// loop body; `None` is a body that ended without one.
     #[allow(clippy::type_complexity)]
+    fn lower_block(
+        &self,
+        b: &mut Builder,
+        env: &mut HashMap<String, (crate::ir::Var, Vec<usize>, DType)>,
+        params: &HashMap<&str, (usize, Vec<usize>, DType)>,
+        cx: &Cx<'_>,
+        stmts: &mut [Stmt],
+        pid: Option<(crate::ir::Var, usize)>,
+    ) -> Result<Option<Vec<(crate::ir::Var, Vec<usize>, DType)>>, String> {
+        for stmt in stmts.iter() {
+            match stmt {
+                Stmt::Let(dst, e) => {
+                    let (v, shape, dt) =
+                        self.lower(b, env, params, cx, &substitute(e, cx.vals), dst, pid)?;
+                    env.insert(dst.clone(), (v, shape, dt));
+                }
+                Stmt::Store(e, dst, at) => {
+                    let (v, tile, _) =
+                        self.lower(b, env, params, cx, &substitute(e, cx.vals), "y", pid)?;
+                    let (id, shape, _) = params
+                        .get(dst.as_str())
+                        .ok_or_else(|| format!("`{dst}` is not a parameter"))?;
+                    let view = match at {
+                        Some(at) => window(*id, at, &tile, cx)?,
+                        None => slice(pid, *id, shape),
+                    };
+                    b.effect(Op::Store(Arg::Move(v), view));
+                }
+                Stmt::Grid(_) => return Err("`grid` goes first, outside any loop".into()),
+                Stmt::Yield(es) => {
+                    let mut out = vec![];
+                    for e in es {
+                        out.push(self.lower(
+                            b,
+                            env,
+                            params,
+                            cx,
+                            &substitute(e, cx.vals),
+                            "y",
+                            pid,
+                        )?);
+                    }
+                    return Ok(Some(out));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn lower(
         &self,
         b: &mut Builder,
         env: &mut HashMap<String, (crate::ir::Var, Vec<usize>, DType)>,
         params: &HashMap<&str, (usize, Vec<usize>, DType)>,
+        cx: &Cx<'_>,
         e: &Expr,
         name: &str,
         pid: Option<(crate::ir::Var, usize)>,
@@ -705,6 +990,105 @@ impl Algo {
                 );
                 (v, shape.clone(), *dt)
             }
+            Expr::LoadAt(p, at, shape) => {
+                let (id, _, dt) = params
+                    .get(p.as_str())
+                    .ok_or_else(|| format!("`{p}` is not a parameter"))?;
+                let shape: Vec<usize> = shape
+                    .iter()
+                    .map(|d| dim_of(d, cx.vals))
+                    .collect::<Result<_, _>>()?;
+                let view = window(*id, at, &shape, cx)?;
+                let v = b.op(p, Op::Load(view, TileTy::new(*dt, &shape, Space::Reg)));
+                (v, shape, *dt)
+            }
+            Expr::Zeros(dt, shape) => {
+                let shape: Vec<usize> = shape
+                    .iter()
+                    .map(|d| dim_of(d, cx.vals))
+                    .collect::<Result<_, _>>()?;
+                let v = b.op(name, Op::Fill(TileTy::new(*dt, &shape, Space::Reg), 0.0));
+                (v, shape, *dt)
+            }
+            Expr::MatMul(nt, l, r) => {
+                let (lv, lshape, _) = self.lower(b, env, params, cx, l, name, pid)?;
+                let (rv, rshape, _) = self.lower(b, env, params, cx, r, name, pid)?;
+                let (m, k) = (lshape[0], lshape[1]);
+                let (kr, n) = if *nt {
+                    (rshape[1], rshape[0])
+                } else {
+                    (rshape[0], rshape[1])
+                };
+                if k != kr {
+                    return Err(format!(
+                        "`{name}`: {lshape:?} against {rshape:?} do not share their inner dimension"
+                    ));
+                }
+                let (la, ra) = (arg(l, lv), arg(r, rv));
+                let op = if *nt {
+                    Op::MatMulNT(la, ra, DType::F32)
+                } else {
+                    Op::MatMul(la, ra, DType::F32)
+                };
+                (b.op(name, op), vec![m, n], DType::F32)
+            }
+            Expr::For {
+                index,
+                start,
+                end,
+                carry,
+                body,
+            } => {
+                let (start, end) = (constant(start, cx)?, constant(end, cx)?);
+                let mut init = vec![];
+                let mut tys = vec![];
+                let mut seen = vec![];
+                for n in carry {
+                    let (v, shape, dt) = env
+                        .get(n)
+                        .ok_or_else(|| format!("`{n}` is not bound"))?
+                        .clone();
+                    init.push(v);
+                    tys.push(crate::ir::Ty::Tile(TileTy::new(dt, &shape, Space::Reg)));
+                    seen.push((shape, dt));
+                }
+                if carry.len() != 1 {
+                    return Err(format!(
+                        "a loop carries one tile for now, `for {index}` carries {}",
+                        carry.len()
+                    ));
+                }
+                let failed: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+                let outs = b.for_range(start, end, init, tys, |b, i, ps| {
+                    let mut inner = env.clone();
+                    for ((n, p), (shape, dt)) in carry.iter().zip(ps).zip(&seen) {
+                        inner.insert(n.clone(), (*p, shape.clone(), *dt));
+                    }
+                    let mut idx = cx.idx.clone();
+                    idx.insert(index.clone(), i);
+                    let inside = Cx {
+                        vals: cx.vals,
+                        idx: &idx,
+                    };
+                    let mut stmts = body.clone();
+                    match self.lower_block(b, &mut inner, params, &inside, &mut stmts, pid) {
+                        Ok(Some(ys)) => ys.into_iter().map(|y| y.0).collect(),
+                        Ok(None) => {
+                            *failed.borrow_mut() =
+                                Some(format!("the loop over `{index}` never yields"));
+                            vec![]
+                        }
+                        Err(e) => {
+                            *failed.borrow_mut() = Some(e);
+                            vec![]
+                        }
+                    }
+                });
+                if let Some(e) = failed.into_inner() {
+                    return Err(e);
+                }
+                (outs[0], seen[0].0.clone(), seen[0].1)
+            }
             Expr::Move(n) | Expr::Borrow(n) => {
                 let (v, shape, dt) = env
                     .get(n)
@@ -714,7 +1098,7 @@ impl Algo {
             }
             Expr::Num(_) => return Err("a constant needs something to take its shape from".into()),
             Expr::Call(f, inner) => {
-                let (v, shape, dt) = self.lower(b, env, params, inner, name, pid)?;
+                let (v, shape, dt) = self.lower(b, env, params, cx, inner, name, pid)?;
                 let a = arg(inner, v);
                 match f.as_str() {
                     "rowsum" | "rowmax" => {
@@ -750,14 +1134,14 @@ impl Algo {
                 // multiply by a constant is `Scale`, which the emitter
                 // folds, and anything else needs a tile to add to.
                 if let (BinOp::Mul, Expr::Num(k)) = (op, r.as_ref()) {
-                    let (v, shape, dt) = self.lower(b, env, params, l, name, pid)?;
+                    let (v, shape, dt) = self.lower(b, env, params, cx, l, name, pid)?;
                     return Ok((b.op(name, Op::Scale(arg(l, v), *k as f32)), shape, dt));
                 }
                 if let (BinOp::Mul, Expr::Num(k)) = (op, l.as_ref()) {
-                    let (v, shape, dt) = self.lower(b, env, params, r, name, pid)?;
+                    let (v, shape, dt) = self.lower(b, env, params, cx, r, name, pid)?;
                     return Ok((b.op(name, Op::Scale(arg(r, v), *k as f32)), shape, dt));
                 }
-                let (lv, lshape, dt) = self.lower(b, env, params, l, name, pid)?;
+                let (lv, lshape, dt) = self.lower(b, env, params, cx, l, name, pid)?;
                 let (rv, rshape, _) = match r.as_ref() {
                     Expr::Num(k) => {
                         // Shaped like what it meets, so `ms + eps` fills a
@@ -765,7 +1149,7 @@ impl Algo {
                         let t = TileTy::new(dt, &lshape, Space::Reg);
                         (b.op("eps", Op::Fill(t, *k as f32)), lshape.clone(), dt)
                     }
-                    other => self.lower(b, env, params, other, name, pid)?,
+                    other => self.lower(b, env, params, cx, other, name, pid)?,
                 };
                 // The checker's two broadcasts, and no others: a 1-d
                 // tile of `rows` against `[rows, n]`, and a single row
@@ -796,6 +1180,11 @@ fn substitute(e: &Expr, vals: &HashMap<&str, f64>) -> Expr {
             None => e.clone(),
         },
         Expr::Call(f, x) => Expr::Call(f.clone(), Box::new(substitute(x, vals))),
+        Expr::MatMul(nt, l, r) => Expr::MatMul(
+            *nt,
+            Box::new(substitute(l, vals)),
+            Box::new(substitute(r, vals)),
+        ),
         Expr::Bin(op, l, r) => {
             let (l, r) = (substitute(l, vals), substitute(r, vals));
             // Fold once both sides are numbers, so `1 / n` is a constant
@@ -868,4 +1257,99 @@ fn whole(param: usize, shape: &[usize]) -> View {
         offset: shape.iter().map(|_| IdxExpr::lit(0)).collect(),
         shape: shape.to_vec(),
     }
+}
+
+/// What names mean while a statement is lowered: the algorithm's constants,
+/// and the grid's and enclosing loops' indices.
+struct Cx<'a> {
+    vals: &'a HashMap<&'a str, f64>,
+    idx: &'a HashMap<String, crate::ir::Var>,
+}
+
+/// A dimension, resolved.
+fn dim_of(d: &Dim, vals: &HashMap<&str, f64>) -> Result<usize, String> {
+    Ok(match d {
+        Dim::Lit(n) => *n,
+        Dim::Named(s) => *vals
+            .get(s.as_str())
+            .ok_or_else(|| format!("`{s}` is not one of this algo's constants"))?
+            as usize,
+    })
+}
+
+/// `c + sum(coeff * index)`, which is all an offset can be: a view's place
+/// must be provable in bounds without running the program.
+fn affine(e: &Ce, cx: &Cx<'_>) -> Result<IdxExpr, String> {
+    fn scale(a: IdxExpr, k: i64) -> IdxExpr {
+        IdxExpr {
+            constant: a.constant * k,
+            terms: a.terms.into_iter().map(|(v, c)| (v, c * k)).collect(),
+        }
+    }
+    let lit = |c: i64| IdxExpr {
+        constant: c,
+        terms: vec![],
+    };
+    Ok(match e {
+        Ce::Num(n) if n.fract() == 0.0 => lit(*n as i64),
+        Ce::Num(n) => return Err(format!("{n} is not an integer")),
+        Ce::Name(s) => match (cx.idx.get(s), cx.vals.get(s.as_str())) {
+            (Some(v), _) => IdxExpr {
+                constant: 0,
+                terms: vec![(*v, 1)],
+            },
+            (None, Some(x)) if x.fract() == 0.0 => lit(*x as i64),
+            _ => return Err(format!("`{s}` is neither an index nor an integer constant")),
+        },
+        Ce::Bin(op, l, r) => {
+            let (l, r) = (affine(l, cx)?, affine(r, cx)?);
+            match op {
+                '+' | '-' => {
+                    let k = if *op == '+' { 1 } else { -1 };
+                    let r = scale(r, k);
+                    IdxExpr {
+                        constant: l.constant + r.constant,
+                        terms: l.terms.into_iter().chain(r.terms).collect(),
+                    }
+                }
+                '*' if l.terms.is_empty() => scale(r, l.constant),
+                '*' if r.terms.is_empty() => scale(l, r.constant),
+                '*' => return Err("a product of two indices is not an affine offset".into()),
+                _ => {
+                    if !l.terms.is_empty() || !r.terms.is_empty() {
+                        return Err("an offset divides constants only".into());
+                    }
+                    if r.constant == 0 || l.constant % r.constant != 0 {
+                        return Err(format!("{} does not divide by {}", l.constant, r.constant));
+                    }
+                    lit(l.constant / r.constant)
+                }
+            }
+        }
+    })
+}
+
+/// A non-negative constant: a loop bound or a grid extent.
+fn constant(e: &Ce, cx: &Cx<'_>) -> Result<usize, String> {
+    let a = affine(e, cx)?;
+    if !a.terms.is_empty() || a.constant < 0 {
+        return Err("an extent is a constant, not an index".into());
+    }
+    Ok(a.constant as usize)
+}
+
+/// A window of a parameter at affine offsets, `shape` big.
+fn window(param: usize, at: &[Ce], shape: &[usize], cx: &Cx<'_>) -> Result<View, String> {
+    if at.len() != shape.len() {
+        return Err(format!(
+            "{} offsets for a window of {} dimensions",
+            at.len(),
+            shape.len()
+        ));
+    }
+    Ok(View {
+        param,
+        offset: at.iter().map(|e| affine(e, cx)).collect::<Result<_, _>>()?,
+        shape: shape.to_vec(),
+    })
 }

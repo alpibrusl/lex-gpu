@@ -1,0 +1,34 @@
+// y = a w^T: a tiled matrix product, `[m, k] x [n, k]^T -> [m, n]`.
+//
+// This is the first `.lx` kernel with loops, and it is what the hand-written
+// GEMMs of `lex_msl::gemm` compute. Everything a machine decides is a `tile`
+// extent -- how big a piece of y one instance owns (`bm`, `bn`) and how many
+// of the inner dimension it takes at a time (`bk`) -- and the schedules
+// below give them; the algorithm names no machine.
+//
+// A loop carries a tile: `with acc` moves `acc` in, `acc` inside the body is
+// this iteration's, and the `yield` moves the next one out. The checker
+// counts every use, so a loop that drops its accumulator or uses it twice is
+// a compile error, not a wrong answer.
+//
+// Accumulation is f32 and the inputs are f16: `matmul_nt` says so by what it
+// is handed and what `acc` is, not by a default.
+
+algo gemm(m, n, k)
+  in  a: f16[m, k]
+  in  w: f16[n, k]
+  out y: f32[m, n]
+  tile bm, bn, bk
+{
+  grid i over m / bm, j over n / bn
+  let acc = zeros f32[bm, bn]
+  let acc = for p in 0 .. k / bk with acc {
+    let at = load a[i * bm, p * bk ; bm, bk]
+    let wt = load w[j * bn, p * bk ; bn, bk]
+    yield acc + matmul_nt at wt
+  }
+  store acc -> y[i * bm, j * bn]
+}
+
+schedule gemm for apple-m-series { threads 128 bm 16 bn 16 bk 32 }
+schedule gemm for nvidia-ada     { threads 128 bm 16 bn 16 bk 32 }

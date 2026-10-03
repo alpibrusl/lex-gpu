@@ -214,3 +214,170 @@ fn a_chunk_that_does_not_divide_is_rejected() {
     let err = unit.compile("apple-m-series", &[]).unwrap_err();
     assert!(err.contains("does not divide"), "got {err}");
 }
+
+const GEMM: &str = include_str!("../lx/gemm.lx");
+
+/// The same program, written with the builder: what `gemm.lx` has to be.
+fn gemm_by_hand(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    bk: usize,
+) -> lex_front::Program {
+    use lex_front::ir::{Arg::Move, BinOp, Builder, IdxExpr, Op, Ty, View};
+    use lex_ir::{DType::*, Space::Reg};
+    let tile = |dt, s: &[usize]| lex_front::ir::TileTy::new(dt, s, Reg);
+    let mut b = Builder::new(&format!("gemm_{m}_{n}_{k}_{bm}_{bn}_{bk}"));
+    let a = b.param("a", F16, &[m, k], false);
+    let w = b.param("w", F16, &[n, k], false);
+    let y = b.param("y", F32, &[m, n], true);
+    let pi = b.grid(m / bm);
+    let pj = b.grid2(n / bn);
+    let zero = b.op("acc", Op::Fill(tile(F32, &[bm, bn]), 0.0));
+    let out = b.for_range(
+        0,
+        k / bk,
+        vec![zero],
+        vec![Ty::Tile(tile(F32, &[bm, bn]))],
+        |b, p, carry| {
+            let view = |param, row: usize, rows| View {
+                param,
+                offset: vec![
+                    IdxExpr::scaled(row_var(row, pi, pj), rows, 0),
+                    IdxExpr::scaled(p, bk, 0),
+                ],
+                shape: vec![rows, bk],
+            };
+            let at = b.op("a", Op::Load(view(a, 0, bm), tile(F16, &[bm, bk])));
+            let wt = b.op("w", Op::Load(view(w, 1, bn), tile(F16, &[bn, bk])));
+            let mm = b.op("y", Op::MatMulNT(Move(at), Move(wt), F32));
+            vec![b.op("y", Op::Binary(BinOp::Add, Move(carry[0]), Move(mm)))]
+        },
+    );
+    b.effect(Op::Store(
+        Move(out[0]),
+        View {
+            param: y,
+            offset: vec![IdxExpr::scaled(pi, bm, 0), IdxExpr::scaled(pj, bn, 0)],
+            shape: vec![bm, bn],
+        },
+    ));
+    b.finish()
+}
+
+/// Which grid index a window's rows follow: `a` by `i`, `w` by `j`.
+fn row_var(which: usize, pi: lex_front::ir::Var, pj: lex_front::ir::Var) -> lex_front::ir::Var {
+    if which == 0 { pi } else { pj }
+}
+
+#[test]
+fn loops_and_windows_build_the_program_the_builder_builds() {
+    let unit = syntax::parse(GEMM).unwrap_or_else(|e| panic!("{e}"));
+    let (m, n, k) = (64usize, 48usize, 96usize);
+    let (prog, threads) = unit
+        .compile(
+            "apple-m-series",
+            &[("m", m as f64), ("n", n as f64), ("k", k as f64)],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(threads, 128);
+    let want = gemm_by_hand(m, n, k, 16, 16, 32);
+    assert_eq!(prog, want, "the surface and the builder disagree");
+    lex_front::check(&prog, &lex_ir::Target::apple_m_series())
+        .unwrap_or_else(|e| panic!("the parsed gemm: {e:#?}"));
+}
+
+#[test]
+fn the_parsed_gemm_computes_a_matrix_product() {
+    use lex_front::interp::{Tensor, run};
+    let unit = syntax::parse(GEMM).unwrap_or_else(|e| panic!("{e}"));
+    let (m, n, k) = (32usize, 48usize, 64usize);
+    let (prog, _) = unit
+        .compile(
+            "nvidia-ada",
+            &[("m", m as f64), ("n", n as f64), ("k", k as f64)],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    let fill = |len: usize, seed: u32| -> Vec<f32> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((x >> 9) as f32 / (1u32 << 23) as f32) - 0.5
+            })
+            .collect()
+    };
+    let (av, wv) = (fill(m * k, 1), fill(n * k, 2));
+    let mut t = vec![
+        Tensor::new(lex_ir::DType::F16, &[m, k], &av),
+        Tensor::new(lex_ir::DType::F16, &[n, k], &wv),
+        Tensor::new(lex_ir::DType::F32, &[m, n], &vec![0.0; m * n]),
+    ];
+    run(&prog, &mut t).unwrap_or_else(|e| panic!("{e:?}"));
+    // The reference sees what the kernel sees: the inputs rounded to f16.
+    let (ar, wr) = (&t[0].data, &t[1].data);
+    for i in 0..m {
+        for j in 0..n {
+            let want: f64 = (0..k)
+                .map(|p| ar[i * k + p] as f64 * wr[j * k + p] as f64)
+                .sum();
+            let got = t[2].data[i * n + j] as f64;
+            assert!((got - want).abs() < 1e-4, "y[{i},{j}] = {got}, want {want}");
+        }
+    }
+}
+
+#[test]
+fn a_schedule_that_leaves_a_tile_open_or_invents_one_is_refused() {
+    // `tile bm, bn, bk` are the algorithm's holes; a schedule that does not
+    // fill them has chosen nothing, and one that sets another name has
+    // misspelt one.
+    let missing = GEMM.replace(" bk 32 }", " }");
+    let err = syntax::parse(&missing).err().expect("a missing tile");
+    assert!(err.contains("sets no `bk`"), "{err}");
+    let invented = GEMM.replace("bk 32 }", "bk 32 bq 8 }");
+    let err = syntax::parse(&invented).err().expect("an unknown key");
+    assert!(err.contains("not a schedule key"), "{err}");
+}
+
+#[test]
+fn a_loop_that_uses_its_accumulator_twice_does_not_check() {
+    // `acc + acc * ...` spends the carried tile twice.
+    let src = GEMM.replace("yield acc + matmul_nt at wt", "yield acc + acc");
+    let unit = syntax::parse(&src).expect("it parses");
+    let (prog, _) = unit
+        .compile("apple-m-series", &[("m", 16.0), ("n", 16.0), ("k", 32.0)])
+        .expect("it builds");
+    assert!(
+        lex_front::check(&prog, &lex_ir::Target::apple_m_series()).is_err(),
+        "a carried tile was used twice and the checker said nothing"
+    );
+}
+
+#[test]
+fn the_parsed_gemm_lowers_for_both_backends() {
+    use lex_msl::dialect::{Cuda, Msl};
+    let unit = syntax::parse(GEMM).unwrap_or_else(|e| panic!("{e}"));
+    for (target, dialect) in [
+        (
+            lex_ir::Target::apple_m_series(),
+            &Msl as &dyn lex_msl::dialect::Dialect,
+        ),
+        (lex_ir::Target::nvidia_ada(), &Cuda),
+    ] {
+        let (prog, threads) = unit
+            .compile(target.name, &[("m", 64.0), ("n", 64.0), ("k", 128.0)])
+            .unwrap_or_else(|e| panic!("{e}"));
+        lex_front::check(&prog, &target).unwrap_or_else(|e| panic!("{}: {e:#?}", target.name));
+        let l = lex_msl::program::lower_with(&prog, &target, threads, dialect)
+            .unwrap_or_else(|e| panic!("{}: {e}", target.name));
+        assert_eq!(
+            (l.grid, l.grid2),
+            (4, 4),
+            "{}: one instance a 16x16 tile",
+            target.name
+        );
+    }
+}
