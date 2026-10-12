@@ -483,7 +483,7 @@ impl Parser {
                 }
                 // A call is `name expr` with no parentheses, which reads
                 // as the pipeline it is: `rowsum sq`, `rsqrt t`.
-                "rowsum" | "rowmax" | "rsqrt" | "sigmoid" | "softplus" => {
+                "rowsum" | "rowmax" | "rsqrt" | "sigmoid" | "softplus" | "exp" | "log" => {
                     Ok(Expr::Call(s, Box::new(self.atom()?)))
                 }
                 _ => Ok(Expr::Move(s)),
@@ -1284,6 +1284,8 @@ impl Algo {
                         // would be a surface for a different compiler.
                         let u = match f.as_str() {
                             "rsqrt" => UnOp::Rsqrt,
+                            "exp" => UnOp::Exp,
+                            "log" => UnOp::Log,
                             "sigmoid" => UnOp::Sigmoid,
                             "softplus" => UnOp::Softplus,
                             other => return Err(format!("`{other}` is not an operation here")),

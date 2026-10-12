@@ -1780,6 +1780,8 @@ impl Gen<'_> {
                     Op::Scale(_, f) => (ty.dtype, format!("{src} * {}", lit(*f))),
                     Op::Convert(_, d) => (*d, src),
                     Op::Unary(UnOp::Rsqrt, _) => (ty.dtype, self.d.rsqrt(&src)),
+                    Op::Unary(UnOp::Exp, _) => (ty.dtype, self.d.exp(&src)),
+                    Op::Unary(UnOp::Log, _) => (ty.dtype, self.d.log(&src)),
                     Op::Unary(UnOp::Sigmoid, _) => (
                         ty.dtype,
                         format!("1.0f / (1.0f + {})", self.d.exp(&format!("-{src}"))),

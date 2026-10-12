@@ -224,6 +224,10 @@ impl BinOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
     Rsqrt,
+    /// `e^x`. Softmax's numerator; the IR's `Op::Exp` is the same value.
+    Exp,
+    /// The natural logarithm, `ln`.
+    Log,
     Sigmoid,
     /// `log(1 + exp(x))`, evaluated as `max(x, 0) + log(1 + exp(-|x|))` so
     /// a large `x` neither overflows nor loses the linear part. Qwen3.8's
@@ -235,6 +239,8 @@ impl UnOp {
     pub fn apply(self, x: f32) -> f32 {
         match self {
             UnOp::Rsqrt => 1.0 / x.sqrt(),
+            UnOp::Exp => x.exp(),
+            UnOp::Log => x.ln(),
             UnOp::Sigmoid => 1.0 / (1.0 + (-x).exp()),
             UnOp::Softplus => x.max(0.0) + (-x.abs()).exp().ln_1p(),
         }
@@ -243,6 +249,8 @@ impl UnOp {
     pub fn name(self) -> &'static str {
         match self {
             UnOp::Rsqrt => "rsqrt",
+            UnOp::Exp => "exp",
+            UnOp::Log => "log",
             UnOp::Sigmoid => "sigmoid",
             UnOp::Softplus => "softplus",
         }
